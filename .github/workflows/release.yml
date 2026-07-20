@@ -19,12 +19,19 @@ jobs:
         include:
           - target: aarch64-apple-darwin
             os: macos-latest
+            native: true
+          # macos-latest is arm64, so this one is cross-compiled; running its test binaries
+          # would depend on Rosetta, which is not guaranteed on the runner. Build only —
+          # ci.yml already runs the suite natively on both platforms.
           - target: x86_64-apple-darwin
             os: macos-latest
+            native: false
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            native: true
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
+            native: true
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -34,7 +41,8 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup target add ${{ matrix.target }}
 
-      - run: cargo test --locked --target ${{ matrix.target }}
+      - if: matrix.native
+        run: cargo test --locked --target ${{ matrix.target }}
 
       - run: cargo build --release --locked --target ${{ matrix.target }}
 
@@ -57,7 +65,13 @@ jobs:
           staging=$(mktemp -d)
           cp "target/${{ matrix.target }}/release/herdr-lazy" "$staging/"
           tar -czf "$asset" -C "$staging" herdr-lazy
-          shasum -a 256 "$asset" | cut -d' ' -f1 > "$asset.sha256"
+          # shasum is present on GitHub's macOS and Ubuntu images, but prefer sha256sum
+          # where it exists so this keeps working on a leaner container.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$asset" | cut -d' ' -f1 > "$asset.sha256"
+          else
+            shasum -a 256 "$asset" | cut -d' ' -f1 > "$asset.sha256"
+          fi
           echo "asset=$asset" >> "$GITHUB_OUTPUT"
 
       - uses: softprops/action-gh-release@v2

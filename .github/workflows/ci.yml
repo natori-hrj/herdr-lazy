@@ -14,7 +14,8 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-      - run: rustup toolchain install stable --profile minimal --component rustfmt clippy
+      # `--component` takes one value; a bare second name is parsed as a toolchain.
+      - run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --locked
