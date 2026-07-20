@@ -1,0 +1,40 @@
+name: Bug report
+description: herdr-lazy did something wrong
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        If herdr-lazy removed a plugin you wanted, or overwrote your list, say so — that is
+        treated as a priority. An older copy of your list may still exist at
+        `~/.config/herdr-lazy/plugins.list`.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+
+  - type: textarea
+    id: probe
+    attributes:
+      label: Output of `herdr-lazy probe`
+      description: It prints the resolved bundle and lock paths, and what the herdr CLI exposes.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: list
+    attributes:
+      label: Your plugins.list
+      render: text
+
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      placeholder: "herdr 0.7.4, herdr-lazy 0.1.0, macOS 15"
+    validations:
+      required: true

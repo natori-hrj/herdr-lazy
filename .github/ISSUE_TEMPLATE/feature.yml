@@ -1,0 +1,22 @@
+name: Feature request
+description: Something herdr-lazy should be able to do
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        If the idea is still forming, a Discussion is a better home — it will not be closed for
+        being vague there.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do that you cannot do today?
+      description: Describe the situation, not the solution. The best fix is often not the requested one.
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: What did you have in mind?

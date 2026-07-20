@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question, idea, or something you built
+    url: https://github.com/natori-hrj/herdr-lazy/discussions
+    about: Anything open-ended. Nothing is too vague for a discussion.
+  - name: Security vulnerability
+    url: https://github.com/natori-hrj/herdr-lazy/security/advisories/new
+    about: Report privately — never in a public issue.

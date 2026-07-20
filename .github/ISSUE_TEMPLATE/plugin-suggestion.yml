@@ -1,0 +1,47 @@
+name: Suggest a plugin for the default set
+description: Propose adding, swapping, or removing an entry in DEFAULT_BUNDLE
+labels: ["default-set"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please read the criteria in CONTRIBUTING.md first — they are specific, and a "no" is
+        usually about the shape of the set rather than the plugin. Self-submissions are fine
+        and judged the same way.
+
+  - type: input
+    id: repo
+    attributes:
+      label: Plugin (owner/repo)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: build
+    attributes:
+      label: Does it install without a Rust toolchain?
+      description: >
+        A build of bare `cargo build --release` fails under herdr's build PATH, which excludes
+        `~/.cargo/bin`. Plugins with no build step, or that ship a verified prebuilt binary, are fine.
+      options:
+        - "No build step at all"
+        - "Ships a prebuilt binary (checksum-verified)"
+        - "Requires cargo / another toolchain"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: overlap
+    attributes:
+      label: What does it overlap in the current set, if anything?
+      description: Overlap is a reason to swap rather than add. Say which entry it would replace.
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: Why does it belong in a default, rather than being something people add themselves?
+    validations:
+      required: true
