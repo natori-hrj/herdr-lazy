@@ -9,21 +9,22 @@ set you want, and no lockfile — so a working setup cannot be reproduced on ano
 machine. herdr-lazy adds both.
 
 ```
- herdr-lazy  5 ok · 2 to sync · 1 extra
+ herdr-lazy  2 ok · 2 to sync · 1 unlisted
  ────────────────────────────────────────────────────────────────
- ✔ cloudmanic/herdr-plus                     f32b0825f125
- ✗ smarzban/herdr-file-viewer                -             not installed — press s
- ↻ owner/pinned-plugin@9f3c1ab               b872365a12f4  at b872365a12f4 — press s to restore the pin
- + someone/unwanted                          8facfbb2a7bd  not in bundle — press x to prune
- ⚑ my.local-plugin                           -             local link — prune will not touch it
+ ✔ cloudmanic/herdr-plus            f32b0825f125
+ ✔ smarzban/herdr-file-viewer       10e930332635
+ ✗ owner/not-yet-installed          -             in your list, not installed — press s to install
+ ↻ owner/pinned@9f3c1ab             b872365a12f4  installed at b872365a12f4, pinned elsewhere — press s …
+ + someone/unlisted                 8facfbb2a7bd  installed, not in your list — press x to remove
+ ⚑ herdr-lazy                       -             installed as a local link — never removed by prune
  ────────────────────────────────────────────────────────────────
- s sync  u update  x prune  r refresh  q quit
+ s sync  u update  x remove extras  r refresh  q quit
 ```
 
 ## What it gives you
 
-- **A declarative bundle.** One `owner/repo` per line. `sync` converges your machine
-  to it — installing what is missing, and (with `--prune`) removing what is not listed.
+- **A declarative plugin list.** One `owner/repo` per line. `sync` converges your
+  machine to it — installing what is missing, and (with `--prune`) removing the rest.
 - **A real lockfile.** Entries pin to a commit, and the lock records the commit herdr
   actually checked out. Copy the lock to another machine, `sync`, and you get the same
   plugins at the same commits.
@@ -83,10 +84,14 @@ herdr-lazy sync --prune  # also remove anything not in the bundle
 | `lock` | write the lockfile from the current bundle |
 | `probe` | dump what the herdr CLI exposes (for debugging) |
 
-Files:
+Both files live in the directory herdr assigns the plugin — `herdr plugin config-dir
+herdr-lazy` prints it:
 
-- bundle: `$HERDR_PLUGIN_CONFIG_DIR/plugins.list` (outside herdr: `~/.config/herdr-lazy/`)
-- lock: `$HERDR_PLUGIN_STATE_DIR/plugins.lock` (outside herdr: `~/.local/state/herdr-lazy/`)
+- `plugins.list` — the set you declare, edited by hand or via `add`/`remove`
+- `plugins.lock` — the commits actually installed, rewritten on every `sync`
+
+Run from a shell, herdr-lazy asks herdr for that path rather than guessing, so the CLI and
+the manage pane always read the same files.
 
 ## Pinning and reproducibility
 

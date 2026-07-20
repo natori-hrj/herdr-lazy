@@ -69,32 +69,53 @@ fn herdr_bin() -> String {
     env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string())
 }
 
+/// Must match `id` in herdr-plugin.toml — it is how we ask herdr about ourselves.
+const PLUGIN_ID: &str = "herdr-lazy";
+
+/// Where the bundle and lock live.
+///
+/// herdr sets `HERDR_PLUGIN_CONFIG_DIR` when it launches a plugin, but a user running the
+/// binary from a shell has no such variable — and if the two disagree, `init` writes a bundle
+/// the manage pane cannot see, and the pane reports "no plugin list" for a set that plainly
+/// exists. So when the variable is absent, *ask herdr* where our config belongs rather than
+/// inventing a second location.
+///
+/// Cached: this shells out, and it is consulted several times per run.
 fn config_dir() -> PathBuf {
-    if let Ok(d) = env::var("HERDR_PLUGIN_CONFIG_DIR") {
-        return PathBuf::from(d);
-    }
-    // Fallback when run outside herdr (local dev).
-    let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".config").join("herdr-lazy")
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        if let Ok(d) = env::var("HERDR_PLUGIN_CONFIG_DIR") {
+            return PathBuf::from(d);
+        }
+        if let Ok((true, out, _)) = run_herdr(&["plugin", "config-dir", PLUGIN_ID]) {
+            let p = out.trim();
+            if !p.is_empty() {
+                return PathBuf::from(p);
+            }
+        }
+        // herdr is unreachable or we are not registered with it yet (fresh checkout).
+        legacy_config_dir()
+    })
+    .clone()
 }
 
-fn state_dir() -> PathBuf {
-    if let Ok(d) = env::var("HERDR_PLUGIN_STATE_DIR") {
-        return PathBuf::from(d);
-    }
+/// Where an earlier version kept things, before the location was taken from herdr.
+fn legacy_config_dir() -> PathBuf {
     let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home)
-        .join(".local")
-        .join("state")
-        .join("herdr-lazy")
+    PathBuf::from(home).join(".config").join("herdr-lazy")
 }
 
 pub(crate) fn bundle_path() -> PathBuf {
     config_dir().join("plugins.list")
 }
 
+/// The lock sits beside the bundle, not in a state dir.
+///
+/// It is generated, but it is also the file you copy to another machine to reproduce a
+/// setup — the same reasoning that puts Cargo.lock next to Cargo.toml. Keeping both in one
+/// directory also means there is exactly one location to reason about.
 fn lock_path() -> PathBuf {
-    state_dir().join("plugins.lock")
+    config_dir().join("plugins.lock")
 }
 
 fn ensure_parent(p: &Path) -> io::Result<()> {
@@ -127,7 +148,36 @@ fn read_lines(p: &Path) -> Vec<String> {
 }
 
 pub(crate) fn desired_plugins() -> Vec<String> {
+    migrate_legacy_bundle();
     read_lines(&bundle_path())
+}
+
+/// Move a bundle written by an earlier version into the location herdr gives us.
+///
+/// Only ever copies into an empty slot — if a bundle already exists at the real location,
+/// the legacy file is left alone and nothing is overwritten. Copy rather than move, so a
+/// mistake here cannot lose the user's list.
+fn migrate_legacy_bundle() {
+    let current = bundle_path();
+    if current.exists() {
+        return;
+    }
+    let legacy = legacy_config_dir().join("plugins.list");
+    if !legacy.exists() || legacy == current {
+        return;
+    }
+    let Ok(body) = fs::read_to_string(&legacy) else {
+        return;
+    };
+    if ensure_parent(&current).is_err() || fs::write(&current, &body).is_err() {
+        return;
+    }
+    println!(
+        "moved your plugin list to the location herdr uses:\n  {} -> {}\n  (the old copy is \
+         left in place; delete it when you are happy)",
+        legacy.display(),
+        current.display()
+    );
 }
 
 /// "owner/repo" or "owner/repo/subdir" -> "repo"
@@ -366,7 +416,16 @@ fn cmd_probe() -> io::Result<()> {
     println!("herdr-lazy probe — verifying the plugin <-> herdr CLI bridge\n");
     println!("HERDR_BIN_PATH = {}", herdr_bin());
     println!("config dir     = {}", config_dir().display());
-    println!("state dir      = {}", state_dir().display());
+    println!(
+        "  (from {})",
+        if env::var("HERDR_PLUGIN_CONFIG_DIR").is_ok() {
+            "HERDR_PLUGIN_CONFIG_DIR"
+        } else {
+            "`herdr plugin config-dir`, or the legacy default if herdr is unreachable"
+        }
+    );
+    println!("bundle         = {}", bundle_path().display());
+    println!("lock           = {}", lock_path().display());
     println!();
 
     // 1. Can we reach the herdr binary at all?
@@ -459,7 +518,7 @@ fn cmd_list() -> io::Result<()> {
     let desired = desired_plugins();
     if desired.is_empty() {
         println!(
-            "no bundle yet. run `herdr-lazy init`. (looked at {})",
+            "no plugin list at {} — run `herdr-lazy init`.",
             bundle_path().display()
         );
         return Ok(());
@@ -475,7 +534,10 @@ fn cmd_list() -> io::Result<()> {
 pub(crate) fn cmd_sync(prune: bool) -> io::Result<()> {
     let desired: Vec<Spec> = desired_plugins().iter().map(|l| Spec::parse(l)).collect();
     if desired.is_empty() {
-        println!("no bundle. run `herdr-lazy init` first.");
+        println!(
+            "no plugin list at {} — run `herdr-lazy init` first.",
+            bundle_path().display()
+        );
         return Ok(());
     }
 
@@ -672,7 +734,10 @@ fn prune_extras(desired: &[Spec], installed: &[Installed]) {
 pub(crate) fn cmd_update(targets: &[&str]) -> io::Result<()> {
     let desired: Vec<Spec> = desired_plugins().iter().map(|l| Spec::parse(l)).collect();
     if desired.is_empty() {
-        println!("no bundle. run `herdr-lazy init` first.");
+        println!(
+            "no plugin list at {} — run `herdr-lazy init` first.",
+            bundle_path().display()
+        );
         return Ok(());
     }
 
@@ -853,7 +918,7 @@ fn write_lock(desired: &[Spec], installed: &[Installed]) -> io::Result<()> {
 fn cmd_add(spec: &str) -> io::Result<()> {
     let p = bundle_path();
     if read_lines(&p).iter().any(|l| l.as_str() == spec) {
-        println!("{} already in bundle", spec);
+        println!("{} is already in your list", spec);
         return Ok(());
     }
     ensure_parent(&p)?;
@@ -874,7 +939,7 @@ fn cmd_remove(spec: &str) -> io::Result<()> {
     let content = match fs::read_to_string(&p) {
         Ok(c) => c,
         Err(_) => {
-            println!("no bundle yet.");
+            println!("no plugin list at {}.", bundle_path().display());
             return Ok(());
         }
     };
