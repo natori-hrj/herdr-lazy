@@ -30,6 +30,8 @@ machine. herdr-lazy adds both.
   plugins at the same commits.
 - **A manage pane.** A herdr overlay pane with the same operations on single keys —
   lowercase acts on the row under the cursor, SHIFT on the whole list.
+- **Marketplace search, in the pane.** Press `/` to search all published herdr plugins by
+  name, description or topic, and add one to your list without leaving the terminal.
 - **A curated default set.** `init` writes a starting bundle so a fresh herdr is useful
   immediately.
 
@@ -92,7 +94,7 @@ herdr-lazy update smarzban/herdr-file-viewer
 | `sync [<repo>…] [--prune]` | converge installed plugins to the list |
 | `update [<repo>…]` | re-resolve unpinned entries to their latest commit |
 | `restore [<repo>…]` | put plugins back to the commits in the lockfile |
-| `ui` / `manage` | open the manage pane |
+| `ui` / `manage` | open the manage pane (`/` inside it searches the marketplace) |
 | `add <owner/repo>` | add an entry to the bundle |
 | `remove <owner/repo>` | remove an entry from the bundle |
 | `lock` | write the lockfile from the current bundle |
@@ -106,6 +108,35 @@ herdr-lazy` prints it:
 
 Run from a shell, herdr-lazy asks herdr for that path rather than guessing, so the CLI and
 the manage pane always read the same files.
+
+## Finding plugins
+
+herdr publishes its marketplace as a single index, so the pane can search it directly.
+Press `/`, type, and Enter adds the highlighted plugin to your list; `esc` then `s` installs
+it.
+
+```
+ marketplace  95 of 275 · cached 3m ago
+ search: wor
+ ─────────────────────────────────────────────────────────────────────────────────
+ >     43★ devashish2203/herdr-worktrunk     Herdr Plugin to integrate worktrunk …
+       41★ yuk1ty/herdr-spreader             Spin up your whole herdr workspace la…
+       29★ NathanFlurry/herdr-plugin-jj-work Create and remove Jujutsu (jj) worksp…
+ ─────────────────────────────────────────────────────────────────────────────────
+ enter add to list  ctrl+r refresh  esc back
+```
+
+Search terms are ANDed and each may match the name, description or topics, so `worktree fzf`
+finds a worktree plugin whose description mentions fzf.
+
+Enter adds to your list rather than installing outright: one keystroke on a fuzzy match
+should not run a stranger's build script. The list is where intent is recorded.
+
+The index is cached for six hours (`ctrl+r` refreshes) and works offline from that cache,
+saying how old it is. Two caveats worth stating plainly: the index endpoint is **not a
+documented API** — it is what the marketplace page itself fetches, and it may change without
+notice — and everything here fails soft, so if it becomes unreachable, browsing stops working
+and nothing else does.
 
 ## Pinning and reproducibility
 
