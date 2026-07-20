@@ -8,14 +8,40 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
-# Pinned to commit SHAs, not tags: a tag is mutable, and this job runs with `contents: write`
-# to publish binaries that users download and execute. A compromised upstream tag would be a
-# direct path into other people's machines. Update deliberately, checking what changed.
+# Actions are pinned to commit SHAs, not tags: a tag is mutable, and these jobs run with
+# `contents: write` to publish binaries that users download and execute. A compromised
+# upstream tag would be a direct path into other people's machines.
 permissions:
   contents: write
 
 jobs:
+  # The release is created exactly once, before anything uploads to it.
+  #
+  # Previously each matrix job created-or-updated the release itself, which is a race: four
+  # jobs finish at once, one creates it and the rest fail with `already_exists`, leaving the
+  # release missing whichever platform lost. That is worse than a failed release, because it
+  # looks successful while quietly shipping an incomplete set.
+  create-release:
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create the release if it does not exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME already exists"
+          else
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
+          fi
+
   build:
+    needs: [create-release]
+    # `always()` so a non-tag run, where create-release is skipped, still builds.
+    if: always() && needs.create-release.result != 'failure'
+
     strategy:
       fail-fast: false
       matrix:
@@ -81,9 +107,15 @@ jobs:
           fi
           echo "asset=$asset" >> "$GITHUB_OUTPUT"
 
-      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+      # Upload with gh rather than a third-party action: the release already exists, so this
+      # is a plain upload, and it removes an action from the supply chain of a job that
+      # publishes executables. `--clobber` makes a re-run idempotent.
+      - name: Upload
         if: github.ref_type == 'tag'
-        with:
-          files: |
-            ${{ steps.package.outputs.asset }}
-            ${{ steps.package.outputs.asset }}.sha256
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASSET: ${{ steps.package.outputs.asset }}
+        run: |
+          set -euo pipefail
+          gh release upload "$GITHUB_REF_NAME" "$ASSET" "$ASSET.sha256" \
+            --repo "$GITHUB_REPOSITORY" --clobber
