@@ -100,6 +100,9 @@ struct Row {
     /// `owner/repo`, when known — what `a` adds. `None` for a local link, which has no repo
     /// to record, so it can never be adopted into the list.
     slug: Option<String>,
+    /// herdr's id for the installed plugin, and how it was installed. Present only when the
+    /// row corresponds to something actually installed — which is exactly when `x` applies.
+    installed: Option<(String, String)>,
 }
 
 /// Build the view: every bundle entry, then anything installed that the bundle does not name.
@@ -132,6 +135,7 @@ fn rows(desired: &[Spec], installed: &[Installed]) -> Vec<Row> {
             status,
             listed_as: Some(spec.display()),
             slug: Some(spec.repo.clone()),
+            installed: hit.map(|(p, _)| (p.plugin_id.clone(), p.source_kind.clone())),
         });
     }
 
@@ -150,6 +154,7 @@ fn rows(desired: &[Spec], installed: &[Installed]) -> Vec<Row> {
             },
             listed_as: None,
             slug: p.slug.clone(),
+            installed: Some((p.plugin_id.clone(), p.source_kind.clone())),
         });
     }
 
@@ -218,6 +223,57 @@ impl App {
             Ok(msg) => msg,
             Err(e) => format!("could not write the list: {}", e),
         });
+        self.refresh();
+    }
+
+    /// `s` — install or repair just the selected entry.
+    fn sync_selected(&mut self) -> io::Result<()> {
+        let Some(row) = self.selected() else {
+            return Ok(());
+        };
+        if row.listed_as.is_none() {
+            self.flash = Some(format!(
+                "{} is not in your list — press a to adopt it first",
+                row.label
+            ));
+            return Ok(());
+        }
+        let repo = row.slug.clone().unwrap_or_default();
+        suspended(|| {
+            let _ = crate::cmd_sync(false, &[repo.as_str()]);
+        })?;
+        self.refresh();
+        Ok(())
+    }
+
+    /// `u` — update just the selected entry.
+    fn update_selected(&mut self) -> io::Result<()> {
+        let Some(row) = self.selected() else {
+            return Ok(());
+        };
+        if row.listed_as.is_none() {
+            self.flash = Some(format!(
+                "{} is not in your list — press a to adopt it first",
+                row.label
+            ));
+            return Ok(());
+        }
+        let repo = row.slug.clone().unwrap_or_default();
+        suspended(|| {
+            let _ = crate::cmd_update(&[repo.as_str()]);
+        })?;
+        self.refresh();
+        Ok(())
+    }
+
+    /// `x` — uninstall just the selected plugin.
+    fn uninstall_selected(&mut self) {
+        let Some(row) = self.selected() else { return };
+        let Some((id, kind)) = row.installed.clone() else {
+            self.flash = Some(format!("{} is not installed", row.label));
+            return;
+        };
+        self.flash = Some(crate::uninstall_plugin(&id, &kind));
         self.refresh();
     }
 
@@ -293,10 +349,20 @@ impl App {
             )?;
         }
 
-        let legend = "\x1b[1ms\x1b[0m sync  \x1b[1mu\x1b[0m update  \x1b[1ma\x1b[0m adopt                        \x1b[1md\x1b[0m drop  \x1b[1mx\x1b[0m uninstall extras                        \x1b[1mr\x1b[0m refresh  \x1b[1mq\x1b[0m quit";
+        // Built by concatenation rather than one long literal: a `\`-continued string keeps
+        // the indentation of the following line, which had been padding the legend with runs
+        // of spaces.
+        const BOLD: &str = "\x1b[1m";
+        const OFF: &str = "\x1b[0m";
+        let legend = format!(
+            "{B}s{O}ync  {B}u{O}pdate  {B}a{O}dopt  {B}d{O}rop  {B}x{O} uninstall  \
+             \x1b[2mSHIFT = all{O}  {B}r{O}efresh  {B}q{O}uit",
+            B = BOLD,
+            O = OFF
+        );
         let footer = match &self.flash {
             Some(msg) => format!("\x1b[36m{}\x1b[0m", msg),
-            None => legend.to_string(),
+            None => legend,
         };
         write!(
             out,
@@ -435,21 +501,25 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             KeyCode::Char('g') | KeyCode::Home => app.cursor = 0,
             KeyCode::Char('G') | KeyCode::End => app.cursor = app.rows.len().saturating_sub(1),
 
-            KeyCode::Char('s') => {
+            // Lowercase acts on the row under the cursor; uppercase on the whole list.
+            KeyCode::Char('s') => app.sync_selected()?,
+            KeyCode::Char('S') => {
                 suspended(|| {
-                    let _ = crate::cmd_sync(false);
+                    let _ = crate::cmd_sync(false, &[]);
                 })?;
                 app.refresh();
             }
-            KeyCode::Char('u') => {
+            KeyCode::Char('u') => app.update_selected()?,
+            KeyCode::Char('U') => {
                 suspended(|| {
                     let _ = crate::cmd_update(&[]);
                 })?;
                 app.refresh();
             }
-            KeyCode::Char('x') => {
+            KeyCode::Char('x') => app.uninstall_selected(),
+            KeyCode::Char('X') => {
                 suspended(|| {
-                    let _ = crate::cmd_sync(true);
+                    let _ = crate::cmd_sync(true, &[]);
                 })?;
                 app.refresh();
             }
@@ -664,6 +734,33 @@ mod tests {
         // Ctrl+C remains the one honoured chord.
         assert_eq!(classify(&ctrl('c')), Action::Quit);
         assert_eq!(classify(&plain('q')), Action::Command('q'));
+    }
+
+    /// Uppercase must reach the dispatcher as its own command, not be folded into the
+    /// lowercase one — `S` means "the whole list" and `s` means "this row".
+    #[test]
+    fn shifted_letters_are_distinct_commands() {
+        let shifted = KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT);
+        assert_eq!(classify(&shifted), Action::Command('S'));
+        let plain = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
+        assert_eq!(classify(&plain), Action::Command('s'));
+    }
+
+    /// `x` uninstalls by herdr's plugin id, so every row that is actually installed must
+    /// carry it — including listed rows, which are the ones a user is most likely to remove.
+    #[test]
+    fn installed_rows_carry_the_id_needed_to_uninstall() {
+        let desired = vec![Spec::parse("o/listed"), Spec::parse("o/absent")];
+        let installed = vec![github("o", "listed", SHA, true), local("herdr-lazy")];
+        let r = rows(&desired, &installed);
+
+        assert_eq!(r[0].installed, Some(("listed".into(), "github".into())));
+        assert_eq!(
+            r[1].installed, None,
+            "a missing entry cannot be uninstalled"
+        );
+        let link = r.iter().find(|x| x.status == Status::ExtraLocal).unwrap();
+        assert_eq!(link.installed, Some(("herdr-lazy".into(), "local".into())));
     }
 
     #[test]

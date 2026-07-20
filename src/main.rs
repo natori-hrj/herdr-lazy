@@ -531,8 +531,26 @@ fn cmd_list() -> io::Result<()> {
 }
 
 /// Converge the installed plugin set to the bundle.
-pub(crate) fn cmd_sync(prune: bool) -> io::Result<()> {
-    let desired: Vec<Spec> = desired_plugins().iter().map(|l| Spec::parse(l)).collect();
+/// Converge the installed plugin set to the list.
+///
+/// `targets` restricts the work to named `owner/repo` entries; empty means everything. The
+/// lock is only rewritten on a full run — a targeted sync is a partial view of the world, and
+/// writing the lock from it would drop every entry it did not look at.
+pub(crate) fn cmd_sync(prune: bool, targets: &[&str]) -> io::Result<()> {
+    let all: Vec<Spec> = desired_plugins().iter().map(|l| Spec::parse(l)).collect();
+    let desired: Vec<Spec> = if targets.is_empty() {
+        all.clone()
+    } else {
+        for t in targets {
+            if !all.iter().any(|s| s.repo == *t) {
+                println!("! {} is not in your list — skipping", t);
+            }
+        }
+        all.iter()
+            .filter(|s| targets.iter().any(|t| *t == s.repo))
+            .cloned()
+            .collect()
+    };
     if desired.is_empty() {
         println!(
             "no plugin list at {} — run `herdr-lazy init` first.",
@@ -643,8 +661,10 @@ pub(crate) fn cmd_sync(prune: bool) -> io::Result<()> {
         }
     }
 
+    // Prune compares against the WHOLE list, never the filtered subset: an entry that was
+    // filtered out is still wanted, and pruning against the subset would uninstall it.
     if prune {
-        prune_extras(&desired, &installed);
+        prune_extras(&all, &installed);
     }
 
     println!(
@@ -660,7 +680,7 @@ pub(crate) fn cmd_sync(prune: bool) -> io::Result<()> {
         eprintln!("warning: could not re-read plugin list for the lock: {}", e);
         installed.clone()
     });
-    write_lock(&desired, &after)?;
+    write_lock(&all, &after)?;
     Ok(())
 }
 
@@ -720,6 +740,28 @@ fn prune_extras(desired: &[Spec], installed: &[Installed]) {
         }
     }
     println!("pruned {} plugin(s)", removed);
+}
+
+/// Uninstall one plugin, applying the same rule `--prune` uses.
+///
+/// Returns a message rather than printing: the manage pane calls this while it owns the
+/// screen. Refuses local links for the same reason prune does — they have no owner/repo, and
+/// herdr-lazy is normally one, so this stops the pane uninstalling the tool running it.
+pub(crate) fn uninstall_plugin(plugin_id: &str, source_kind: &str) -> String {
+    if source_kind == "local" {
+        return format!(
+            "{} is a local link — use `herdr plugin unlink {}` if you really mean it",
+            plugin_id, plugin_id
+        );
+    }
+    match run_herdr(&["plugin", "uninstall", plugin_id]) {
+        Ok((true, _, _)) => format!("uninstalled {}", plugin_id),
+        Ok((false, out, err)) => {
+            let msg = if err.trim().is_empty() { out } else { err };
+            format!("could not uninstall {}: {}", plugin_id, msg.trim())
+        }
+        Err(e) => format!("could not run herdr: {}", e),
+    }
 }
 
 /// Re-resolve unpinned bundle entries to their latest commit.
@@ -995,7 +1037,14 @@ fn main() {
         "probe" => cmd_probe(),
         "init" => cmd_init(rest.contains(&"--force")),
         "list" => cmd_list(),
-        "sync" => cmd_sync(rest.contains(&"--prune")),
+        "sync" => {
+            let targets: Vec<&str> = rest
+                .iter()
+                .copied()
+                .filter(|a| !a.starts_with("--"))
+                .collect();
+            cmd_sync(rest.contains(&"--prune"), &targets)
+        }
         "ui" | "manage" => ui::run(),
         "update" => {
             let targets: Vec<&str> = rest

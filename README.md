@@ -18,7 +18,7 @@ machine. herdr-lazy adds both.
  + someone/unlisted                 8facfbb2a7bd  installed, not in your list — press x to remove
  ⚑ herdr-lazy                       -             installed as a local link — never removed by prune
  ────────────────────────────────────────────────────────────────
- s sync  u update  x remove extras  r refresh  q quit
+ sync  update  adopt  drop  x uninstall   SHIFT = all   refresh  quit
 ```
 
 ## What it gives you
@@ -28,7 +28,8 @@ machine. herdr-lazy adds both.
 - **A real lockfile.** Entries pin to a commit, and the lock records the commit herdr
   actually checked out. Copy the lock to another machine, `sync`, and you get the same
   plugins at the same commits.
-- **A manage pane.** A herdr overlay pane with the same operations on single keys.
+- **A manage pane.** A herdr overlay pane with the same operations on single keys —
+  lowercase acts on the row under the cursor, SHIFT on the whole list.
 - **A curated default set.** `init` writes a starting bundle so a fresh herdr is useful
   immediately.
 
@@ -65,18 +66,25 @@ Pick a key that is actually free — `prefix+l` is `focus_pane_right`, and `h`/`
 ## Use
 
 ```sh
-herdr-lazy init          # write the curated default bundle
-herdr-lazy list          # show what the bundle asks for
+herdr-lazy init          # write the curated default list
+herdr-lazy list          # show what the list asks for
 herdr-lazy sync          # install what is missing
 herdr-lazy update        # move unpinned entries to their latest commit
-herdr-lazy sync --prune  # also remove anything not in the bundle
+herdr-lazy sync --prune  # also uninstall anything not in the list
+```
+
+`sync` and `update` take plugin names to work on just those:
+
+```sh
+herdr-lazy sync cloudmanic/herdr-plus
+herdr-lazy update smarzban/herdr-file-viewer
 ```
 
 | command | what it does |
 |---|---|
 | `init [--force]` | write the curated default bundle |
 | `list` | show the desired plugin set |
-| `sync [--prune]` | converge installed plugins to the bundle |
+| `sync [<repo>…] [--prune]` | converge installed plugins to the list |
 | `update [<repo>…]` | re-resolve unpinned entries to their latest commit |
 | `ui` / `manage` | open the manage pane |
 | `add <owner/repo>` | add an entry to the bundle |
