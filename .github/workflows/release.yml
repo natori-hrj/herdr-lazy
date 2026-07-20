@@ -1,0 +1,68 @@
+name: release
+
+# Publishes the prebuilt binaries that scripts/fetch-or-build.sh looks for, so installing
+# the plugin does not require a Rust toolchain. Asset names must stay in sync with that
+# script: herdr-lazy-<version>-<triple>.tar.gz, each with a .sha256 beside it.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add ${{ matrix.target }}
+
+      - run: cargo test --locked --target ${{ matrix.target }}
+
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Take the version from the manifest, which is what the install script reads.
+          version=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' herdr-plugin.toml | head -1)
+          asset="herdr-lazy-${version}-${{ matrix.target }}.tar.gz"
+
+          # A tag must not disagree with the manifest, or the install script will look for
+          # an asset that was never published.
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match manifest version ${version}" >&2
+            exit 1
+          fi
+
+          staging=$(mktemp -d)
+          cp "target/${{ matrix.target }}/release/herdr-lazy" "$staging/"
+          tar -czf "$asset" -C "$staging" herdr-lazy
+          shasum -a 256 "$asset" | cut -d' ' -f1 > "$asset.sha256"
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+
+      - uses: softprops/action-gh-release@v2
+        if: github.ref_type == 'tag'
+        with:
+          files: |
+            ${{ steps.package.outputs.asset }}
+            ${{ steps.package.outputs.asset }}.sha256

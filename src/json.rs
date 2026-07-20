@@ -1,7 +1,9 @@
 //! A minimal JSON reader — just enough to consume `herdr plugin list --json`.
 //!
-//! Why hand-rolled: the project is deliberately dependency-free (offline build, no
-//! supply-chain surface), so no serde.
+//! Why hand-rolled: the payload is one known shape from one known producer, and reading it
+//! needs a few string fields. serde + serde_json would be ~40 crates for that. The project
+//! takes a dependency only where std genuinely cannot do the job (see `ui`, which needs raw
+//! terminal mode); this is not one of those places.
 //!
 //! Why a real parser rather than scanning for `"plugin_id":"..."`: the payload nests
 //! objects that reuse key names — every entry in `actions[]` has its own `id`, and
@@ -101,7 +103,12 @@ impl<'a> Parser<'a> {
     fn expect(&mut self, c: char) -> Result<(), String> {
         match self.bump() {
             Some(got) if got == c => Ok(()),
-            Some(got) => Err(format!("expected `{}`, found `{}` at {}", c, got, self.i - 1)),
+            Some(got) => Err(format!(
+                "expected `{}`, found `{}` at {}",
+                c,
+                got,
+                self.i - 1
+            )),
             None => Err(format!("expected `{}`, found end of input", c)),
         }
     }
@@ -275,7 +282,8 @@ mod tests {
 
     #[test]
     fn empty_plugin_list() {
-        let v = parse(r#"{"id":"cli:plugin","result":{"plugins":[],"type":"plugin_list"}}"#).unwrap();
+        let v =
+            parse(r#"{"id":"cli:plugin","result":{"plugins":[],"type":"plugin_list"}}"#).unwrap();
         assert!(v
             .path(&["result", "plugins"])
             .unwrap()

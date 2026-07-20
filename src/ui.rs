@@ -55,11 +55,11 @@ impl Status {
     /// is simpler to read here than a builder chain.
     fn colour(&self) -> &'static str {
         match self {
-            Status::Ok => "\x1b[32m",                              // green
+            Status::Ok => "\x1b[32m",                               // green
             Status::Missing | Status::Drifted { .. } => "\x1b[33m", // yellow
             Status::Unverifiable | Status::Disabled => "\x1b[36m",  // cyan
-            Status::Extra => "\x1b[31m",                           // red
-            Status::ExtraLocal => "\x1b[35m",                      // magenta
+            Status::Extra => "\x1b[31m",                            // red
+            Status::ExtraLocal => "\x1b[35m",                       // magenta
         }
     }
 

@@ -2,7 +2,18 @@
 name = "herdr-lazy"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.78"
 description = "Be lazy: a curated, batteries-included plugin distro & manager for herdr"
+license = "MIT"
+repository = "https://github.com/natori-hrj/herdr-lazy"
+homepage = "https://github.com/natori-hrj/herdr-lazy"
+readme = "README.md"
+keywords = ["herdr", "plugin-manager", "tui", "lockfile", "distro"]
+categories = ["command-line-utilities", "development-tools"]
+
+[profile.release]
+strip = true
+lto = "thin"
 
 [[bin]]
 name = "herdr-lazy"

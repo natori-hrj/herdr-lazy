@@ -27,18 +27,42 @@ mod ui;
 use std::env;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Curated "batteries-included" default set (the LazyVim layer).
-/// Edit freely — `herdr-lazy init` writes these into your bundle file.
+///
+/// Two criteria, applied in order: prefer what the ecosystem has already vetted, then fill
+/// the gaps nothing else covers. Overlapping plugins are deliberately excluded rather than
+/// stacked — two plugins that both open a file pane is a worse default than one.
+///
+/// A third criterion, learned the hard way: it has to actually install. herdr runs plugin
+/// builds with a minimal PATH that excludes `~/.cargo/bin`, so a plugin whose build is a bare
+/// `cargo build --release` fails on machines where Rust is installed and works fine in the
+/// user's own shell. A default set must not hand a new user a failed install.
+///
+/// Excluded, and why (revisit if these change):
+///   - `yuk1ty/herdr-spreader` (41★) — the better-known layout plugin, but its build is a bare
+///     `cargo build` and it fails to install under herdr's build PATH (verified 2026-07-20).
+///     herdr-plugin-workspace-manager does the same job with no build step at all, so it wins
+///     on the criterion that matters most for a default.
+///   - `persiyanov/herdr-reviewr` (152★) — excellent, but it bundles its own file viewer, so
+///     it duplicates herdr-file-viewer. A review-first workflow should swap, not add.
+///   - `dcolinmorgan/herdr-remote` (100★), `AltanS/collie` (63★) — remote approval overlaps
+///     herdr-hail. All three are good; which fits depends on where you want to be pinged,
+///     which is not something a default set should decide.
+///
+/// Edit freely — `herdr-lazy init` writes these into your bundle file, and nothing here is
+/// load-bearing.
 const DEFAULT_BUNDLE: &[&str] = &[
-    "natori-hrj/herdr-hail",
-    "natori-hrj/herdr-triage",
-    "natori-hrj/herdr-green",
-    "natori-hrj/herdr-standup",
-    "cloudmanic/herdr-plus",
-    "razajamil/herdr-plugin-workspace-manager",
+    // Proven in the ecosystem, and verified to install cleanly.
+    "cloudmanic/herdr-plus",                    // projects + quick actions
+    "smarzban/herdr-file-viewer",               // git-aware read-only file pane
+    "razajamil/herdr-plugin-workspace-manager", // per-workspace tab/pane layouts; no build step
+    // Gaps nothing else covers: keeping a human oriented across several running agents.
+    "natori-hrj/herdr-triage",  // which agent needs you most
+    "natori-hrj/herdr-green",   // did its tests pass when it finished
+    "natori-hrj/herdr-standup", // what all your agents actually changed
 ];
 
 fn herdr_bin() -> String {
@@ -73,7 +97,7 @@ fn lock_path() -> PathBuf {
     state_dir().join("plugins.lock")
 }
 
-fn ensure_parent(p: &PathBuf) -> io::Result<()> {
+fn ensure_parent(p: &Path) -> io::Result<()> {
     if let Some(parent) = p.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -91,7 +115,7 @@ fn run_herdr(args: &[&str]) -> io::Result<(bool, String, String)> {
 }
 
 /// Read a simple list file: one entry per line, `#` comments and blanks ignored.
-fn read_lines(p: &PathBuf) -> Vec<String> {
+fn read_lines(p: &Path) -> Vec<String> {
     match fs::read_to_string(p) {
         Ok(s) => s
             .lines()
@@ -511,7 +535,12 @@ pub(crate) fn cmd_sync(prune: bool) -> io::Result<()> {
                 } else {
                     format!("  ({})", notes.join("; "))
                 };
-                println!("= {} (present as {}){}", spec.display(), p.plugin_id, suffix);
+                println!(
+                    "= {} (present as {}){}",
+                    spec.display(),
+                    p.plugin_id,
+                    suffix
+                );
                 continue;
             }
 
@@ -897,7 +926,11 @@ fn main() {
         "sync" => cmd_sync(rest.contains(&"--prune")),
         "ui" | "manage" => ui::run(),
         "update" => {
-            let targets: Vec<&str> = rest.iter().copied().filter(|a| !a.starts_with("--")).collect();
+            let targets: Vec<&str> = rest
+                .iter()
+                .copied()
+                .filter(|a| !a.starts_with("--"))
+                .collect();
             cmd_update(&targets)
         }
         "add" => match rest.first() {
@@ -999,14 +1032,23 @@ mod tests {
     #[test]
     fn slug_match_beats_a_same_named_repo_from_another_owner() {
         let p = from_github("smarzban", "herdr-file-viewer");
-        assert_eq!(p.matches(&Spec::parse("impostor/herdr-file-viewer")), Match::Weak);
-        assert_eq!(p.matches(&Spec::parse("smarzban/herdr-file-viewer")), Match::Strong);
+        assert_eq!(
+            p.matches(&Spec::parse("impostor/herdr-file-viewer")),
+            Match::Weak
+        );
+        assert_eq!(
+            p.matches(&Spec::parse("smarzban/herdr-file-viewer")),
+            Match::Strong
+        );
     }
 
     #[test]
     fn subdir_spec_matches_its_parent_repo_slug() {
         let p = from_github("owner", "repo");
-        assert_eq!(p.matches(&Spec::parse("owner/repo/plugins/x")), Match::Strong);
+        assert_eq!(
+            p.matches(&Spec::parse("owner/repo/plugins/x")),
+            Match::Strong
+        );
         // ...but a different repo that merely shares a prefix must not.
         assert_eq!(p.matches(&Spec::parse("owner/repo-other")), Match::None);
     }
@@ -1059,7 +1101,10 @@ mod tests {
     fn a_pinned_entry_at_the_right_commit_is_satisfied() {
         let sha = "a8f86ec4103bc367b52e547b492483f3b792a952";
         assert_eq!(
-            pin_state(&Spec::parse(&format!("owner/repo@{}", sha)), &at_commit(Some(sha))),
+            pin_state(
+                &Spec::parse(&format!("owner/repo@{}", sha)),
+                &at_commit(Some(sha))
+            ),
             PinState::Satisfied
         );
         // An abbreviated pin is satisfied by the full commit it prefixes.
@@ -1088,7 +1133,10 @@ mod tests {
     fn tag_and_branch_pins_are_unverifiable() {
         for r in ["v1.13.0", "main", "release-2"] {
             assert_eq!(
-                pin_state(&Spec::parse(&format!("owner/repo@{}", r)), &at_commit(Some("f32b0825f125"))),
+                pin_state(
+                    &Spec::parse(&format!("owner/repo@{}", r)),
+                    &at_commit(Some("f32b0825f125"))
+                ),
                 PinState::Unverifiable,
                 "{} should be unverifiable",
                 r
@@ -1115,7 +1163,10 @@ mod tests {
 
     #[test]
     fn short_abbreviates_shas_but_not_tags() {
-        assert_eq!(short("10e93033263549600e75119c5617dac48137d011"), "10e930332635");
+        assert_eq!(
+            short("10e93033263549600e75119c5617dac48137d011"),
+            "10e930332635"
+        );
         // A `--ref` may be a tag or branch; truncating those would be misleading.
         assert_eq!(short("v1.13.0"), "v1.13.0");
         assert_eq!(short("release-candidate-2"), "release-candidate-2");
@@ -1166,7 +1217,10 @@ mod tests {
         let p = installed("anything", "github", &["github", "owner/repo"]);
         assert_eq!(p.matches(&Spec::parse("owner/repo")), Match::Strong);
         // A pin must not change identity — same repo, same plugin.
-        assert_eq!(p.matches(&Spec::parse("owner/repo@deadbeef")), Match::Strong);
+        assert_eq!(
+            p.matches(&Spec::parse("owner/repo@deadbeef")),
+            Match::Strong
+        );
     }
 
     #[test]

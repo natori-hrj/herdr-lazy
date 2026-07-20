@@ -5,9 +5,18 @@ min_herdr_version = "0.7.0"
 description = "Be lazy: a curated, batteries-included plugin distro & manager for herdr"
 platforms = ["linux", "macos", "windows"]
 
-# herdr runs this after `plugin install` (before registering the plugin).
-# Produces target/release/herdr-lazy.
+# herdr runs this after `plugin install`, before registering the plugin.
+# Both paths produce target/release/herdr-lazy, which the actions and pane below execute.
+#
+# On Unix, try a checksum-verified prebuilt binary first so installing does not require a
+# Rust toolchain; the script falls back to `cargo build --release` whenever that is not
+# possible. Windows has no prebuilt yet and builds from source directly.
 [[build]]
+platforms = ["linux", "macos"]
+command = ["/bin/sh", "scripts/fetch-or-build.sh"]
+
+[[build]]
+platforms = ["windows"]
 command = ["cargo", "build", "--release"]
 
 # Actions surface herdr-lazy inside herdr's command palette.

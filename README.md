@@ -1,87 +1,173 @@
 # herdr-lazy
 
-> Be lazy. Install one plugin, get a sensible herd — then customize.
+> Be lazy. Declare the plugins you want; let the tool converge your machine to them.
 
-A curated, batteries-included plugin **distro** and **manager** for
-[herdr](https://herdr.dev), in the spirit of LazyVim:
+A declarative plugin **manager** and curated **distro** for [herdr](https://herdr.dev),
+in the spirit of lazy.nvim and LazyVim.
 
-- **Manager layer** — a declarative bundle file plus `sync` that converges your
-  installed plugins to it. (the lazy.nvim idea)
-- **Distro layer** — `init` drops a curated default set so a fresh herdr is
-  useful immediately, without hunting the marketplace. (the LazyVim idea)
+herdr installs plugins one imperative command at a time. There is no way to declare
+the set you want, and no lockfile — so a working setup cannot be reproduced on another
+machine ([herdr#1427](https://github.com/ogulcancelik/herdr/discussions/1427)).
+herdr-lazy adds both.
 
-herdr-lazy is itself a herdr plugin: it drives the herdr CLI (via
-`HERDR_BIN_PATH`) to install/list/uninstall the *other* plugins.
+```
+ herdr-lazy  5 ok · 2 to sync · 1 extra
+ ────────────────────────────────────────────────────────────────
+ ✔ cloudmanic/herdr-plus                     f32b0825f125
+ ✗ smarzban/herdr-file-viewer                -             not installed — press s
+ ↻ owner/pinned-plugin@9f3c1ab               b872365a12f4  at b872365a12f4 — press s to restore the pin
+ + someone/unwanted                          8facfbb2a7bd  not in bundle — press x to prune
+ ⚑ my.local-plugin                           -             local link — prune will not touch it
+ ────────────────────────────────────────────────────────────────
+ s sync  u update  x prune  r refresh  q quit
+```
 
-## Status: early MVP
+## What it gives you
 
-Written in Rust (same language as herdr core), std-only, no dependencies.
+- **A declarative bundle.** One `owner/repo` per line. `sync` converges your machine
+  to it — installing what is missing, and (with `--prune`) removing what is not listed.
+- **A real lockfile.** Entries pin to a commit, and the lock records the commit herdr
+  actually checked out. Copy the lock to another machine, `sync`, and you get the same
+  plugins at the same commits.
+- **A manage pane.** A herdr overlay pane with the same operations on single keys.
+- **A curated default set.** `init` writes a starting bundle so a fresh herdr is useful
+  immediately.
 
-Commands:
+herdr-lazy is itself a herdr plugin: it drives the herdr CLI (via `HERDR_BIN_PATH`) to
+manage the *other* plugins.
+
+## Install
+
+Requires herdr ≥ 0.7.0.
+
+```sh
+herdr plugin install natori-hrj/herdr-lazy
+```
+
+Install fetches a prebuilt binary and verifies its SHA-256; if none matches your platform,
+or anything about the download is not exactly right, it falls back to building from source
+with [Rust](https://rustup.rs) (≥ 1.78). No toolchain is needed on the fast path.
+
+Then open the manage pane from the command palette (**Lazy: open manage pane**), or
+bind it:
+
+```toml
+# ~/.config/herdr/config.toml
+[[keys.command]]
+key = "prefix+l"
+type = "plugin_action"
+command = "natori.lazy.manage"
+```
+
+## Use
+
+```sh
+herdr-lazy init          # write the curated default bundle
+herdr-lazy list          # show what the bundle asks for
+herdr-lazy sync          # install what is missing
+herdr-lazy update        # move unpinned entries to their latest commit
+herdr-lazy sync --prune  # also remove anything not in the bundle
+```
 
 | command | what it does |
 |---|---|
-| `probe` | verify the plugin↔herdr CLI bridge and dump `plugin list`'s real format |
 | `init [--force]` | write the curated default bundle |
 | `list` | show the desired plugin set |
-| `sync [--prune]` | install everything in the bundle that's missing |
-| `add <owner/repo>` | add a plugin to the bundle |
-| `remove <owner/repo>` | remove a plugin from the bundle |
-| `lock` | record the desired set |
+| `sync [--prune]` | converge installed plugins to the bundle |
+| `update [<repo>…]` | re-resolve unpinned entries to their latest commit |
+| `ui` / `manage` | open the manage pane |
+| `add <owner/repo>` | add an entry to the bundle |
+| `remove <owner/repo>` | remove an entry from the bundle |
+| `lock` | write the lockfile from the current bundle |
+| `probe` | dump what the herdr CLI exposes (for debugging) |
 
-## Build & try
+Files:
 
-```sh
-# 1. install Rust if needed:  https://rustup.rs
-cargo build --release          # -> target/release/herdr-lazy
+- bundle: `$HERDR_PLUGIN_CONFIG_DIR/plugins.list` (outside herdr: `~/.config/herdr-lazy/`)
+- lock: `$HERDR_PLUGIN_STATE_DIR/plugins.lock` (outside herdr: `~/.local/state/herdr-lazy/`)
 
-# 2. FIRST run probe on a machine with herdr installed.
-#    This is the make-or-break check + it reveals the `plugin list` format.
-HERDR_BIN_PATH="$(command -v herdr)" ./target/release/herdr-lazy probe
-
-# 3. once probe looks good:
-./target/release/herdr-lazy init      # write curated defaults
-./target/release/herdr-lazy sync      # install them
-```
-
-Files it uses:
-
-- bundle:  `$HERDR_PLUGIN_CONFIG_DIR/plugins.list`  (falls back to `~/.config/herdr-lazy/`)
-- lock:    `$HERDR_PLUGIN_STATE_DIR/plugins.lock`   (falls back to `~/.local/state/herdr-lazy/`)
-
-## Pinning
-
-A bundle entry may pin a commit, tag, or branch:
+## Pinning and reproducibility
 
 ```
-owner/repo                 # tracks the default branch
-owner/repo@v1.2.0          # pinned
-owner/repo@9f3c1ab         # pinned to a commit — reproducible
+owner/repo             # tracks the default branch
+owner/repo@v1.2.0      # pinned to a tag
+owner/repo@9f3c1ab     # pinned to a commit — reproducible and checkable
 ```
 
-This maps onto herdr's native `plugin install --ref REF`, so a fully-pinned bundle
-reproduces the same plugin set on another machine. `lock` reports how many entries
-are still floating.
+These map onto herdr's native `plugin install --ref`. `sync` writes the lock from
+herdr's own `source.resolved_commit`, so the lock records what is *installed*, not
+merely what was requested.
 
-`sync` writes the lock from herdr's own `source.resolved_commit`, so the lock
-records the commit that is actually installed — not merely the ref you asked for.
-Verified round-trip: uninstall a plugin, feed the lock back in as the bundle, and
-`sync` restores the identical commit.
+`sync` also **enforces** commit pins: a plugin sitting at the wrong commit is restored,
+not silently accepted. Tag and branch pins cannot be checked locally — herdr resolves
+them at install time and does not report the original ref back — so those are flagged
+as unverifiable rather than reinstalled on every run.
 
-## Known gaps
+`update` deliberately skips pinned entries. A pin means "this commit"; moving it
+silently would make the lock disagree with the bundle. Edit the bundle to move a pin.
 
-1. **`--prune` uninstalls on strong matches only.** A match is *strong* when
-   herdr's `source` names the repo (`owner` + `repo`), *weak* when only the
-   display name lines up. Locally-linked plugins have no owner/repo at all, so
-   they are always reported and kept rather than removed — under-removing is
-   recoverable, uninstalling the wrong plugin is not.
-2. **`DEFAULT_BUNDLE` is not yet curated.** All six entries are real, installable
-   plugins, but the set was assembled by hand rather than chosen as the best
-   batteries-included default for a new user.
+## Safety
+
+`--prune` uninstalls only what it can prove is extraneous. A match is **strong** when
+herdr's `source` names the repo (`owner` + `repo`), and **weak** when only the display
+name lines up — herdr's `plugin_id` and `name` bear no reliable relation to the repo
+(`natori-hrj/herdr-hail` registers as `hail`). Prune acts on strong matches only.
+Locally-linked plugins have no owner/repo at all and are always kept: herdr-lazy is
+normally one, so this also stops prune from removing the tool running it.
+
+Under-removing is recoverable. Uninstalling the wrong plugin is not.
+
+## The default bundle
+
+A distro is an opinion, so here is the reasoning rather than just the list. Two criteria,
+in order: prefer what the ecosystem has already vetted, then fill the gaps nothing else
+covers. Overlapping plugins are excluded rather than stacked — two plugins that both open
+a file pane is a worse default than one.
+
+| plugin | why |
+|---|---|
+| [cloudmanic/herdr-plus](https://github.com/cloudmanic/herdr-plus) | projects and quick actions; the broadest general-purpose add-on |
+| [smarzban/herdr-file-viewer](https://github.com/smarzban/herdr-file-viewer) | git-aware read-only file pane |
+| [razajamil/herdr-plugin-workspace-manager](https://github.com/razajamil/herdr-plugin-workspace-manager) | per-workspace tab/pane layouts, applied automatically |
+| [natori-hrj/herdr-triage](https://github.com/natori-hrj/herdr-triage) | ranks agents by who needs you most |
+| [natori-hrj/herdr-green](https://github.com/natori-hrj/herdr-green) | runs a project's tests when its agent finishes |
+| [natori-hrj/herdr-standup](https://github.com/natori-hrj/herdr-standup) | digest of what every agent actually changed |
+
+The last three are by this project's author. They are here because running several agents
+at once creates a problem the ecosystem does not otherwise address — knowing which one to
+look at, whether its work is sound, and what it did — not because of who wrote them. If
+that is not your problem, remove them.
+
+A third criterion showed up during testing: it has to actually install. herdr runs plugin
+builds with a minimal PATH that excludes `~/.cargo/bin`, so a plugin whose build is a bare
+`cargo build --release` fails on machines where Rust is installed and works fine in your own
+shell. herdr-lazy itself works around this (see `scripts/fetch-or-build.sh`), but a default
+set cannot hand a new user a failed install.
+
+Deliberately **not** included, despite being good:
+[herdr-spreader](https://github.com/yuk1ty/herdr-spreader) (41★) is the better-known layout
+plugin, but it hits exactly that build problem, and workspace-manager does the same job with
+no build step;
+[herdr-reviewr](https://github.com/persiyanov/herdr-reviewr) bundles its own file viewer and
+so duplicates herdr-file-viewer (swap, do not add);
+[herdr-remote](https://github.com/dcolinmorgan/herdr-remote) and
+[collie](https://github.com/AltanS/collie) cover remote approval, where the right choice
+depends on where you want to be pinged — not a decision a default set should make for you.
+
+None of this is load-bearing: `init` just writes these lines into `plugins.list`. Edit it,
+or skip `init` and build your own with `add`.
 
 ## Design notes
 
-- Dependency-free by choice: the manager is orchestration (shelling out to the
-  herdr CLI and git), which std covers. Keeps builds offline and the
-  supply-chain surface at zero. Revisit if we add real TOML/git crates.
-- The curated default set lives in `DEFAULT_BUNDLE` in `src/main.rs`.
+- **Rust, and nearly dependency-free.** The manager is orchestration — shelling out to
+  the herdr CLI — which std covers, including a small hand-written JSON reader for
+  `plugin list --json`. The one dependency is `crossterm`, because std cannot put a
+  terminal into raw mode and the manage pane needs it. Not ratatui: the UI is a list
+  with a status column, and ratatui costs 70 crates against crossterm's 19.
+- **Never parse human output.** All state comes from `herdr plugin list --json`.
+- **Long operations leave the TUI** rather than being redrawn as in-pane progress, so
+  a failing plugin build shows you its actual output.
+
+## License
+
+MIT
