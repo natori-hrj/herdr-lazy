@@ -218,6 +218,46 @@ impl Installed {
     }
 }
 
+/// Whether an installed plugin actually honours its bundle entry's pin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PinState {
+    /// Not pinned, or installed at exactly the pinned commit.
+    Satisfied,
+    /// Pinned to a commit, but a different one is installed. `sync` must repair this.
+    Drifted { have: String },
+    /// Pinned to a tag or branch. herdr resolves those to a commit at install time and never
+    /// reports the original ref back, so there is nothing local to compare against. Reported,
+    /// not repaired — reinstalling on every sync just to be sure would be worse.
+    Unverifiable,
+}
+
+/// Does this ref look like a commit id (possibly abbreviated) rather than a tag or branch?
+fn is_commit_ref(r: &str) -> bool {
+    r.len() >= 7 && r.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn pin_state(spec: &Spec, installed: &Installed) -> PinState {
+    let pin = match &spec.reference {
+        Some(r) => r,
+        None => return PinState::Satisfied,
+    };
+    if !is_commit_ref(pin) {
+        return PinState::Unverifiable;
+    }
+    match &installed.resolved_commit {
+        // A local link has no commit to compare; nothing to enforce.
+        None => PinState::Unverifiable,
+        Some(have) => {
+            let (have_l, pin_l) = (have.to_lowercase(), pin.to_lowercase());
+            if have_l == pin_l || have_l.starts_with(&pin_l) {
+                PinState::Satisfied
+            } else {
+                PinState::Drifted { have: have.clone() }
+            }
+        }
+    }
+}
+
 /// Collect every string leaf in a JSON value (used to flatten a `source` object).
 fn collect_strings(v: &json::Value, out: &mut Vec<String>) {
     match v {
@@ -433,32 +473,56 @@ fn cmd_sync(prune: bool) -> io::Result<()> {
             .max_by_key(|(_, m)| (*m == Match::Strong) as u8);
 
         if let Some((p, m)) = hit {
-            present += 1;
-            let mut notes = Vec::new();
-            if m == Match::Weak {
-                notes.push(format!(
-                    "matched on name only — source says `{}`",
-                    p.source_kind
-                ));
-            }
-            // Installed but disabled satisfies the bundle only nominally: herdr will not run
-            // it. Say so, or `sync` reports success for a plugin that does nothing.
-            if !p.enabled {
-                notes.push(format!(
-                    "DISABLED — `herdr plugin enable {}` to activate",
-                    p.plugin_id
-                ));
-            }
-            let suffix = if notes.is_empty() {
-                String::new()
-            } else {
-                format!("  ({})", notes.join("; "))
+            // Being installed is not enough when the entry is pinned: a plugin sitting at the
+            // wrong commit satisfies "present" while violating the pin. Treat that as work to
+            // do, not as converged — otherwise `sync` cannot actually reproduce a bundle.
+            let drift = match pin_state(spec, p) {
+                PinState::Drifted { have } => Some(have),
+                _ => None,
             };
-            println!("= {} (present as {}){}", spec.display(), p.plugin_id, suffix);
-            continue;
+
+            if drift.is_none() {
+                present += 1;
+                let mut notes = Vec::new();
+                if m == Match::Weak {
+                    notes.push(format!(
+                        "matched on name only — source says `{}`",
+                        p.source_kind
+                    ));
+                }
+                if let PinState::Unverifiable = pin_state(spec, p) {
+                    notes.push(
+                        "pinned to a non-commit ref — cannot verify locally; \
+                         pin a commit for a checkable guarantee"
+                            .to_string(),
+                    );
+                }
+                // Installed but disabled satisfies the bundle only nominally: herdr will not
+                // run it. Say so, or `sync` reports success for a plugin that does nothing.
+                if !p.enabled {
+                    notes.push(format!(
+                        "DISABLED — `herdr plugin enable {}` to activate",
+                        p.plugin_id
+                    ));
+                }
+                let suffix = if notes.is_empty() {
+                    String::new()
+                } else {
+                    format!("  ({})", notes.join("; "))
+                };
+                println!("= {} (present as {}){}", spec.display(), p.plugin_id, suffix);
+                continue;
+            }
+
+            println!(
+                "↻ {} is at {} — restoring the pin",
+                spec.repo,
+                short(&drift.unwrap())
+            );
+        } else {
+            println!("+ installing {} ...", spec.display());
         }
 
-        println!("+ installing {} ...", spec.display());
         let mut args = vec!["plugin", "install", spec.repo.as_str()];
         if let Some(r) = &spec.reference {
             args.push("--ref");
@@ -566,6 +630,129 @@ fn prune_extras(desired: &[Spec], installed: &[Installed]) {
     println!("pruned {} plugin(s)", removed);
 }
 
+/// Re-resolve unpinned bundle entries to their latest commit.
+///
+/// herdr has no `plugin update`; re-running `plugin install` is the update path — it reports
+/// `replaces: <id> from github:owner/repo@<old sha>` and keeps the plugin's config dir. So
+/// "update" is: install again without `--ref`, then diff the resolved commits.
+///
+/// Pinned entries (`owner/repo@ref`) are skipped by design. A pin is a statement that this
+/// commit is the one you want; silently moving it would make the lockfile a lie. To move a
+/// pin, edit the bundle.
+fn cmd_update(targets: &[&str]) -> io::Result<()> {
+    let desired: Vec<Spec> = desired_plugins().iter().map(|l| Spec::parse(l)).collect();
+    if desired.is_empty() {
+        println!("no bundle. run `herdr-lazy init` first.");
+        return Ok(());
+    }
+
+    // Restrict to named plugins, if any were given.
+    let selected: Vec<&Spec> = if targets.is_empty() {
+        desired.iter().collect()
+    } else {
+        let picked: Vec<&Spec> = desired
+            .iter()
+            .filter(|s| targets.iter().any(|t| *t == s.repo))
+            .collect();
+        for t in targets {
+            if !desired.iter().any(|s| s.repo == *t) {
+                println!("! {} is not in the bundle — skipping", t);
+            }
+        }
+        picked
+    };
+    if selected.is_empty() {
+        println!("nothing to update.");
+        return Ok(());
+    }
+
+    let before = match installed_plugins() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{}", e);
+            return Ok(());
+        }
+    };
+    let commit_of = |set: &[Installed], spec: &Spec| -> Option<String> {
+        set.iter()
+            .find(|p| p.matches(spec) == Match::Strong)
+            .and_then(|p| p.resolved_commit.clone())
+    };
+
+    let mut changed = 0;
+    let mut unchanged = 0;
+    let mut pinned = 0;
+    let mut failed = 0;
+    for spec in &selected {
+        if spec.reference.is_some() {
+            pinned += 1;
+            println!("• {} (pinned — edit the bundle to move it)", spec.display());
+            continue;
+        }
+        let old = commit_of(&before, spec);
+        print!("↻ {} ... ", spec.repo);
+        match run_herdr(&["plugin", "install", spec.repo.as_str(), "--yes"]) {
+            Ok((true, _, _)) => {}
+            Ok((false, out, err)) => {
+                failed += 1;
+                println!("FAILED");
+                let msg = if err.trim().is_empty() { out } else { err };
+                if !msg.trim().is_empty() {
+                    println!("  {}", msg.trim());
+                }
+                continue;
+            }
+            Err(e) => {
+                failed += 1;
+                println!("could not run herdr: {}", e);
+                continue;
+            }
+        }
+
+        // Re-read rather than trusting the install output: `resolved_commit` is herdr's own
+        // record, and it is what the lock will be written from.
+        let now = installed_plugins().unwrap_or_default();
+        let new = commit_of(&now, spec);
+        match (&old, &new) {
+            (Some(o), Some(n)) if o == n => {
+                unchanged += 1;
+                println!("up to date ({})", short(o));
+            }
+            (Some(o), Some(n)) => {
+                changed += 1;
+                println!("{} -> {}", short(o), short(n));
+            }
+            (None, Some(n)) => {
+                changed += 1;
+                println!("installed ({}) — was missing", short(n));
+            }
+            _ => {
+                unchanged += 1;
+                println!("done (no commit reported)");
+            }
+        }
+    }
+
+    println!(
+        "\nsummary: {} updated, {} already current, {} pinned, {} failed",
+        changed, unchanged, pinned, failed
+    );
+
+    let after = installed_plugins().unwrap_or(before);
+    write_lock(&desired, &after)?;
+    Ok(())
+}
+
+/// Abbreviate a commit for display, without assuming it is a 40-char sha (a `--ref` may be a
+/// tag or branch name that herdr echoes back).
+fn short(commit: &str) -> String {
+    if commit.len() > 12 && commit.chars().all(|c| c.is_ascii_hexdigit()) {
+        commit[..12].to_string()
+    } else {
+        commit.to_string()
+    }
+}
+
 /// Record the desired set, including any `@ref` pins.
 ///
 /// With herdr's native `install --ref`, a bundle whose entries are all pinned to commit SHAs
@@ -580,12 +767,23 @@ fn write_lock(desired: &[Spec], installed: &[Installed]) -> io::Result<()> {
     // what makes the lock reproducible rather than merely descriptive.
     let mut lines = Vec::new();
     let mut unresolved = 0;
+    let mut drifted = Vec::new();
     for d in desired {
-        let commit = installed
-            .iter()
-            .find(|p| p.matches(d) == Match::Strong)
-            .and_then(|p| p.resolved_commit.clone());
-        match commit {
+        let hit = installed.iter().find(|p| p.matches(d) == Match::Strong);
+        // A commit pin that disagrees with what is installed means bundle and reality have
+        // diverged. Record the truth (what is installed), but never let it pass silently:
+        // a lock that quietly contradicts its bundle is worse than no lock.
+        if let Some(p) = hit {
+            if let PinState::Drifted { have } = pin_state(d, p) {
+                drifted.push(format!(
+                    "{} pins {} but {} is installed",
+                    d.repo,
+                    short(d.reference.as_deref().unwrap_or("")),
+                    short(&have)
+                ));
+            }
+        }
+        match hit.and_then(|p| p.resolved_commit.clone()) {
             Some(c) => lines.push(format!("{}@{}", d.repo, c)),
             None => {
                 unresolved += 1;
@@ -611,6 +809,13 @@ fn write_lock(desired: &[Spec], installed: &[Installed]) -> io::Result<()> {
             unresolved,
             desired.len()
         );
+    }
+    if !drifted.is_empty() {
+        println!("WARNING: the lock disagrees with the bundle's pins:");
+        for d in &drifted {
+            println!("  ! {}", d);
+        }
+        println!("  run `herdr-lazy sync` to restore the pinned commits.");
     }
     Ok(())
 }
@@ -672,6 +877,7 @@ fn print_help() {
     println!("  init [--force]    write the curated default bundle (the distro layer)");
     println!("  list              show desired plugins");
     println!("  sync [--prune]    converge installed plugins to the bundle");
+    println!("  update [<repo>…]  re-resolve unpinned entries to their latest commit");
     println!("  add <owner/repo>  add a plugin to the bundle");
     println!("  remove <owner/repo>  remove a plugin from the bundle");
     println!("  lock              write the lockfile from the current bundle");
@@ -687,6 +893,10 @@ fn main() {
         "init" => cmd_init(rest.contains(&"--force")),
         "list" => cmd_list(),
         "sync" => cmd_sync(rest.contains(&"--prune")),
+        "update" => {
+            let targets: Vec<&str> = rest.iter().copied().filter(|a| !a.starts_with("--")).collect();
+            cmd_update(&targets)
+        }
         "add" => match rest.first() {
             Some(spec) => cmd_add(spec),
             None => {
@@ -820,6 +1030,107 @@ mod tests {
     fn rejects_unparseable_output() {
         assert!(parse_plugin_list("No plugins installed.").is_err());
         assert!(parse_plugin_list(r#"{"result":{}}"#).is_err());
+    }
+
+    fn at_commit(commit: Option<&str>) -> Installed {
+        let mut p = from_github("owner", "repo");
+        p.resolved_commit = commit.map(|c| c.to_string());
+        p
+    }
+
+    /// The bug this pins down: an entry pinned to one commit, but sitting at another, was
+    /// reported "present" and never repaired, so `sync` could not actually reproduce a bundle.
+    #[test]
+    fn a_pinned_entry_at_the_wrong_commit_is_drift() {
+        let spec = Spec::parse("owner/repo@a8f86ec4103bc367b52e547b492483f3b792a952");
+        let p = at_commit(Some("f32b0825f12543c1d03e54fb10d1741c40d66cdc"));
+        assert_eq!(
+            pin_state(&spec, &p),
+            PinState::Drifted {
+                have: "f32b0825f12543c1d03e54fb10d1741c40d66cdc".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_pinned_entry_at_the_right_commit_is_satisfied() {
+        let sha = "a8f86ec4103bc367b52e547b492483f3b792a952";
+        assert_eq!(
+            pin_state(&Spec::parse(&format!("owner/repo@{}", sha)), &at_commit(Some(sha))),
+            PinState::Satisfied
+        );
+        // An abbreviated pin is satisfied by the full commit it prefixes.
+        assert_eq!(
+            pin_state(&Spec::parse("owner/repo@a8f86ec"), &at_commit(Some(sha))),
+            PinState::Satisfied
+        );
+        // ...but a similar-looking prefix that does not match is still drift.
+        assert!(matches!(
+            pin_state(&Spec::parse("owner/repo@a8f86ff"), &at_commit(Some(sha))),
+            PinState::Drifted { .. }
+        ));
+    }
+
+    #[test]
+    fn an_unpinned_entry_never_drifts() {
+        assert_eq!(
+            pin_state(&Spec::parse("owner/repo"), &at_commit(Some("f32b0825f125"))),
+            PinState::Satisfied
+        );
+    }
+
+    /// Tags and branches resolve to a commit at install time and are not echoed back, so there
+    /// is nothing to compare — say so rather than reinstalling on every sync.
+    #[test]
+    fn tag_and_branch_pins_are_unverifiable() {
+        for r in ["v1.13.0", "main", "release-2"] {
+            assert_eq!(
+                pin_state(&Spec::parse(&format!("owner/repo@{}", r)), &at_commit(Some("f32b0825f125"))),
+                PinState::Unverifiable,
+                "{} should be unverifiable",
+                r
+            );
+        }
+        // A local link has no commit at all.
+        assert_eq!(
+            pin_state(&Spec::parse("owner/repo@a8f86ec4103b"), &at_commit(None)),
+            PinState::Unverifiable
+        );
+    }
+
+    #[test]
+    fn commit_refs_are_told_apart_from_names() {
+        assert!(is_commit_ref("a8f86ec"));
+        assert!(is_commit_ref("a8f86ec4103bc367b52e547b492483f3b792a952"));
+        assert!(!is_commit_ref("v1.0.0"));
+        assert!(!is_commit_ref("main"));
+        assert!(!is_commit_ref("abc123"), "too short to be unambiguous");
+        // `deadbee` is hex and 7 chars — a legitimate abbreviated commit, and also a plausible
+        // branch name. Treating it as a commit is the safe reading: it gets verified.
+        assert!(is_commit_ref("deadbee"));
+    }
+
+    #[test]
+    fn short_abbreviates_shas_but_not_tags() {
+        assert_eq!(short("10e93033263549600e75119c5617dac48137d011"), "10e930332635");
+        // A `--ref` may be a tag or branch; truncating those would be misleading.
+        assert_eq!(short("v1.13.0"), "v1.13.0");
+        assert_eq!(short("release-candidate-2"), "release-candidate-2");
+        assert_eq!(short("abc123"), "abc123");
+    }
+
+    /// `update` must leave pinned entries alone: a pin says "this commit", and moving it
+    /// silently would make the lockfile disagree with the bundle.
+    #[test]
+    fn pinned_entries_are_distinguishable_from_floating_ones() {
+        let bundle = ["owner/a", "owner/b@9f3c1ab", "owner/c"];
+        let specs: Vec<Spec> = bundle.iter().map(|l| Spec::parse(l)).collect();
+        let floating: Vec<&str> = specs
+            .iter()
+            .filter(|s| s.reference.is_none())
+            .map(|s| s.repo.as_str())
+            .collect();
+        assert_eq!(floating, vec!["owner/a", "owner/c"]);
     }
 
     #[test]
