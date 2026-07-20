@@ -48,6 +48,11 @@ Install fetches a prebuilt binary and verifies its SHA-256; if none matches your
 or anything about the download is not exactly right, it falls back to building from source
 with [Rust](https://rustup.rs) (≥ 1.78). No toolchain is needed on the fast path.
 
+**Platform status.** Developed and verified end-to-end on macOS (arm64). Linux binaries are
+built and the test suite runs on Linux in CI, but the install has not been exercised on a
+real Linux machine. Windows has no prebuilt binary and builds from source; nothing about it
+has been tested. If you run either, reports are very welcome — see the open issues.
+
 Then open the manage pane from the command palette (**Lazy: open manage pane**), or
 bind it:
 
