@@ -1,6 +1,6 @@
 //! herdr-lazy — be lazy: a curated, batteries-included plugin distro & manager for herdr.
 //!
-//! Two layers, LazyVim-style:
+//! Two layers:
 //!   1. manager   — a declarative bundle file + `sync` to converge your install to it.
 //!   2. distro    — `init` writes a curated default set so "install one, get everything".
 //!
@@ -30,7 +30,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Curated "batteries-included" default set (the LazyVim layer).
+/// Curated "batteries-included" default set — the distro layer.
 ///
 /// Two criteria, applied in order: prefer what the ecosystem has already vetted, then fill
 /// the gaps nothing else covers. Overlapping plugins are deliberately excluded rather than
@@ -786,7 +786,7 @@ pub(crate) fn short(commit: &str) -> String {
 /// Record the desired set, including any `@ref` pins.
 ///
 /// With herdr's native `install --ref`, a bundle whose entries are all pinned to commit SHAs
-/// is genuinely reproducible across machines — the config-sync problem in herdr#1427.
+/// is genuinely reproducible across machines, which is the whole point of the lockfile.
 /// Unpinned entries still float, and are flagged as such.
 fn write_lock(desired: &[Spec], installed: &[Installed]) -> io::Result<()> {
     let p = lock_path();
@@ -972,7 +972,7 @@ mod tests {
     use super::*;
 
     /// Verbatim from `herdr plugin list --json` (herdr 0.7.4), trimmed of long arrays.
-    const LINKED_LOCAL: &str = r#"{"id":"cli:plugin","result":{"plugins":[{"actions":[{"command":["target/release/herdr-lazy","init"],"contexts":["workspace"],"id":"init","title":"Lazy: install curated defaults"}],"build":[{"command":["cargo","build","--release"]}],"description":"Be lazy","enabled":true,"manifest_path":"/Users/n/work/herdr-lazy/herdr-plugin.toml","min_herdr_version":"0.7.0","name":"herdr-lazy","platforms":["macos"],"plugin_id":"natori.lazy","plugin_root":"/Users/n/work/herdr-lazy","source":{"kind":"local"},"version":"0.1.0"}],"type":"plugin_list"}}"#;
+    const LINKED_LOCAL: &str = r#"{"id":"cli:plugin","result":{"plugins":[{"actions":[{"command":["target/release/herdr-lazy","init"],"contexts":["workspace"],"id":"init","title":"Lazy: install curated defaults"}],"build":[{"command":["cargo","build","--release"]}],"description":"Be lazy","enabled":true,"manifest_path":"/Users/n/work/herdr-lazy/herdr-plugin.toml","min_herdr_version":"0.7.0","name":"herdr-lazy","platforms":["macos"],"plugin_id":"herdr-lazy","plugin_root":"/Users/n/work/herdr-lazy","source":{"kind":"local"},"version":"0.1.0"}],"type":"plugin_list"}}"#;
 
     const EMPTY: &str = r#"{"id":"cli:plugin","result":{"plugins":[],"type":"plugin_list"}}"#;
 
@@ -1057,7 +1057,7 @@ mod tests {
     fn parses_real_list_output() {
         let ps = parse_plugin_list(LINKED_LOCAL).expect("real payload should parse");
         assert_eq!(ps.len(), 1);
-        assert_eq!(ps[0].plugin_id, "natori.lazy");
+        assert_eq!(ps[0].plugin_id, "herdr-lazy");
         assert_eq!(ps[0].name, "herdr-lazy");
         assert_eq!(ps[0].source_kind, "local");
         assert!(ps[0].enabled);

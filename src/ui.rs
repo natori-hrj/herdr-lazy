@@ -438,7 +438,7 @@ mod tests {
         let installed = vec![
             github("o", "wanted", SHA, true),
             github("someone", "unwanted", SHA, true),
-            local("natori.lazy"),
+            local("herdr-lazy"),
         ];
 
         let r = rows(&desired, &installed);

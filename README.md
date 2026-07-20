@@ -2,13 +2,11 @@
 
 > Be lazy. Declare the plugins you want; let the tool converge your machine to them.
 
-A declarative plugin **manager** and curated **distro** for [herdr](https://herdr.dev),
-in the spirit of lazy.nvim and LazyVim.
+A declarative plugin **manager** and curated **distro** for [herdr](https://herdr.dev).
 
-herdr installs plugins one imperative command at a time. There is no way to declare
-the set you want, and no lockfile — so a working setup cannot be reproduced on another
-machine ([herdr#1427](https://github.com/ogulcancelik/herdr/discussions/1427)).
-herdr-lazy adds both.
+herdr installs plugins one imperative command at a time. There is no way to declare the
+set you want, and no lockfile — so a working setup cannot be reproduced on another
+machine. herdr-lazy adds both.
 
 ```
  herdr-lazy  5 ok · 2 to sync · 1 extra
@@ -54,10 +52,14 @@ bind it:
 ```toml
 # ~/.config/herdr/config.toml
 [[keys.command]]
-key = "prefix+l"
+key = "prefix+shift+l"
 type = "plugin_action"
-command = "natori.lazy.manage"
+command = "herdr-lazy.manage"
+description = "manage plugins"
 ```
+
+Pick a key that is actually free — `prefix+l` is `focus_pane_right`, and `h`/`j`/`k`/`n`/`p`/
+`c`/`g` are taken too. `prefix+?` lists your active bindings.
 
 ## Use
 
@@ -111,7 +113,7 @@ silently would make the lock disagree with the bundle. Edit the bundle to move a
 `--prune` uninstalls only what it can prove is extraneous. A match is **strong** when
 herdr's `source` names the repo (`owner` + `repo`), and **weak** when only the display
 name lines up — herdr's `plugin_id` and `name` bear no reliable relation to the repo
-(`natori-hrj/herdr-hail` registers as `hail`). Prune acts on strong matches only.
+(`cloudmanic/herdr-plus` registers as `cloudmanic.herdr-plus`). Prune acts on strong matches only.
 Locally-linked plugins have no owner/repo at all and are always kept: herdr-lazy is
 normally one, so this also stops prune from removing the tool running it.
 

@@ -1,4 +1,4 @@
-id = "natori.lazy"
+id = "herdr-lazy"
 name = "herdr-lazy"
 version = "0.1.0"
 min_herdr_version = "0.7.0"
@@ -44,8 +44,8 @@ title = "Lazy: open manage pane"
 contexts = ["workspace"]
 command = ["target/release/herdr-lazy", "ui"]
 
-# The manage UI. `overlay` matches what LazyVim's :Lazy feels like — a temporary zoomed
-# view that hands focus back to whatever you were doing when it closes.
+# The manage UI. `overlay` is the right placement for it: a temporary zoomed view that
+# hands focus back to whatever you were doing when it closes.
 [[panes]]
 id = "manage"
 title = "herdr-lazy"

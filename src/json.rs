@@ -253,14 +253,14 @@ mod tests {
     use super::*;
 
     /// The exact payload shape herdr 0.7.4 returns for a linked local plugin.
-    const REAL_LIST: &str = r#"{"id":"cli:plugin","result":{"plugins":[{"actions":[{"command":["target/release/herdr-lazy","init"],"contexts":["workspace"],"id":"init","title":"Lazy: install curated defaults"}],"build":[{"command":["cargo","build","--release"]}],"description":"Be lazy","enabled":true,"manifest_path":"/p/herdr-plugin.toml","min_herdr_version":"0.7.0","name":"herdr-lazy","platforms":["linux"],"plugin_id":"natori.lazy","plugin_root":"/p","source":{"kind":"local"},"version":"0.1.0"}],"type":"plugin_list"}}"#;
+    const REAL_LIST: &str = r#"{"id":"cli:plugin","result":{"plugins":[{"actions":[{"command":["target/release/herdr-lazy","init"],"contexts":["workspace"],"id":"init","title":"Lazy: install curated defaults"}],"build":[{"command":["cargo","build","--release"]}],"description":"Be lazy","enabled":true,"manifest_path":"/p/herdr-plugin.toml","min_herdr_version":"0.7.0","name":"herdr-lazy","platforms":["linux"],"plugin_id":"herdr-lazy","plugin_root":"/p","source":{"kind":"local"},"version":"0.1.0"}],"type":"plugin_list"}}"#;
 
     #[test]
     fn reads_plugin_fields_from_real_payload() {
         let v = parse(REAL_LIST).expect("should parse");
         let plugins = v.path(&["result", "plugins"]).unwrap().as_array().unwrap();
         assert_eq!(plugins.len(), 1);
-        assert_eq!(plugins[0].str_field("plugin_id"), Some("natori.lazy"));
+        assert_eq!(plugins[0].str_field("plugin_id"), Some("herdr-lazy"));
         assert_eq!(plugins[0].str_field("name"), Some("herdr-lazy"));
         assert_eq!(plugins[0].get("enabled").unwrap().as_bool(), Some(true));
         assert_eq!(
