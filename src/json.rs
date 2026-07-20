@@ -293,6 +293,8 @@ mod tests {
             parse(r#""a\"b\\c\nd""#).unwrap(),
             Value::Str("a\"b\\c\nd".to_string())
         );
+        // Literal (unescaped) multi-byte input, at 3 and 4 bytes per character: the parser
+        // walks `chars()`, so anything indexing by byte would split these and panic.
         assert_eq!(parse(r#""あ""#).unwrap(), Value::Str("あ".to_string()));
         assert_eq!(parse(r#""🚀""#).unwrap(), Value::Str("🚀".to_string()));
     }

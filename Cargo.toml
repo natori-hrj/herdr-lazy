@@ -8,8 +8,13 @@ description = "Be lazy: a curated, batteries-included plugin distro & manager fo
 name = "herdr-lazy"
 path = "src/main.rs"
 
-# Intentionally dependency-free (std only) for the MVP:
-# - compiles offline, no supply-chain surface, fast to build.
-# - the manager is mostly orchestration (shelling out to the herdr CLI + git),
-#   which std handles fine. Revisit if we add real TOML/git crates later.
+# The manager itself is orchestration (shelling out to the herdr CLI) and stays std-only.
+# The one exception is the manage UI: std cannot put a terminal into raw mode, so a pane
+# TUI is impossible without help.
+#
+# crossterm alone, not ratatui. The UI is a scrolling list with a status column — ratatui's
+# value is layout and widget composition, which this does not use, and it costs 70 crates
+# against crossterm's 19. crossterm is also ratatui's own backend, so if the UI ever outgrows
+# hand-drawing, ratatui layers on top rather than replacing anything.
 [dependencies]
+crossterm = { version = "0.29", default-features = false, features = ["events"] }

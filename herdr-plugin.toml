@@ -28,3 +28,17 @@ id = "sync"
 title = "Lazy: sync plugins to bundle"
 contexts = ["workspace"]
 command = ["target/release/herdr-lazy", "sync"]
+
+[[actions]]
+id = "manage"
+title = "Lazy: open manage pane"
+contexts = ["workspace"]
+command = ["target/release/herdr-lazy", "ui"]
+
+# The manage UI. `overlay` matches what LazyVim's :Lazy feels like — a temporary zoomed
+# view that hands focus back to whatever you were doing when it closes.
+[[panes]]
+id = "manage"
+title = "herdr-lazy"
+placement = "overlay"
+command = ["target/release/herdr-lazy", "ui"]

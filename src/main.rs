@@ -22,6 +22,7 @@
 //! only its name can be compared), and `--prune` acts on Strong only.
 
 mod json;
+mod ui;
 
 use std::env;
 use std::fs;
@@ -64,7 +65,7 @@ fn state_dir() -> PathBuf {
         .join("herdr-lazy")
 }
 
-fn bundle_path() -> PathBuf {
+pub(crate) fn bundle_path() -> PathBuf {
     config_dir().join("plugins.list")
 }
 
@@ -101,7 +102,7 @@ fn read_lines(p: &PathBuf) -> Vec<String> {
     }
 }
 
-fn desired_plugins() -> Vec<String> {
+pub(crate) fn desired_plugins() -> Vec<String> {
     read_lines(&bundle_path())
 }
 
@@ -120,15 +121,15 @@ fn repo_leaf(spec: &str) -> String {
 /// herdr's `plugin install` takes `--ref REF`, so pinning is native — the `@ref` suffix maps
 /// straight onto it. No git-checkout management of our own is needed.
 #[derive(Debug, Clone, PartialEq)]
-struct Spec {
+pub(crate) struct Spec {
     /// `owner/repo[/subdir]` — what `install`/`uninstall` want as the positional arg.
-    repo: String,
+    pub(crate) repo: String,
     /// Commit / tag / branch, if pinned.
-    reference: Option<String>,
+    pub(crate) reference: Option<String>,
 }
 
 impl Spec {
-    fn parse(line: &str) -> Spec {
+    pub(crate) fn parse(line: &str) -> Spec {
         match line.split_once('@') {
             Some((repo, r)) if !repo.is_empty() && !r.is_empty() => Spec {
                 repo: repo.trim().to_string(),
@@ -142,7 +143,7 @@ impl Spec {
     }
 
     /// How it appears in the bundle/lockfile.
-    fn display(&self) -> String {
+    pub(crate) fn display(&self) -> String {
         match &self.reference {
             Some(r) => format!("{}@{}", self.repo, r),
             None => self.repo.clone(),
@@ -152,17 +153,17 @@ impl Spec {
 
 /// One entry from `herdr plugin list --json`.
 #[derive(Debug, Clone)]
-struct Installed {
-    plugin_id: String,
-    name: String,
-    enabled: bool,
-    source_kind: String,
+pub(crate) struct Installed {
+    pub(crate) plugin_id: String,
+    pub(crate) name: String,
+    pub(crate) enabled: bool,
+    pub(crate) source_kind: String,
     /// `owner/repo` rebuilt from `source.owner` + `source.repo`. herdr stores them as two
     /// separate fields, never as a joined slug, so this has to be assembled.
-    slug: Option<String>,
+    pub(crate) slug: Option<String>,
     /// `source.resolved_commit` — the exact commit herdr checked out. This is what makes a
     /// lockfile real: we can record what is actually installed, not merely what was asked for.
-    resolved_commit: Option<String>,
+    pub(crate) resolved_commit: Option<String>,
     /// Every string value inside `source`, as a fallback for source kinds we have not seen
     /// (e.g. a plain clone URL) so an unknown shape degrades to a match attempt, not a miss.
     source_values: Vec<String>,
@@ -174,7 +175,7 @@ struct Installed {
 /// (worst case: a redundant install attempt), but `--prune` may only *uninstall* on a strong
 /// one. Getting it wrong in the prune direction destroys a plugin the user wanted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Match {
+pub(crate) enum Match {
     /// `source` names this exact repo — authoritative.
     Strong,
     /// Only the plugin's display name lines up with the repo leaf. Plausible, not proof:
@@ -184,7 +185,7 @@ enum Match {
 }
 
 impl Installed {
-    fn matches(&self, spec: &Spec) -> Match {
+    pub(crate) fn matches(&self, spec: &Spec) -> Match {
         let want = spec.repo.to_lowercase();
 
         // Authoritative: herdr's own record of which repo this came from.
@@ -220,7 +221,7 @@ impl Installed {
 
 /// Whether an installed plugin actually honours its bundle entry's pin.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum PinState {
+pub(crate) enum PinState {
     /// Not pinned, or installed at exactly the pinned commit.
     Satisfied,
     /// Pinned to a commit, but a different one is installed. `sync` must repair this.
@@ -236,7 +237,7 @@ fn is_commit_ref(r: &str) -> bool {
     r.len() >= 7 && r.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-fn pin_state(spec: &Spec, installed: &Installed) -> PinState {
+pub(crate) fn pin_state(spec: &Spec, installed: &Installed) -> PinState {
     let pin = match &spec.reference {
         Some(r) => r,
         None => return PinState::Satisfied,
@@ -310,7 +311,7 @@ fn parse_plugin_list(stdout: &str) -> Result<Vec<Installed>, String> {
 }
 
 /// Snapshot the installed set via `plugin list --json`.
-fn installed_plugins() -> Result<Vec<Installed>, String> {
+pub(crate) fn installed_plugins() -> Result<Vec<Installed>, String> {
     match run_herdr(&["plugin", "list", "--json"]) {
         Ok((true, out, _)) => parse_plugin_list(&out),
         Ok((false, _, err)) => Err(format!("`herdr plugin list` failed: {}", err.trim())),
@@ -447,7 +448,7 @@ fn cmd_list() -> io::Result<()> {
 }
 
 /// Converge the installed plugin set to the bundle.
-fn cmd_sync(prune: bool) -> io::Result<()> {
+pub(crate) fn cmd_sync(prune: bool) -> io::Result<()> {
     let desired: Vec<Spec> = desired_plugins().iter().map(|l| Spec::parse(l)).collect();
     if desired.is_empty() {
         println!("no bundle. run `herdr-lazy init` first.");
@@ -639,7 +640,7 @@ fn prune_extras(desired: &[Spec], installed: &[Installed]) {
 /// Pinned entries (`owner/repo@ref`) are skipped by design. A pin is a statement that this
 /// commit is the one you want; silently moving it would make the lockfile a lie. To move a
 /// pin, edit the bundle.
-fn cmd_update(targets: &[&str]) -> io::Result<()> {
+pub(crate) fn cmd_update(targets: &[&str]) -> io::Result<()> {
     let desired: Vec<Spec> = desired_plugins().iter().map(|l| Spec::parse(l)).collect();
     if desired.is_empty() {
         println!("no bundle. run `herdr-lazy init` first.");
@@ -745,7 +746,7 @@ fn cmd_update(targets: &[&str]) -> io::Result<()> {
 
 /// Abbreviate a commit for display, without assuming it is a 40-char sha (a `--ref` may be a
 /// tag or branch name that herdr echoes back).
-fn short(commit: &str) -> String {
+pub(crate) fn short(commit: &str) -> String {
     if commit.len() > 12 && commit.chars().all(|c| c.is_ascii_hexdigit()) {
         commit[..12].to_string()
     } else {
@@ -878,6 +879,7 @@ fn print_help() {
     println!("  list              show desired plugins");
     println!("  sync [--prune]    converge installed plugins to the bundle");
     println!("  update [<repo>…]  re-resolve unpinned entries to their latest commit");
+    println!("  ui                open the manage pane (also `manage`)");
     println!("  add <owner/repo>  add a plugin to the bundle");
     println!("  remove <owner/repo>  remove a plugin from the bundle");
     println!("  lock              write the lockfile from the current bundle");
@@ -893,6 +895,7 @@ fn main() {
         "init" => cmd_init(rest.contains(&"--force")),
         "list" => cmd_list(),
         "sync" => cmd_sync(rest.contains(&"--prune")),
+        "ui" | "manage" => ui::run(),
         "update" => {
             let targets: Vec<&str> = rest.iter().copied().filter(|a| !a.starts_with("--")).collect();
             cmd_update(&targets)
