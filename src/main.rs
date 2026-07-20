@@ -21,7 +21,9 @@
 //! `Installed::matches` still grades Strong/Weak (a local link has no owner/repo at all, so
 //! only its name can be compared), and `--prune` acts on Strong only.
 
+mod browse;
 mod json;
+mod registry;
 mod ui;
 
 use std::env;
@@ -81,7 +83,7 @@ const PLUGIN_ID: &str = "herdr-lazy";
 /// inventing a second location.
 ///
 /// Cached: this shells out, and it is consulted several times per run.
-fn config_dir() -> PathBuf {
+pub(crate) fn config_dir() -> PathBuf {
     static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
         if let Ok(d) = env::var("HERDR_PLUGIN_CONFIG_DIR") {
@@ -536,8 +538,61 @@ fn cmd_list() -> io::Result<()> {
 /// `targets` restricts the work to named `owner/repo` entries; empty means everything. The
 /// lock is only rewritten on a full run — a targeted sync is a partial view of the world, and
 /// writing the lock from it would drop every entry it did not look at.
+/// Read the lockfile as a set of specs.
+pub(crate) fn lock_specs() -> Vec<Spec> {
+    read_lines(&lock_path())
+        .iter()
+        .map(|l| Spec::parse(l))
+        .collect()
+}
+
+/// Put the machine back into the state the lockfile records.
+///
+/// `sync` converges to the *list*, which may float; `restore` converges to the *lock*, which
+/// does not. That is the difference between "the plugins I asked for" and "the exact commits
+/// that were installed when this lock was written" — and it is what makes a lock copied from
+/// another machine actually usable, rather than something you paste into the list by hand.
+///
+/// Deliberately does not rewrite the lock: it is the input here, not the output.
+pub(crate) fn cmd_restore(targets: &[&str]) -> io::Result<()> {
+    let all = lock_specs();
+    if all.is_empty() {
+        println!(
+            "no lockfile at {} — run `herdr-lazy sync` first, or copy one from another machine.",
+            lock_path().display()
+        );
+        return Ok(());
+    }
+    let unpinned = all.iter().filter(|s| s.reference.is_none()).count();
+    if unpinned > 0 {
+        println!(
+            "note: {}/{} lock entries have no commit; those are installed at whatever the \
+             default branch points to now.",
+            unpinned,
+            all.len()
+        );
+    }
+    converge(&all, targets, false, false)
+}
+
 pub(crate) fn cmd_sync(prune: bool, targets: &[&str]) -> io::Result<()> {
     let all: Vec<Spec> = desired_plugins().iter().map(|l| Spec::parse(l)).collect();
+    if all.is_empty() {
+        println!(
+            "no plugin list at {} — run `herdr-lazy init` first.",
+            bundle_path().display()
+        );
+        return Ok(());
+    }
+    converge(&all, targets, prune, true)
+}
+
+/// Install whatever in `all` is missing or has drifted from its pin.
+///
+/// `write_lock` is false for `restore`, whose input IS the lock — rewriting it there would let
+/// a partial restore quietly redefine the thing being restored to.
+fn converge(all: &[Spec], targets: &[&str], prune: bool, write_the_lock: bool) -> io::Result<()> {
+    let all: Vec<Spec> = all.to_vec();
     let desired: Vec<Spec> = if targets.is_empty() {
         all.clone()
     } else {
@@ -552,10 +607,7 @@ pub(crate) fn cmd_sync(prune: bool, targets: &[&str]) -> io::Result<()> {
             .collect()
     };
     if desired.is_empty() {
-        println!(
-            "no plugin list at {} — run `herdr-lazy init` first.",
-            bundle_path().display()
-        );
+        println!("nothing to do.");
         return Ok(());
     }
 
@@ -676,11 +728,13 @@ pub(crate) fn cmd_sync(prune: bool, targets: &[&str]) -> io::Result<()> {
     );
     // Re-query: the snapshot above predates this run's installs, so it has no commits for
     // them. Locking against it would silently record the new plugins as unpinned.
-    let after = installed_plugins().unwrap_or_else(|e| {
-        eprintln!("warning: could not re-read plugin list for the lock: {}", e);
-        installed.clone()
-    });
-    write_lock(&all, &after)?;
+    if write_the_lock {
+        let after = installed_plugins().unwrap_or_else(|e| {
+            eprintln!("warning: could not re-read plugin list for the lock: {}", e);
+            installed.clone()
+        });
+        write_lock(&all, &after)?;
+    }
     Ok(())
 }
 
@@ -1052,6 +1106,7 @@ fn print_help() {
     println!("  list              show desired plugins");
     println!("  sync [--prune]    converge installed plugins to the bundle");
     println!("  update [<repo>…]  re-resolve unpinned entries to their latest commit");
+    println!("  restore [<repo>…] put plugins back to the commits in the lockfile");
     println!("  ui                open the manage pane (also `manage`)");
     println!("  add <owner/repo>  add a plugin to the bundle");
     println!("  remove <owner/repo>  remove a plugin from the bundle");
@@ -1076,6 +1131,14 @@ fn main() {
             cmd_sync(rest.contains(&"--prune"), &targets)
         }
         "ui" | "manage" => ui::run(),
+        "restore" => {
+            let targets: Vec<&str> = rest
+                .iter()
+                .copied()
+                .filter(|a| !a.starts_with("--"))
+                .collect();
+            cmd_restore(&targets)
+        }
         "update" => {
             let targets: Vec<&str> = rest
                 .iter()

@@ -91,6 +91,7 @@ herdr-lazy update smarzban/herdr-file-viewer
 | `list` | show the desired plugin set |
 | `sync [<repo>…] [--prune]` | converge installed plugins to the list |
 | `update [<repo>…]` | re-resolve unpinned entries to their latest commit |
+| `restore [<repo>…]` | put plugins back to the commits in the lockfile |
 | `ui` / `manage` | open the manage pane |
 | `add <owner/repo>` | add an entry to the bundle |
 | `remove <owner/repo>` | remove an entry from the bundle |
@@ -124,7 +125,17 @@ them at install time and does not report the original ref back — so those are 
 as unverifiable rather than reinstalled on every run.
 
 `update` deliberately skips pinned entries. A pin means "this commit"; moving it
-silently would make the lock disagree with the bundle. Edit the bundle to move a pin.
+silently would make the lock disagree with the list. Edit the list to move a pin.
+
+`restore` is the other direction: it converges to the **lock** rather than the list, so a
+lock copied from another machine reproduces that machine directly — no editing the list by
+hand. It never rewrites the lock, since here the lock is the input.
+
+```sh
+scp other-machine:~/.config/herdr/plugins/config/herdr-lazy/plugins.lock .
+cp plugins.lock "$(herdr plugin config-dir herdr-lazy)/"
+herdr-lazy restore
+```
 
 ## Safety
 

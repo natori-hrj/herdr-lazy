@@ -170,6 +170,8 @@ fn rows(desired: &[Spec], installed: &[Installed]) -> Vec<Row> {
 
 struct App {
     rows: Vec<Row>,
+    /// Present while the marketplace browser is open; the pane draws that instead of the list.
+    browser: Option<crate::browse::Browser>,
     cursor: usize,
     /// Set when a refresh fails, so the pane explains itself instead of showing an empty list.
     error: Option<String>,
@@ -188,12 +190,14 @@ impl App {
         match installed_plugins() {
             Ok(installed) => App {
                 rows: rows(&desired, &installed),
+                browser: None,
                 cursor: 0,
                 error: None,
                 flash: None,
             },
             Err(e) => App {
                 rows: Vec::new(),
+                browser: None,
                 cursor: 0,
                 error: Some(e),
                 flash: None,
@@ -203,7 +207,9 @@ impl App {
 
     fn refresh(&mut self) {
         let (cursor, flash) = (self.cursor, self.flash.take());
+        let browser = self.browser.take();
         *self = App::load();
+        self.browser = browser;
         self.cursor = cursor.min(self.rows.len().saturating_sub(1));
         self.flash = flash;
     }
@@ -231,6 +237,45 @@ impl App {
             Err(e) => format!("could not write the list: {}", e),
         });
         self.refresh();
+    }
+
+    /// `/` — open the marketplace browser.
+    fn open_browser(&mut self, force_refresh: bool) {
+        match crate::registry::load(force_refresh) {
+            Ok((entries, note)) => {
+                let listed: Vec<String> = crate::desired_plugins()
+                    .iter()
+                    .map(|l| crate::Spec::parse(l).repo)
+                    .collect();
+                self.browser = Some(crate::browse::Browser::new(entries, note, listed));
+                self.flash = None;
+            }
+            // Browsing is a convenience over someone else's undocumented endpoint; failing to
+            // reach it must not look like herdr-lazy is broken.
+            Err(e) => self.flash = Some(format!("marketplace unavailable — {}", e)),
+        }
+    }
+
+    /// Enter, in the browser — record the discovery in the list. Does not install; `s` does.
+    fn add_selected_from_browser(&mut self) {
+        let Some(b) = self.browser.as_ref() else {
+            return;
+        };
+        let Some(entry) = b.selected() else {
+            self.flash = Some("nothing selected".to_string());
+            return;
+        };
+        let name = entry.full_name.clone();
+        self.flash = Some(match crate::add_to_list(&name) {
+            Ok(msg) => format!("{} — press esc, then s to install", msg),
+            Err(e) => format!("could not write the list: {}", e),
+        });
+        // Reflect it immediately, so the ✔ appears without leaving the browser.
+        if let Some(b) = self.browser.as_mut() {
+            if !b.listed.contains(&name) {
+                b.listed.push(name);
+            }
+        }
     }
 
     /// `s` — install or repair just the selected entry.
@@ -298,7 +343,79 @@ impl App {
         self.refresh();
     }
 
-    fn draw(&self, out: &mut impl Write, height: u16) -> io::Result<()> {
+    fn draw(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        if self.browser.is_some() {
+            return self.draw_browser(out, width, height);
+        }
+        self.draw_list(out, width, height)
+    }
+
+    /// The marketplace overlay: a query line, matching plugins, and what each one is.
+    fn draw_browser(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        let b = self.browser.as_ref().expect("checked by caller");
+        let rule = "─".repeat((width as usize).clamp(20, 200));
+        let results = b.results();
+
+        write!(out, "\x1b[H\x1b[2J")?;
+        writeln!(
+            out,
+            "\x1b[1m marketplace\x1b[0m  \x1b[2m{} of {} · {}\x1b[0m\r",
+            results.len(),
+            b.all.len(),
+            b.source_note
+        )?;
+        writeln!(out, " search: \x1b[1m{}\x1b[0m\x1b[7m \x1b[0m\r", b.query)?;
+        writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
+
+        let visible = (height as usize).saturating_sub(6).max(1);
+        let start = if b.cursor >= visible {
+            b.cursor - visible + 1
+        } else {
+            0
+        };
+        if results.is_empty() {
+            writeln!(out, " \x1b[2mnothing matches\x1b[0m\r")?;
+        }
+        for (i, e) in results.iter().enumerate().skip(start).take(visible) {
+            let selected = i == b.cursor;
+            let pointer = if selected { "\x1b[7m>\x1b[0m" } else { " " };
+            // Already in the list is worth knowing before you add it a second time.
+            let mark = if b.is_listed(e) {
+                "\x1b[32m✔\x1b[0m"
+            } else {
+                " "
+            };
+            writeln!(
+                out,
+                "{} {} \x1b[33m{:>4}★\x1b[0m {:<42} \x1b[2m{}\x1b[0m\r",
+                pointer,
+                mark,
+                e.stars,
+                truncate(&e.full_name, 42),
+                truncate(&e.description, width.saturating_sub(56) as usize)
+            )?;
+        }
+
+        let footer = match &self.flash {
+            Some(msg) => format!("\x1b[36m{}\x1b[0m", msg),
+            None => "\x1b[1menter\x1b[0m add to list  \x1b[1mctrl+r\x1b[0m refresh  \
+                     \x1b[1mesc\x1b[0m back"
+                .to_string(),
+        };
+        write!(
+            out,
+            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
+            height.saturating_sub(1),
+            rule,
+            footer
+        )?;
+        out.flush()
+    }
+
+    fn draw_list(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        // Rules span the pane. A fixed width looked deliberate at 80 columns and plainly
+        // broken at 140, where the list ran well past the line meant to underline it.
+        let rule = "─".repeat((width as usize).clamp(20, 200));
         // Home the cursor and clear, rather than scrolling: redraw in place.
         write!(out, "\x1b[H\x1b[2J")?;
 
@@ -312,7 +429,7 @@ impl App {
             "\x1b[1m herdr-lazy\x1b[0m  \x1b[2m{} ok · {} to sync · {} unlisted\x1b[0m\r",
             ok, todo, extra
         )?;
-        writeln!(out, "\x1b[2m{}\x1b[0m\r", "─".repeat(64))?;
+        writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
 
         if let Some(e) = &self.error {
             writeln!(out, " \x1b[31mcannot read plugin list:\x1b[0m {}\r", e)?;
@@ -363,7 +480,7 @@ impl App {
         const OFF: &str = "\x1b[0m";
         let legend = format!(
             "{B}s{O}ync  {B}u{O}pdate  {B}a{O}dopt  {B}d{O}rop  {B}x{O} uninstall  \
-             \x1b[2mSHIFT = all{O}  {B}r{O}efresh  {B}q{O}uit",
+             {B}/{O} marketplace  \x1b[2mSHIFT = all{O}  {B}r{O}efresh  {B}q{O}uit",
             B = BOLD,
             O = OFF
         );
@@ -375,7 +492,7 @@ impl App {
             out,
             "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
             height.saturating_sub(1),
-            "─".repeat(64),
+            rule,
             footer
         )?;
         out.flush()
@@ -486,8 +603,8 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
     let mut app = App::load();
 
     loop {
-        let (_, height) = terminal::size().unwrap_or((80, 24));
-        app.draw(out, height)?;
+        let (width, height) = terminal::size().unwrap_or((80, 24));
+        app.draw(out, width, height)?;
 
         let key = match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
@@ -504,6 +621,39 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
         // pty sends Ctrl+D at end of input — which silently ran "drop from list" on whatever
         // the cursor happened to be on. Destructive actions must not be reachable by a
         // modifier chord the user did not intend.
+        // The browser is a text field: printable keys type into it rather than acting as
+        // commands, so its input is handled before the list's keymap is consulted.
+        if app.browser.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    app.browser = None;
+                    app.flash = None;
+                }
+                KeyCode::Enter => app.add_selected_from_browser(),
+                KeyCode::Down => app.browser.as_mut().unwrap().move_down(),
+                KeyCode::Up => app.browser.as_mut().unwrap().move_up(),
+                KeyCode::Backspace => {
+                    app.flash = None;
+                    app.browser.as_mut().unwrap().backspace();
+                }
+                KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.open_browser(true)
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Ok(())
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.flash = None;
+                    app.browser.as_mut().unwrap().push(c);
+                }
+                _ => {}
+            }
+            if let Some(b) = app.browser.as_mut() {
+                b.clamp();
+            }
+            continue;
+        }
+
         match classify(&key) {
             Action::Quit => return Ok(()),
             Action::Ignore if !matches!(key.code, KeyCode::Char(_)) => {}
@@ -547,6 +697,7 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             }
             KeyCode::Char('a') => app.adopt_selected(),
             KeyCode::Char('d') => app.drop_selected(),
+            KeyCode::Char('/') => app.open_browser(false),
             KeyCode::Char('r') => app.refresh(),
             _ => {}
         }
