@@ -1,0 +1,15 @@
+[package]
+name = "herdr-lazy"
+version = "0.1.0"
+edition = "2021"
+description = "Be lazy: a curated, batteries-included plugin distro & manager for herdr"
+
+[[bin]]
+name = "herdr-lazy"
+path = "src/main.rs"
+
+# Intentionally dependency-free (std only) for the MVP:
+# - compiles offline, no supply-chain surface, fast to build.
+# - the manager is mostly orchestration (shelling out to the herdr CLI + git),
+#   which std handles fine. Revisit if we add real TOML/git crates later.
+[dependencies]
