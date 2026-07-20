@@ -73,7 +73,19 @@ case "$(uname -m)" in
 esac
 
 TRIPLE="$ARCH-$OS"
-ASSET="herdr-lazy-$VERSION-$TRIPLE.tar.gz"
+
+# The asset name carries a fingerprint of the source this binary was built from. herdr
+# installs the default branch HEAD, which routinely runs ahead of the last release — without
+# this, the version alone would happily match a stale binary against newer source, and the
+# user would run behaviour that does not correspond to the code they have. When the source
+# has moved, the name simply does not exist and we compile instead.
+FINGERPRINT=$(sh scripts/build-fingerprint.sh 2>/dev/null || true)
+if [ -z "$FINGERPRINT" ]; then
+    log "could not fingerprint the source"
+    build_from_source
+fi
+
+ASSET="herdr-lazy-$VERSION-$FINGERPRINT-$TRIPLE.tar.gz"
 # Overridable so the download path itself can be exercised in a test, instead of only ever
 # being proven by the fallback firing.
 BASE="${HERDR_LAZY_RELEASE_BASE:-https://github.com/$REPO/releases/download/v$VERSION}"
@@ -103,9 +115,9 @@ TMP=$(mktemp -d 2>/dev/null || mktemp -d -t herdr-lazy)
 # shellcheck disable=SC2064  # expand TMP now: it must be removed even if the var changes.
 trap "rm -rf '$TMP'" EXIT INT TERM
 
-log "looking for a prebuilt $TRIPLE binary for v$VERSION"
+log "looking for a prebuilt $TRIPLE binary for v$VERSION ($FINGERPRINT)"
 if ! fetch "$BASE/$ASSET" "$TMP/$ASSET"; then
-    log "no prebuilt binary available"
+    log "no prebuilt binary matching this source ($FINGERPRINT) — the release is older"
     build_from_source
 fi
 

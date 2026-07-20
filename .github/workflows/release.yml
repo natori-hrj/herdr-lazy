@@ -56,7 +56,11 @@ jobs:
           set -euo pipefail
           # Take the version from the manifest, which is what the install script reads.
           version=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' herdr-plugin.toml | head -1)
-          asset="herdr-lazy-${version}-${{ matrix.target }}.tar.gz"
+
+          # Same script the install path uses, so the names cannot drift apart.
+          fingerprint=$(sh scripts/build-fingerprint.sh)
+          asset="herdr-lazy-${version}-${fingerprint}-${{ matrix.target }}.tar.gz"
+          echo "fingerprint: $fingerprint"
 
           # A tag must not disagree with the manifest, or the install script will look for
           # an asset that was never published.
