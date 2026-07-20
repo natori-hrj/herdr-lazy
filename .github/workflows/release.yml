@@ -8,6 +8,9 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# Pinned to commit SHAs, not tags: a tag is mutable, and this job runs with `contents: write`
+# to publish binaries that users download and execute. A compromised upstream tag would be a
+# direct path into other people's machines. Update deliberately, checking what changed.
 permissions:
   contents: write
 
@@ -34,7 +37,7 @@ jobs:
             native: true
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust
         run: |
@@ -74,7 +77,7 @@ jobs:
           fi
           echo "asset=$asset" >> "$GITHUB_OUTPUT"
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         if: github.ref_type == 'tag'
         with:
           files: |
