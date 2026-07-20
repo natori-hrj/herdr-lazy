@@ -915,11 +915,14 @@ fn write_lock(desired: &[Spec], installed: &[Installed]) -> io::Result<()> {
     Ok(())
 }
 
-fn cmd_add(spec: &str) -> io::Result<()> {
+/// Add an entry to the list, returning what to tell the user.
+///
+/// Returns a message rather than printing, because the manage pane calls this while it owns
+/// the screen — a stray `println!` there corrupts the display.
+pub(crate) fn add_to_list(spec: &str) -> io::Result<String> {
     let p = bundle_path();
     if read_lines(&p).iter().any(|l| l.as_str() == spec) {
-        println!("{} is already in your list", spec);
-        return Ok(());
+        return Ok(format!("{} is already in your list", spec));
     }
     ensure_parent(&p)?;
     let mut existing = fs::read_to_string(&p).unwrap_or_default();
@@ -929,19 +932,14 @@ fn cmd_add(spec: &str) -> io::Result<()> {
     existing.push_str(spec);
     existing.push('\n');
     fs::write(&p, existing)?;
-    println!("added {} -> {}", spec, p.display());
-    println!("run `herdr-lazy sync` to apply.");
-    Ok(())
+    Ok(format!("added {} to your list", spec))
 }
 
-fn cmd_remove(spec: &str) -> io::Result<()> {
+/// Drop an entry from the list. Does NOT uninstall — that is `sync --prune`.
+pub(crate) fn remove_from_list(spec: &str) -> io::Result<String> {
     let p = bundle_path();
-    let content = match fs::read_to_string(&p) {
-        Ok(c) => c,
-        Err(_) => {
-            println!("no plugin list at {}.", bundle_path().display());
-            return Ok(());
-        }
+    let Ok(content) = fs::read_to_string(&p) else {
+        return Ok(format!("no plugin list at {}", p.display()));
     };
     let mut kept = String::new();
     let mut removed = false;
@@ -953,15 +951,24 @@ fn cmd_remove(spec: &str) -> io::Result<()> {
         kept.push_str(line);
         kept.push('\n');
     }
-    fs::write(&p, kept)?;
-    if removed {
-        println!(
-            "removed {} from bundle. run `herdr-lazy sync --prune` to uninstall.",
-            spec
-        );
-    } else {
-        println!("{} not found in bundle.", spec);
+    if !removed {
+        return Ok(format!("{} is not in your list", spec));
     }
+    fs::write(&p, kept)?;
+    Ok(format!(
+        "dropped {} from your list (still installed; `sync --prune` uninstalls it)",
+        spec
+    ))
+}
+
+fn cmd_add(spec: &str) -> io::Result<()> {
+    println!("{}", add_to_list(spec)?);
+    println!("run `herdr-lazy sync` to apply.");
+    Ok(())
+}
+
+fn cmd_remove(spec: &str) -> io::Result<()> {
+    println!("{}", remove_from_list(spec)?);
     Ok(())
 }
 

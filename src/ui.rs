@@ -82,7 +82,9 @@ impl Status {
                 "installed; pinned to a tag/branch, so it cannot be verified".to_string()
             }
             Status::Disabled => "installed but disabled — herdr will not run it".to_string(),
-            Status::Extra => "installed, not in your list — press x to remove".to_string(),
+            Status::Extra => {
+                "installed, not in your list — press a to adopt, x to uninstall".to_string()
+            }
             Status::ExtraLocal => "installed as a local link — never removed by prune".to_string(),
         }
     }
@@ -93,6 +95,11 @@ struct Row {
     label: String,
     commit: Option<String>,
     status: Status,
+    /// The exact line in plugins.list, when this row came from there — what `d` removes.
+    listed_as: Option<String>,
+    /// `owner/repo`, when known — what `a` adds. `None` for a local link, which has no repo
+    /// to record, so it can never be adopted into the list.
+    slug: Option<String>,
 }
 
 /// Build the view: every bundle entry, then anything installed that the bundle does not name.
@@ -123,6 +130,8 @@ fn rows(desired: &[Spec], installed: &[Installed]) -> Vec<Row> {
             label: spec.display(),
             commit,
             status,
+            listed_as: Some(spec.display()),
+            slug: Some(spec.repo.clone()),
         });
     }
 
@@ -139,6 +148,8 @@ fn rows(desired: &[Spec], installed: &[Installed]) -> Vec<Row> {
             } else {
                 Status::Extra
             },
+            listed_as: None,
+            slug: p.slug.clone(),
         });
     }
 
@@ -150,6 +161,10 @@ struct App {
     cursor: usize,
     /// Set when a refresh fails, so the pane explains itself instead of showing an empty list.
     error: Option<String>,
+    /// Result of the last instant action (`a`/`d`), shown until the next keypress. Editing the
+    /// list is fast and touches only a file, so it stays in the pane rather than dropping out
+    /// of the alternate screen the way `sync` does.
+    flash: Option<String>,
 }
 
 impl App {
@@ -163,19 +178,61 @@ impl App {
                 rows: rows(&desired, &installed),
                 cursor: 0,
                 error: None,
+                flash: None,
             },
             Err(e) => App {
                 rows: Vec::new(),
                 cursor: 0,
                 error: Some(e),
+                flash: None,
             },
         }
     }
 
     fn refresh(&mut self) {
-        let cursor = self.cursor;
+        let (cursor, flash) = (self.cursor, self.flash.take());
         *self = App::load();
         self.cursor = cursor.min(self.rows.len().saturating_sub(1));
+        self.flash = flash;
+    }
+
+    fn selected(&self) -> Option<&Row> {
+        self.rows.get(self.cursor)
+    }
+
+    /// `a` — bring an installed-but-unlisted plugin under management.
+    fn adopt_selected(&mut self) {
+        let Some(row) = self.selected() else { return };
+        if row.listed_as.is_some() {
+            self.flash = Some(format!("{} is already in your list", row.label));
+            return;
+        }
+        let Some(slug) = row.slug.clone() else {
+            self.flash = Some(format!(
+                "{} is a local link — it has no owner/repo to record",
+                row.label
+            ));
+            return;
+        };
+        self.flash = Some(match crate::add_to_list(&slug) {
+            Ok(msg) => msg,
+            Err(e) => format!("could not write the list: {}", e),
+        });
+        self.refresh();
+    }
+
+    /// `d` — stop managing an entry. Never uninstalls; that is `x`.
+    fn drop_selected(&mut self) {
+        let Some(row) = self.selected() else { return };
+        let Some(line) = row.listed_as.clone() else {
+            self.flash = Some(format!("{} is not in your list", row.label));
+            return;
+        };
+        self.flash = Some(match crate::remove_from_list(&line) {
+            Ok(msg) => msg,
+            Err(e) => format!("could not write the list: {}", e),
+        });
+        self.refresh();
     }
 
     fn draw(&self, out: &mut impl Write, height: u16) -> io::Result<()> {
@@ -236,12 +293,17 @@ impl App {
             )?;
         }
 
+        let legend = "\x1b[1ms\x1b[0m sync  \x1b[1mu\x1b[0m update  \x1b[1ma\x1b[0m adopt                        \x1b[1md\x1b[0m drop  \x1b[1mx\x1b[0m uninstall extras                        \x1b[1mr\x1b[0m refresh  \x1b[1mq\x1b[0m quit";
+        let footer = match &self.flash {
+            Some(msg) => format!("\x1b[36m{}\x1b[0m", msg),
+            None => legend.to_string(),
+        };
         write!(
             out,
-            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m\x1b[1ms\x1b[0m sync  \x1b[1mu\x1b[0m update  \
-             \x1b[1mx\x1b[0m remove extras  \x1b[1mr\x1b[0m refresh  \x1b[1mq\x1b[0m quit\r",
+            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
             height.saturating_sub(1),
-            "─".repeat(64)
+            "─".repeat(64),
+            footer
         )?;
         out.flush()
     }
@@ -288,6 +350,34 @@ fn suspended<F: FnOnce()>(f: F) -> io::Result<()> {
     io::stdout().flush()
 }
 
+/// What a keypress means, once modifiers are taken into account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Action {
+    Quit,
+    /// A plain, unmodified character key.
+    Command(char),
+    /// A modifier chord we deliberately do nothing with.
+    Ignore,
+}
+
+/// Decide before dispatch, so the "no modifiers" rule lives in one testable place.
+fn classify(key: &KeyEvent) -> Action {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return if key.code == KeyCode::Char('c') {
+            Action::Quit
+        } else {
+            Action::Ignore
+        };
+    }
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        return Action::Ignore;
+    }
+    match key.code {
+        KeyCode::Char(c) => Action::Command(c),
+        _ => Action::Ignore,
+    }
+}
+
 pub(crate) fn run() -> io::Result<()> {
     let mut out = io::stdout();
     terminal::enable_raw_mode()?;
@@ -317,71 +407,55 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             _ => continue,
         };
 
-        match key {
-            KeyEvent {
-                code: KeyCode::Char('c'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => return Ok(()),
-            KeyEvent {
-                code: KeyCode::Char('q') | KeyCode::Esc,
-                ..
-            } => return Ok(()),
+        // Any keypress retires the previous result line.
+        app.flash = None;
 
-            KeyEvent {
-                code: KeyCode::Char('j') | KeyCode::Down,
-                ..
-            } => {
+        // Ctrl+C quits; everything else is a plain, unmodified key.
+        //
+        // Matching on `KeyCode::Char(c)` alone would also fire for the modified forms, and a
+        // pty sends Ctrl+D at end of input — which silently ran "drop from list" on whatever
+        // the cursor happened to be on. Destructive actions must not be reachable by a
+        // modifier chord the user did not intend.
+        match classify(&key) {
+            Action::Quit => return Ok(()),
+            Action::Ignore if !matches!(key.code, KeyCode::Char(_)) => {}
+            Action::Ignore => continue,
+            Action::Command(_) => {}
+        }
+
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+
+            KeyCode::Char('j') | KeyCode::Down => {
                 if app.cursor + 1 < app.rows.len() {
                     app.cursor += 1;
                 }
             }
-            KeyEvent {
-                code: KeyCode::Char('k') | KeyCode::Up,
-                ..
-            } => {
-                app.cursor = app.cursor.saturating_sub(1);
-            }
-            KeyEvent {
-                code: KeyCode::Char('g') | KeyCode::Home,
-                ..
-            } => app.cursor = 0,
-            KeyEvent {
-                code: KeyCode::Char('G') | KeyCode::End,
-                ..
-            } => app.cursor = app.rows.len().saturating_sub(1),
+            KeyCode::Char('k') | KeyCode::Up => app.cursor = app.cursor.saturating_sub(1),
+            KeyCode::Char('g') | KeyCode::Home => app.cursor = 0,
+            KeyCode::Char('G') | KeyCode::End => app.cursor = app.rows.len().saturating_sub(1),
 
-            KeyEvent {
-                code: KeyCode::Char('s'),
-                ..
-            } => {
+            KeyCode::Char('s') => {
                 suspended(|| {
                     let _ = crate::cmd_sync(false);
                 })?;
                 app.refresh();
             }
-            KeyEvent {
-                code: KeyCode::Char('u'),
-                ..
-            } => {
+            KeyCode::Char('u') => {
                 suspended(|| {
                     let _ = crate::cmd_update(&[]);
                 })?;
                 app.refresh();
             }
-            KeyEvent {
-                code: KeyCode::Char('x'),
-                ..
-            } => {
+            KeyCode::Char('x') => {
                 suspended(|| {
                     let _ = crate::cmd_sync(true);
                 })?;
                 app.refresh();
             }
-            KeyEvent {
-                code: KeyCode::Char('r'),
-                ..
-            } => app.refresh(),
+            KeyCode::Char('a') => app.adopt_selected(),
+            KeyCode::Char('d') => app.drop_selected(),
+            KeyCode::Char('r') => app.refresh(),
             _ => {}
         }
     }
@@ -512,6 +586,84 @@ mod tests {
                 s.note()
             );
         }
+    }
+
+    /// `a` needs an owner/repo to write into the list. A local link has none, so the row must
+    /// carry no slug — otherwise the pane would offer to adopt something it cannot express.
+    #[test]
+    fn a_local_link_row_carries_no_slug_to_adopt() {
+        let installed = vec![
+            local("herdr-lazy"),
+            github("someone", "unlisted", SHA, true),
+        ];
+        let r = rows(&[], &installed);
+
+        let link = r.iter().find(|x| x.status == Status::ExtraLocal).unwrap();
+        assert_eq!(link.slug, None, "a local link cannot be adopted");
+        assert_eq!(link.listed_as, None);
+
+        let extra = r.iter().find(|x| x.status == Status::Extra).unwrap();
+        assert_eq!(extra.slug.as_deref(), Some("someone/unlisted"));
+        assert_eq!(
+            extra.listed_as, None,
+            "an extra is by definition not listed"
+        );
+    }
+
+    /// `d` rewrites plugins.list by exact line, so a pinned row must report the line as
+    /// written — dropping `owner/repo` when the file says `owner/repo@sha` would silently
+    /// fail to remove anything.
+    #[test]
+    fn a_listed_row_reports_its_exact_line_including_any_pin() {
+        let desired = vec![
+            Spec::parse("o/plain"),
+            Spec::parse(&format!("o/pinned@{}", SHA)),
+        ];
+        let installed = vec![
+            github("o", "plain", SHA, true),
+            github("o", "pinned", SHA, true),
+        ];
+        let r = rows(&desired, &installed);
+
+        assert_eq!(r[0].listed_as.as_deref(), Some("o/plain"));
+        assert_eq!(
+            r[1].listed_as.as_deref(),
+            Some(format!("o/pinned@{}", SHA).as_str())
+        );
+        // `a` uses the repo alone, without the pin.
+        assert_eq!(r[1].slug.as_deref(), Some("o/pinned"));
+    }
+
+    /// Regression: destructive keys must be unreachable via a modifier chord.
+    ///
+    /// The event loop matched `KeyCode::Char('d')` without inspecting modifiers, so Ctrl+D —
+    /// which a pty sends at end of input, and which users press to mean "end"/"quit" — ran
+    /// "drop from list" on whatever the cursor was on. Two entries were silently deleted from
+    /// a real list before this was noticed.
+    #[test]
+    fn modified_keys_are_not_treated_as_commands() {
+        let plain = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let alt = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT);
+
+        for c in ['d', 'a', 'x', 's', 'u'] {
+            assert_eq!(
+                classify(&plain(c)),
+                Action::Command(c),
+                "plain {} should act",
+                c
+            );
+            assert_eq!(
+                classify(&ctrl(c)),
+                Action::Ignore,
+                "ctrl+{} must not act",
+                c
+            );
+            assert_eq!(classify(&alt(c)), Action::Ignore, "alt+{} must not act", c);
+        }
+        // Ctrl+C remains the one honoured chord.
+        assert_eq!(classify(&ctrl('c')), Action::Quit);
+        assert_eq!(classify(&plain('q')), Action::Command('q'));
     }
 
     #[test]
