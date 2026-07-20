@@ -25,13 +25,24 @@ jobs:
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:
-      - name: Create the release if it does not exist
+      - name: Create or repair the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "release $GITHUB_REF_NAME already exists"
+            # An existing release may be a leftover DRAFT from a failed run. Draft assets are
+            # served from `…/download/untagged-<hash>/…` and are unreachable by tag, so the
+            # install script 404s and everyone silently compiles — a release that looks
+            # complete but is not. Publish it rather than uploading into the same trap.
+            draft=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+                      --json isDraft -q .isDraft)
+            if [ "$draft" = "true" ]; then
+              echo "release $GITHUB_REF_NAME exists as a draft — publishing it"
+              gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+            else
+              echo "release $GITHUB_REF_NAME already exists"
+            fi
           else
             gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
               --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
@@ -119,3 +130,20 @@ jobs:
           set -euo pipefail
           gh release upload "$GITHUB_REF_NAME" "$ASSET" "$ASSET.sha256" \
             --repo "$GITHUB_REPOSITORY" --clobber
+
+      # Prove the asset is reachable at the URL the install script will actually construct.
+      # Uploading successfully is not the same as being downloadable: a draft release accepts
+      # uploads and then serves them from a URL that has nothing to do with the tag.
+      - name: Verify the published URL
+        if: github.ref_type == 'tag'
+        env:
+          ASSET: ${{ steps.package.outputs.asset }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/$ASSET"
+          code=$(curl -fsL -o /dev/null -w '%{http_code}' --retry 3 --retry-delay 3 "$url" || true)
+          if [ "$code" != "200" ]; then
+            echo "::error::$url is not downloadable (HTTP $code)"
+            exit 1
+          fi
+          echo "verified $url"
