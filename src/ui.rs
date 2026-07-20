@@ -36,6 +36,8 @@ enum Status {
     Extra,
     /// ...unless it is a local link, which prune always protects.
     ExtraLocal,
+    /// ...or herdr-lazy itself, which must never be pruned by its own prune.
+    SelfEntry,
 }
 
 impl Status {
@@ -48,6 +50,7 @@ impl Status {
             Status::Disabled => "○",
             Status::Extra => "+",
             Status::ExtraLocal => "⚑",
+            Status::SelfEntry => "◆",
         }
     }
 
@@ -60,6 +63,7 @@ impl Status {
             Status::Unverifiable | Status::Disabled => "\x1b[36m",  // cyan
             Status::Extra => "\x1b[31m",                            // red
             Status::ExtraLocal => "\x1b[35m",                       // magenta
+            Status::SelfEntry => "\x1b[34m",                        // blue
         }
     }
 
@@ -86,6 +90,7 @@ impl Status {
                 "installed, not in your list — press a to adopt, x to uninstall".to_string()
             }
             Status::ExtraLocal => "installed as a local link — never removed by prune".to_string(),
+            Status::SelfEntry => "this is herdr-lazy — never removed by its own prune".to_string(),
         }
     }
 }
@@ -147,7 +152,9 @@ fn rows(desired: &[Spec], installed: &[Installed]) -> Vec<Row> {
         rows.push(Row {
             label: p.slug.clone().unwrap_or_else(|| p.plugin_id.clone()),
             commit: p.resolved_commit.clone(),
-            status: if p.source_kind == "local" {
+            status: if crate::is_self_id(&p.plugin_id) {
+                Status::SelfEntry
+            } else if p.source_kind == "local" {
                 Status::ExtraLocal
             } else {
                 Status::Extra
@@ -592,7 +599,7 @@ mod tests {
         let installed = vec![
             github("o", "wanted", SHA, true),
             github("someone", "unwanted", SHA, true),
-            local("herdr-lazy"),
+            local("someone.local-plugin"),
         ];
 
         let r = rows(&desired, &installed);
@@ -663,7 +670,7 @@ mod tests {
     #[test]
     fn a_local_link_row_carries_no_slug_to_adopt() {
         let installed = vec![
-            local("herdr-lazy"),
+            local("someone.local-plugin"),
             github("someone", "unlisted", SHA, true),
         ];
         let r = rows(&[], &installed);
@@ -702,6 +709,22 @@ mod tests {
         );
         // `a` uses the repo alone, without the pin.
         assert_eq!(r[1].slug.as_deref(), Some("o/pinned"));
+    }
+
+    /// Regression: installed normally (not as a local link), herdr-lazy is an ordinary github
+    /// plugin that is absent from the user's list — precisely what prune removes. It must be
+    /// recognised as itself, or `X` deletes the running tool's own directory.
+    #[test]
+    fn herdr_lazy_is_never_shown_as_prunable() {
+        let mut me = github("natori-hrj", "herdr-lazy", SHA, true);
+        me.plugin_id = "herdr-lazy".to_string();
+        let r = rows(&[], &[me]);
+        assert_eq!(r[0].status, Status::SelfEntry);
+        assert_ne!(r[0].status, Status::Extra);
+
+        // Also while developing, where it is a local link — same protection, clearer reason.
+        let dev = local("herdr-lazy");
+        assert_eq!(rows(&[], &[dev])[0].status, Status::SelfEntry);
     }
 
     /// Regression: destructive keys must be unreachable via a modifier chord.
@@ -751,7 +774,10 @@ mod tests {
     #[test]
     fn installed_rows_carry_the_id_needed_to_uninstall() {
         let desired = vec![Spec::parse("o/listed"), Spec::parse("o/absent")];
-        let installed = vec![github("o", "listed", SHA, true), local("herdr-lazy")];
+        let installed = vec![
+            github("o", "listed", SHA, true),
+            local("someone.local-plugin"),
+        ];
         let r = rows(&desired, &installed);
 
         assert_eq!(r[0].installed, Some(("listed".into(), "github".into())));
@@ -760,7 +786,10 @@ mod tests {
             "a missing entry cannot be uninstalled"
         );
         let link = r.iter().find(|x| x.status == Status::ExtraLocal).unwrap();
-        assert_eq!(link.installed, Some(("herdr-lazy".into(), "local".into())));
+        assert_eq!(
+            link.installed,
+            Some(("someone.local-plugin".into(), "local".into()))
+        );
     }
 
     #[test]

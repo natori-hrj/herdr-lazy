@@ -714,6 +714,15 @@ fn prune_extras(desired: &[Spec], installed: &[Installed]) {
             Match::None => {}
         }
 
+        if is_self(p) {
+            kept.push(format!(
+                "{} — this is herdr-lazy itself; uninstall it with `herdr plugin uninstall` \
+                 if you mean to",
+                p.plugin_id
+            ));
+            continue;
+        }
+
         if p.source_kind == "local" {
             kept.push(format!(
                 "{} — locally linked ({}); use `herdr plugin unlink {}` if you mean it",
@@ -742,12 +751,33 @@ fn prune_extras(desired: &[Spec], installed: &[Installed]) {
     println!("pruned {} plugin(s)", removed);
 }
 
+/// Is this installed plugin herdr-lazy itself?
+///
+/// While developing, herdr-lazy is a local link and prune skips it for that reason. Installed
+/// normally it is an ordinary github plugin, and — not being in the user's list — it is
+/// exactly the shape prune removes. So `sync --prune` would uninstall the tool mid-run,
+/// deleting the directory of the running binary. Match on the plugin id, which herdr takes
+/// from our own manifest.
+fn is_self(p: &Installed) -> bool {
+    is_self_id(&p.plugin_id)
+}
+
+pub(crate) fn is_self_id(plugin_id: &str) -> bool {
+    plugin_id == PLUGIN_ID
+}
+
 /// Uninstall one plugin, applying the same rule `--prune` uses.
 ///
 /// Returns a message rather than printing: the manage pane calls this while it owns the
 /// screen. Refuses local links for the same reason prune does — they have no owner/repo, and
 /// herdr-lazy is normally one, so this stops the pane uninstalling the tool running it.
 pub(crate) fn uninstall_plugin(plugin_id: &str, source_kind: &str) -> String {
+    if plugin_id == PLUGIN_ID {
+        return format!(
+            "{} is herdr-lazy itself — run `herdr plugin uninstall {}` from a shell instead",
+            plugin_id, plugin_id
+        );
+    }
     if source_kind == "local" {
         return format!(
             "{} is a local link — use `herdr plugin unlink {}` if you really mean it",
