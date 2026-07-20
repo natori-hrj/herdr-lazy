@@ -43,11 +43,14 @@ title = "Lazy: sync plugins to bundle"
 contexts = ["workspace"]
 command = ["./target/release/herdr-lazy", "sync"]
 
+# Opens the pane rather than running the TUI directly: actions get no PTY, so `herdr-lazy ui`
+# invoked as an action fails with "Device not configured". See the script for the details.
+# This is also what a `type = "plugin_action"` keybinding ends up calling.
 [[actions]]
 id = "manage"
 title = "Lazy: open manage pane"
 contexts = ["workspace"]
-command = ["./target/release/herdr-lazy", "ui"]
+command = ["/bin/sh", "scripts/open-manage-pane.sh"]
 
 # The manage UI. `overlay` is the right placement for it: a temporary zoomed view that
 # hands focus back to whatever you were doing when it closes.

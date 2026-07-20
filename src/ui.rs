@@ -453,7 +453,22 @@ fn classify(key: &KeyEvent) -> Action {
 
 pub(crate) fn run() -> io::Result<()> {
     let mut out = io::stdout();
-    terminal::enable_raw_mode()?;
+
+    // Without a terminal this fails as "Device not configured (os error 6)", which tells the
+    // reader nothing. It happens for a specific, recurring reason: herdr runs plugin *actions*
+    // with no PTY, so `ui` invoked as an action — or from a keybinding wired straight to one —
+    // cannot work. Only a pane gets a terminal. Say that instead.
+    if let Err(e) = terminal::enable_raw_mode() {
+        eprintln!(
+            "herdr-lazy ui needs a terminal, and does not have one ({}).",
+            e
+        );
+        eprintln!();
+        eprintln!("If you ran this as a herdr plugin action or keybinding: actions get no PTY.");
+        eprintln!("Open the pane instead:");
+        eprintln!("  herdr plugin pane open --plugin herdr-lazy --entrypoint manage");
+        return Ok(());
+    }
     write!(out, "\x1b[?1049h\x1b[?25l")?; // alternate screen, hide cursor
     out.flush()?;
 
