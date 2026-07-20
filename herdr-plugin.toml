@@ -19,30 +19,35 @@ command = ["/bin/sh", "scripts/fetch-or-build.sh"]
 platforms = ["windows"]
 command = ["cargo", "build", "--release"]
 
+# NOTE: the leading `./` is required. herdr resolves a pane's command through PATH, so a
+# bare `target/release/herdr-lazy` fails with "No viable candidates found in PATH" even
+# though the process runs with the plugin directory as its cwd. Actions happen to tolerate
+# the bare form, but every other plugin uses `./`, so keep both consistent.
+
 # Actions surface herdr-lazy inside herdr's command palette.
 [[actions]]
 id = "probe"
 title = "Lazy: probe CLI bridge"
 contexts = ["workspace"]
-command = ["target/release/herdr-lazy", "probe"]
+command = ["./target/release/herdr-lazy", "probe"]
 
 [[actions]]
 id = "init"
 title = "Lazy: install curated defaults"
 contexts = ["workspace"]
-command = ["target/release/herdr-lazy", "init"]
+command = ["./target/release/herdr-lazy", "init"]
 
 [[actions]]
 id = "sync"
 title = "Lazy: sync plugins to bundle"
 contexts = ["workspace"]
-command = ["target/release/herdr-lazy", "sync"]
+command = ["./target/release/herdr-lazy", "sync"]
 
 [[actions]]
 id = "manage"
 title = "Lazy: open manage pane"
 contexts = ["workspace"]
-command = ["target/release/herdr-lazy", "ui"]
+command = ["./target/release/herdr-lazy", "ui"]
 
 # The manage UI. `overlay` is the right placement for it: a temporary zoomed view that
 # hands focus back to whatever you were doing when it closes.
@@ -50,4 +55,4 @@ command = ["target/release/herdr-lazy", "ui"]
 id = "manage"
 title = "herdr-lazy"
 placement = "overlay"
-command = ["target/release/herdr-lazy", "ui"]
+command = ["./target/release/herdr-lazy", "ui"]

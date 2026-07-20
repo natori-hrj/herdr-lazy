@@ -63,17 +63,27 @@ impl Status {
         }
     }
 
+    /// Every note states BOTH axes — installed or not, listed or not.
+    ///
+    /// An earlier version said only "not in bundle" for an extra plugin, which reads as "not
+    /// installed" to anyone who has not internalised what the bundle is. It means the exact
+    /// opposite, and the two states sit next to each other in the same list, so the ambiguity
+    /// is worth the extra words. "your list" rather than "bundle": the file is the user's,
+    /// and the jargon is only explained in the README.
     fn note(&self) -> String {
         match self {
             Status::Ok => String::new(),
-            Status::Missing => "not installed — press s".to_string(),
-            Status::Drifted { have } => {
-                format!("at {} — press s to restore the pin", crate::short(have))
+            Status::Missing => "in your list, not installed — press s to install".to_string(),
+            Status::Drifted { have } => format!(
+                "installed at {}, pinned elsewhere — press s to restore the pin",
+                crate::short(have)
+            ),
+            Status::Unverifiable => {
+                "installed; pinned to a tag/branch, so it cannot be verified".to_string()
             }
-            Status::Unverifiable => "pinned to a tag/branch — cannot verify locally".to_string(),
-            Status::Disabled => "disabled — herdr will not run it".to_string(),
-            Status::Extra => "not in bundle — press x to prune".to_string(),
-            Status::ExtraLocal => "local link — prune will not touch it".to_string(),
+            Status::Disabled => "installed but disabled — herdr will not run it".to_string(),
+            Status::Extra => "installed, not in your list — press x to remove".to_string(),
+            Status::ExtraLocal => "installed as a local link — never removed by prune".to_string(),
         }
     }
 }
@@ -179,7 +189,7 @@ impl App {
 
         writeln!(
             out,
-            "\x1b[1m herdr-lazy\x1b[0m  \x1b[2m{} ok · {} to sync · {} extra\x1b[0m\r",
+            "\x1b[1m herdr-lazy\x1b[0m  \x1b[2m{} ok · {} to sync · {} unlisted\x1b[0m\r",
             ok, todo, extra
         )?;
         writeln!(out, "\x1b[2m{}\x1b[0m\r", "─".repeat(64))?;
@@ -189,7 +199,7 @@ impl App {
         } else if self.rows.is_empty() {
             writeln!(
                 out,
-                " \x1b[2mno bundle yet — run `herdr-lazy init`\x1b[0m\r"
+                " \x1b[2mno plugin list yet — run `herdr-lazy init`\x1b[0m\r"
             )?;
         }
 
@@ -229,7 +239,7 @@ impl App {
         write!(
             out,
             "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m\x1b[1ms\x1b[0m sync  \x1b[1mu\x1b[0m update  \
-             \x1b[1mx\x1b[0m prune  \x1b[1mr\x1b[0m refresh  \x1b[1mq\x1b[0m quit\r",
+             \x1b[1mx\x1b[0m remove extras  \x1b[1mr\x1b[0m refresh  \x1b[1mq\x1b[0m quit\r",
             height.saturating_sub(1),
             "─".repeat(64)
         )?;
@@ -472,6 +482,36 @@ mod tests {
         // width is the case the doc comment above warns about, where the trailing columns of
         // such a row drift right.
         assert_eq!(truncate("ありがとうございます", 4), "ありが…");
+    }
+
+    /// The two states that sit adjacent in the list and mean opposite things must each say
+    /// whether the plugin is installed — reading one as the other is the mistake to prevent.
+    #[test]
+    fn missing_and_extra_notes_both_state_installed_status() {
+        let missing = Status::Missing.note();
+        let extra = Status::Extra.note();
+        assert!(missing.contains("not installed"), "{}", missing);
+        assert!(extra.starts_with("installed,"), "{}", extra);
+        assert!(missing.contains("in your list"), "{}", missing);
+        assert!(extra.contains("not in your list"), "{}", extra);
+    }
+
+    #[test]
+    fn no_note_uses_the_word_bundle() {
+        for s in [
+            Status::Missing,
+            Status::Drifted { have: SHA.into() },
+            Status::Unverifiable,
+            Status::Disabled,
+            Status::Extra,
+            Status::ExtraLocal,
+        ] {
+            assert!(
+                !s.note().to_lowercase().contains("bundle"),
+                "jargon leaked into the UI: {}",
+                s.note()
+            );
+        }
     }
 
     #[test]
