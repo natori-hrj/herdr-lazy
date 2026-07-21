@@ -204,6 +204,20 @@ depends on where you want to be pinged — not a decision a default set should m
 None of this is load-bearing: `init` just writes these lines into `plugins.list`. Edit it,
 or skip `init` and build your own with `add`.
 
+## Roadmap
+
+Directions, not promises. Anything with an issue open is specified enough to be worked on;
+the rest still needs design.
+
+- **Warn before installing what cannot install.** herdr runs plugin builds with a minimal
+  PATH, so a plugin whose build is a bare `cargo build` fails on machines where Rust works
+  fine everywhere else. The manifest is readable before install, so the browser could say so.
+- **`check`** — show what has updates without applying any, the way `update` does but
+  read-only. Needs a plan for GitHub API rate limits.
+- **Starter lists** — `init --from owner/repo`, so a curated list can be shared and adopted
+  the way people fork a LazyVim starter.
+- **enable / disable from the pane** — herdr supports both; herdr-lazy only reports the state.
+
 ## Design notes
 
 - **Rust, and nearly dependency-free.** The manager is orchestration — shelling out to
