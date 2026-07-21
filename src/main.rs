@@ -48,8 +48,6 @@ use std::process::Command;
 ///     `cargo build` and it fails to install under herdr's build PATH (verified 2026-07-20).
 ///     herdr-plugin-workspace-manager does the same job with no build step at all, so it wins
 ///     on the criterion that matters most for a default.
-///   - `persiyanov/herdr-reviewr` (152★) — excellent, but it bundles its own file viewer, so
-///     it duplicates herdr-file-viewer. A review-first workflow should swap, not add.
 ///   - `dcolinmorgan/herdr-remote` (100★), `AltanS/collie` (63★) — remote approval overlaps
 ///     herdr-hail. All three are good; which fits depends on where you want to be pinged,
 ///     which is not something a default set should decide.
@@ -60,6 +58,7 @@ const DEFAULT_BUNDLE: &[&str] = &[
     // Proven in the ecosystem, and verified to install cleanly.
     "cloudmanic/herdr-plus",                    // projects + quick actions
     "smarzban/herdr-file-viewer",               // git-aware read-only file pane
+    "persiyanov/herdr-reviewr",                 // comment on an agent's diff, send it back
     "razajamil/herdr-plugin-workspace-manager", // per-workspace tab/pane layouts; no build step
     // Gaps nothing else covers: keeping a human oriented across several running agents.
     "natori-hrj/herdr-triage",  // which agent needs you most

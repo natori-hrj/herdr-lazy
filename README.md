@@ -91,6 +91,14 @@ herdr-lazy update smarzban/herdr-file-viewer
 | `lock` | write the lockfile from the current bundle |
 | `probe` | dump what the herdr CLI exposes (for debugging) |
 
+### Already using herdr?
+
+Nothing has to be reinstalled, and `init` is optional. The pane lists every plugin you
+already have, marks the ones your list does not mention, and `a` adopts the highlighted one
+into it. Working through that list turns a setup you built by hand into a declared one
+without touching the plugins themselves — after which it can be pinned, locked, and
+reproduced on another machine.
+
 Both files live in the directory herdr assigns the plugin — `herdr plugin config-dir
 herdr-lazy` prints it:
 
@@ -175,6 +183,7 @@ a file pane is a worse default than one.
 |---|---|
 | [cloudmanic/herdr-plus](https://github.com/cloudmanic/herdr-plus) | projects and quick actions; the broadest general-purpose add-on |
 | [smarzban/herdr-file-viewer](https://github.com/smarzban/herdr-file-viewer) | git-aware read-only file pane |
+| [persiyanov/herdr-reviewr](https://github.com/persiyanov/herdr-reviewr) | review an agent's diff line by line and send comments back to it |
 | [razajamil/herdr-plugin-workspace-manager](https://github.com/razajamil/herdr-plugin-workspace-manager) | per-workspace tab/pane layouts, applied automatically |
 | [natori-hrj/herdr-triage](https://github.com/natori-hrj/herdr-triage) | ranks agents by who needs you most |
 | [natori-hrj/herdr-green](https://github.com/natori-hrj/herdr-green) | runs a project's tests when its agent finishes |
@@ -195,8 +204,6 @@ Deliberately **not** included, despite being good:
 [herdr-spreader](https://github.com/yuk1ty/herdr-spreader) (41★) is the better-known layout
 plugin, but it hits exactly that build problem, and workspace-manager does the same job with
 no build step;
-[herdr-reviewr](https://github.com/persiyanov/herdr-reviewr) bundles its own file viewer and
-so duplicates herdr-file-viewer (swap, do not add);
 [herdr-remote](https://github.com/dcolinmorgan/herdr-remote) and
 [collie](https://github.com/AltanS/collie) cover remote approval, where the right choice
 depends on where you want to be pinged — not a decision a default set should make for you.
