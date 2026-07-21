@@ -90,11 +90,13 @@ pub(crate) fn age_label(pushed_at: &str, today: i64) -> String {
         return String::new();
     };
     let days = (today - then).max(0);
+    // Boundaries chosen so no bucket can render a leading zero: at 28 days `days / 30` is 0,
+    // which showed as "0mo" — a label that reads as "never" for something touched last month.
     match days {
         0 => "today".to_string(),
         1..=6 => format!("{}d", days),
-        7..=27 => format!("{}w", days / 7),
-        28..=364 => format!("{}mo", days / 30),
+        7..=29 => format!("{}w", days / 7),
+        30..=364 => format!("{}mo", days / 30),
         _ => format!("{}y", days / 365),
     }
 }
@@ -309,6 +311,20 @@ mod tests {
         assert_eq!(ago(14), "2w");
         assert_eq!(ago(60), "2mo");
         assert_eq!(ago(400), "1y");
+        // Every bucket boundary, since an off-by-one here renders "0mo" or "0y".
+        for d in 0..800 {
+            let label = ago(d);
+            assert!(
+                !label.starts_with('0') || label == "0d",
+                "{} days rendered as {}",
+                d,
+                label
+            );
+        }
+        assert_eq!(ago(29), "4w");
+        assert_eq!(ago(30), "1mo");
+        assert_eq!(ago(364), "12mo");
+        assert_eq!(ago(365), "1y");
     }
 
     /// A missing or malformed date must render as nothing, not as a wrong age.
