@@ -90,6 +90,8 @@ mod tests {
             stars,
             language: "Rust".to_string(),
             topics: topics.iter().map(|t| t.to_string()).collect(),
+            url: format!("https://github.com/{}", name),
+            pushed_at: "2026-07-01T00:00:00Z".to_string(),
         }
     }
 
@@ -175,6 +177,38 @@ mod tests {
             b.selected().is_none(),
             "must not offer to add a phantom row"
         );
+    }
+
+    /// Regression: the query is a text field, so every printable character must reach it.
+    ///
+    /// `a` was briefly bound to "add" and `o` to "open repo" here, which meant typing
+    /// "worktree" searched for "wrktree" and any word containing an "a" wrote to the user's
+    /// list as a side effect of typing. Commands in this view must take a modifier.
+    #[test]
+    fn every_printable_character_can_be_typed() {
+        let mut b = browser();
+        for c in "abcdefghijklmnopqrstuvwxyz0123456789-_./ ".chars() {
+            b.push(c);
+        }
+        assert_eq!(b.query, "abcdefghijklmnopqrstuvwxyz0123456789-_./ ");
+    }
+
+    /// The words a user is most likely to type must survive intact.
+    #[test]
+    fn realistic_queries_are_not_mangled() {
+        for q in [
+            "worktree",
+            "lazygit",
+            "notification",
+            "agent",
+            "workspace manager",
+        ] {
+            let mut b = browser();
+            for c in q.chars() {
+                b.push(c);
+            }
+            assert_eq!(b.query, q, "{} was mangled", q);
+        }
     }
 
     #[test]

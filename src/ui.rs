@@ -351,6 +351,41 @@ impl App {
         Ok(())
     }
 
+    /// `o`, in the browser — open the selected repository in a browser.
+    ///
+    /// Without this the browser can install a stranger's code but not show it to you first,
+    /// which is the wrong way round. It is also the only thing here that sends traffic to the
+    /// plugin's author.
+    fn open_selected_url(&mut self) {
+        let Some(b) = self.browser.as_ref() else {
+            return;
+        };
+        let Some(entry) = b.selected() else {
+            return;
+        };
+        if entry.url.is_empty() {
+            self.flash = Some(format!("{} has no repository URL", entry.full_name));
+            return;
+        }
+        let url = entry.url.clone();
+        // macOS then Linux. Failing to find a browser is a shrug, not an error.
+        let opened = std::process::Command::new("open")
+            .arg(&url)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+            || std::process::Command::new("xdg-open")
+                .arg(&url)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+        self.flash = Some(if opened {
+            format!("opened {}", url)
+        } else {
+            format!("could not open a browser — {}", url)
+        });
+    }
+
     /// `r` — put just the selected entry back to the commit in the lockfile.
     fn restore_selected(&mut self) -> io::Result<()> {
         let Some(row) = self.selected() else {
@@ -446,7 +481,10 @@ impl App {
             &[
                 ("a", "add the selected installed plugin to your list"),
                 ("d", "remove the selected entry (does not uninstall)"),
-                ("/", "search the marketplace and add from it"),
+                (
+                    "/",
+                    "search the marketplace — [o] opens a repo, [enter] adds it",
+                ),
             ],
         )?;
         section(
@@ -474,6 +512,7 @@ impl App {
         let b = self.browser.as_ref().expect("checked by caller");
         let rule = "─".repeat((width as usize).clamp(20, 200));
         let results = b.results();
+        let today = crate::registry::today_days();
 
         write!(out, "\x1b[H\x1b[2J")?;
         writeln!(
@@ -504,21 +543,26 @@ impl App {
             } else {
                 " "
             };
+            // Last push, not stars, is what says whether a plugin still works. Four columns
+            // is enough for "3d" / "2w" / "5mo" and costs almost nothing.
+            let age = crate::registry::age_label(&e.pushed_at, today);
             writeln!(
                 out,
-                "{} {} \x1b[33m{:>4}★\x1b[0m {:<42} \x1b[2m{}\x1b[0m\r",
+                "{} {} \x1b[33m{:>4}★\x1b[0m {:<38} \x1b[2m{:<5}{}\x1b[0m\r",
                 pointer,
                 mark,
                 e.stars,
-                truncate(&e.full_name, 42),
-                truncate(&e.description, width.saturating_sub(56) as usize)
+                truncate(&e.full_name, 38),
+                age,
+                truncate(&e.description, width.saturating_sub(58) as usize)
             )?;
         }
 
         let footer = match &self.flash {
             Some(msg) => format!("\x1b[36m{}\x1b[0m", msg),
-            None => "\x1b[1m[enter]\x1b[0m add to your list  \x1b[1m[↑↓]\x1b[0m move  \
-                     \x1b[1m[ctrl+r]\x1b[0m refresh  \x1b[1m[esc]\x1b[0m back"
+            None => "\x1b[1m[enter]\x1b[0m add to your list  \x1b[1m[ctrl+o]\x1b[0m open repo  \
+                     \x1b[1m[↑↓]\x1b[0m move  \x1b[1m[ctrl+r]\x1b[0m refresh  \
+                     \x1b[1m[esc]\x1b[0m back"
                 .to_string(),
         };
         write!(
@@ -771,9 +815,12 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                 {
                     app.add_and_return()
                 }
-                // `a` adds in the list view, so it adds here too rather than typing an "a".
-                KeyCode::Char('a') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.add_and_return()
+                // NOTHING here may bind a plain letter. The query is a text field, so `a`
+                // and `o` must type an "a" and an "o" — binding them to add and open made
+                // "worktree" search for "wrktree", and typing any word containing an "a"
+                // silently wrote to the user's list. Commands in this view take a modifier.
+                KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.open_selected_url()
                 }
                 KeyCode::Down => app.browser.as_mut().unwrap().move_down(),
                 KeyCode::Up => app.browser.as_mut().unwrap().move_up(),

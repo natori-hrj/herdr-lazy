@@ -34,6 +34,13 @@ pub(crate) struct Entry {
     pub(crate) stars: u64,
     pub(crate) language: String,
     pub(crate) topics: Vec<String>,
+    /// The repository page. Kept so the browser can open it — reading a stranger's code
+    /// before installing it is the habit worth supporting, and without this the browser is a
+    /// dead end that can install but not evaluate.
+    pub(crate) url: String,
+    /// `pushedAt`, verbatim (`2026-07-17T06:37:31Z`). When a plugin was last touched says
+    /// more about whether it still works than its star count does.
+    pub(crate) pushed_at: String,
 }
 
 impl Entry {
@@ -54,6 +61,50 @@ impl Entry {
             .split_whitespace()
             .all(|term| haystack.contains(&term.to_lowercase()))
     }
+}
+
+/// Days since the Unix epoch for a `YYYY-MM-DD…` string, or None if it is not one.
+///
+/// Hand-rolled rather than pulling in a date crate for one field. This is the standard
+/// civil-date-to-days conversion; it is exact for any date the marketplace can contain.
+fn days_from_iso(s: &str) -> Option<i64> {
+    let (y, rest) = s.split_once('-')?;
+    let (m, rest) = rest.split_once('-')?;
+    let d = rest.get(..2)?;
+    let (y, m, d): (i64, i64, i64) = (y.parse().ok()?, m.parse().ok()?, d.parse().ok()?);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + if m > 2 { -3 } else { 9 }) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
+}
+
+/// "3d", "2w", "5mo" — how long ago, in as few characters as possible.
+pub(crate) fn age_label(pushed_at: &str, today: i64) -> String {
+    let Some(then) = days_from_iso(pushed_at) else {
+        return String::new();
+    };
+    let days = (today - then).max(0);
+    match days {
+        0 => "today".to_string(),
+        1..=6 => format!("{}d", days),
+        7..=27 => format!("{}w", days / 7),
+        28..=364 => format!("{}mo", days / 30),
+        _ => format!("{}y", days / 365),
+    }
+}
+
+/// Today, as days since the epoch.
+pub(crate) fn today_days() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_secs() / 86_400) as i64)
+        .unwrap_or(0)
 }
 
 fn cache_path() -> PathBuf {
@@ -124,6 +175,8 @@ pub(crate) fn parse_index(body: &str) -> Result<Vec<Entry>, String> {
                 })
                 .unwrap_or(0),
             language: p.str_field("language").unwrap_or_default().to_string(),
+            url: p.str_field("url").unwrap_or_default().to_string(),
+            pushed_at: p.str_field("pushedAt").unwrap_or_default().to_string(),
             topics: p
                 .get("topics")
                 .and_then(|t| t.as_array())
@@ -208,7 +261,7 @@ mod tests {
         {"id":1,"fullName":"smarzban/herdr-file-viewer","owner":"smarzban","name":"herdr-file-viewer",
          "description":"A git-aware, read-only file viewer for herdr.","url":"https://github.com/smarzban/herdr-file-viewer",
          "stars":181,"forks":0,"openIssues":0,"language":"Rust",
-         "topics":["herdr","herdr-plugin","tui"],"createdAt":"2026-06-18T00:00:00Z"},
+         "topics":["herdr","herdr-plugin","tui"],"createdAt":"2026-06-18T00:00:00Z","pushedAt":"2026-07-17T06:37:31Z"},
         {"id":2,"fullName":"devashish2203/herdr-worktrunk","owner":"devashish2203","name":"herdr-worktrunk",
          "description":"Interactive fzf picker for Worktrunk","url":"https://github.com/devashish2203/herdr-worktrunk",
          "stars":41,"language":"Shell","topics":["herdr-plugin","git-worktree"]}
@@ -224,6 +277,60 @@ mod tests {
         assert_eq!(e[0].language, "Rust");
         assert!(e[0].topics.contains(&"tui".to_string()));
         assert_eq!(e[1].stars, 41);
+    }
+
+    #[test]
+    fn parses_url_and_last_push() {
+        let e = parse_index(INDEX).unwrap();
+        assert_eq!(e[0].url, "https://github.com/smarzban/herdr-file-viewer");
+        assert_eq!(e[0].pushed_at, "2026-07-17T06:37:31Z");
+    }
+
+    #[test]
+    fn converts_iso_dates_to_days() {
+        assert_eq!(days_from_iso("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(days_from_iso("1970-01-02T00:00:00Z"), Some(1));
+        assert_eq!(days_from_iso("2000-03-01T00:00:00Z"), Some(11017));
+        // Leap day must not shift the count.
+        assert_eq!(
+            days_from_iso("2024-03-01").unwrap() - days_from_iso("2024-02-28").unwrap(),
+            2
+        );
+        assert_eq!(days_from_iso("not a date"), None);
+        assert_eq!(days_from_iso("2026-13-01"), None, "month out of range");
+    }
+
+    #[test]
+    fn ages_read_as_few_characters_as_possible() {
+        let today = days_from_iso("2026-07-21").unwrap();
+        let ago = |d: i64| age_label(&format!("{}T00:00:00Z", iso_of(today - d)), today);
+        assert_eq!(ago(0), "today");
+        assert_eq!(ago(3), "3d");
+        assert_eq!(ago(14), "2w");
+        assert_eq!(ago(60), "2mo");
+        assert_eq!(ago(400), "1y");
+    }
+
+    /// A missing or malformed date must render as nothing, not as a wrong age.
+    #[test]
+    fn an_unparseable_date_has_no_age() {
+        assert_eq!(age_label("", 20_000), "");
+        assert_eq!(age_label("soon", 20_000), "");
+    }
+
+    /// Days-since-epoch back to `YYYY-MM-DD`, for the test above only.
+    fn iso_of(days: i64) -> String {
+        let z = days + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if m <= 2 { y + 1 } else { y };
+        format!("{:04}-{:02}-{:02}", y, m, d)
     }
 
     #[test]
