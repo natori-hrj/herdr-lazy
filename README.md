@@ -8,18 +8,7 @@ herdr installs plugins one imperative command at a time. There is no way to decl
 set you want, and no lockfile — so a working setup cannot be reproduced on another
 machine. herdr-lazy adds both.
 
-```
- herdr-lazy  2 ok · 2 to sync · 1 unlisted
- ────────────────────────────────────────────────────────────────
- ✔ cloudmanic/herdr-plus            f32b0825f125
- ✔ smarzban/herdr-file-viewer       10e930332635
- ✗ owner/not-yet-installed          -             in your list, not installed — press s to install
- ↻ owner/pinned@9f3c1ab             b872365a12f4  installed at b872365a12f4, pinned elsewhere — press s …
- + someone/unlisted                 8facfbb2a7bd  installed, not in your list — press x to remove
- ⚑ herdr-lazy                       -             installed as a local link — never removed by prune
- ────────────────────────────────────────────────────────────────
- sync  update  adopt  drop  x uninstall   SHIFT = all   refresh  quit
-```
+![herdr-lazy: the manage pane, searching the marketplace and adding a plugin](docs/demo.gif)
 
 ## What it gives you
 
@@ -114,19 +103,13 @@ the manage pane always read the same files.
 ## Finding plugins
 
 herdr publishes its marketplace as a single index, so the pane can search it directly.
-Press `/`, type, and Enter adds the highlighted plugin to your list; `esc` then `s` installs
-it.
+Press `/` and type. Enter adds the highlighted plugin to your list, closes the search, and
+leaves the cursor on the new entry — so `i` then installs the thing you just chose, and not
+whatever row you happened to be on before.
 
-```
- marketplace  95 of 275 · cached 3m ago
- search: wor
- ─────────────────────────────────────────────────────────────────────────────────
- >     43★ devashish2203/herdr-worktrunk     Herdr Plugin to integrate worktrunk …
-       41★ yuk1ty/herdr-spreader             Spin up your whole herdr workspace la…
-       29★ NathanFlurry/herdr-plugin-jj-work Create and remove Jujutsu (jj) worksp…
- ─────────────────────────────────────────────────────────────────────────────────
- enter add to list  ctrl+r refresh  esc back
-```
+Each result shows its star count and how long ago it was last pushed — `3d`, `2w`, `5mo` —
+because whether a plugin is still maintained matters more than how many stars it has.
+`ctrl+o` opens the repository, so you can read someone's code before installing it.
 
 Search terms are ANDed and each may match the name, description or topics, so `worktree fzf`
 finds a worktree plugin whose description mentions fzf.
