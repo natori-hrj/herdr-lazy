@@ -77,9 +77,9 @@ impl Status {
     fn note(&self) -> String {
         match self {
             Status::Ok => String::new(),
-            Status::Missing => "in your list, not installed — press s to install".to_string(),
+            Status::Missing => "in your list, not installed — press i to install".to_string(),
             Status::Drifted { have } => format!(
-                "installed at {}, pinned elsewhere — press s to restore the pin",
+                "installed at {}, pinned elsewhere — press i to restore the pin",
                 crate::short(have)
             ),
             Status::Unverifiable => {
@@ -261,26 +261,54 @@ impl App {
         }
     }
 
-    /// Enter, in the browser — record the discovery in the list. Does not install; `s` does.
-    fn add_selected_from_browser(&mut self) {
-        let Some(b) = self.browser.as_ref() else {
+    /// Enter, in the browser — add to the list, close the browser, and put the cursor on the
+    /// new entry so the next key acts on it.
+    ///
+    /// Leaving the user in the browser was worse than it sounds: the list behind it was built
+    /// before the addition, so closing the browser showed a list that did not contain what had
+    /// just been added, and `s` would have installed whatever row the cursor happened to be
+    /// on. "Added, here it is, press s" is the only version of this that is safe to follow.
+    fn add_and_return(&mut self) {
+        let Some(name) = self.add_selected_from_browser() else {
             return;
         };
+        self.browser = None;
+        self.refresh();
+        let found = self.rows.iter().position(|r| {
+            r.listed_as.as_deref() == Some(name.as_str())
+                || r.slug.as_deref() == Some(name.as_str())
+        });
+        if let Some(i) = found {
+            self.cursor = i;
+        }
+        // Do not tell someone to install what they already have. A plugin can be installed and
+        // simply absent from the list, in which case adopting it from the marketplace is only
+        // bookkeeping — saying "press s to install" there makes the pane look like it does not
+        // know its own state.
+        let already_installed = found
+            .and_then(|i| self.rows.get(i))
+            .map(|r| r.installed.is_some())
+            .unwrap_or(false);
+        self.flash = Some(if already_installed {
+            format!("added {} to your list — it is already installed", name)
+        } else {
+            format!("added {} — press i to install it", name)
+        });
+    }
+
+    /// Write the selection into the list. Returns the name added, or None if nothing was.
+    fn add_selected_from_browser(&mut self) -> Option<String> {
+        let b = self.browser.as_ref()?;
         let Some(entry) = b.selected() else {
             self.flash = Some("nothing selected".to_string());
-            return;
+            return None;
         };
         let name = entry.full_name.clone();
-        self.flash = Some(match crate::add_to_list(&name) {
-            Ok(msg) => format!("{} — press esc, then s to install", msg),
-            Err(e) => format!("could not write the list: {}", e),
-        });
-        // Reflect it immediately, so the ✔ appears without leaving the browser.
-        if let Some(b) = self.browser.as_mut() {
-            if !b.listed.contains(&name) {
-                b.listed.push(name);
-            }
+        if let Err(e) = crate::add_to_list(&name) {
+            self.flash = Some(format!("could not write the list: {}", e));
+            return None;
         }
+        Some(name)
     }
 
     /// `s` — install or repair just the selected entry.
@@ -318,6 +346,25 @@ impl App {
         let repo = row.slug.clone().unwrap_or_default();
         suspended(|| {
             let _ = crate::cmd_update(&[repo.as_str()]);
+        })?;
+        self.refresh();
+        Ok(())
+    }
+
+    /// `r` — put just the selected entry back to the commit in the lockfile.
+    fn restore_selected(&mut self) -> io::Result<()> {
+        let Some(row) = self.selected() else {
+            return Ok(());
+        };
+        let Some(repo) = row.slug.clone() else {
+            self.flash = Some(format!(
+                "{} is not something the lock can describe",
+                row.label
+            ));
+            return Ok(());
+        };
+        suspended(|| {
+            let _ = crate::cmd_restore(&[repo.as_str()]);
         })?;
         self.refresh();
         Ok(())
@@ -366,7 +413,11 @@ impl App {
     fn draw_help(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
         let rule = "─".repeat((width as usize).clamp(20, 200));
         write!(out, "\x1b[H\x1b[2J")?;
-        writeln!(out, "\x1b[1m keys\x1b[0m\r")?;
+        // The one rule the whole keymap follows, stated before any of the keys.
+        writeln!(
+            out,
+            "\x1b[1m keys\x1b[0m   \x1b[2mlowercase acts on the selected row ·              UPPERCASE on your whole list\x1b[0m\r"
+        )?;
         writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
 
         let section = |out: &mut dyn Write, title: &str, keys: &[(&str, &str)]| -> io::Result<()> {
@@ -404,7 +455,7 @@ impl App {
             &[
                 ("j / k", "down / up  (arrow keys work too)"),
                 ("g / G", "first / last row"),
-                ("r", "re-read the list and what is installed"),
+                ("ctrl+r", "re-read the list and what is installed"),
                 ("? / q", "close this help / quit"),
             ],
         )?;
@@ -466,7 +517,7 @@ impl App {
 
         let footer = match &self.flash {
             Some(msg) => format!("\x1b[36m{}\x1b[0m", msg),
-            None => "\x1b[1m[enter]\x1b[0m add to list  \x1b[1m[↑↓]\x1b[0m move  \
+            None => "\x1b[1m[enter]\x1b[0m add to your list  \x1b[1m[↑↓]\x1b[0m move  \
                      \x1b[1m[ctrl+r]\x1b[0m refresh  \x1b[1m[esc]\x1b[0m back"
                 .to_string(),
         };
@@ -547,11 +598,12 @@ impl App {
         // and it disappears entirely on a terminal that renders bold faintly — leaving a row
         // of words with no visible connection to any key. Brackets survive any theme.
         let legend = [
-            ("s", "sync"),
+            ("i", "install"),
             ("u", "update"),
+            ("x", "uninstall"),
+            ("r", "restore"),
             ("a", "adopt"),
             ("d", "drop"),
-            ("x", "uninstall"),
             ("/", "search"),
             ("?", "help"),
         ]
@@ -710,7 +762,19 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                     app.browser = None;
                     app.flash = None;
                 }
-                KeyCode::Enter => app.add_selected_from_browser(),
+                // Enter, plus the raw bytes some terminals deliver instead of it: Ctrl+J is
+                // LF and Ctrl+M is CR. A pty that translates CR to LF would otherwise leave
+                // Enter doing nothing at all, with no hint as to why.
+                KeyCode::Enter => app.add_and_return(),
+                KeyCode::Char('j') | KeyCode::Char('m')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    app.add_and_return()
+                }
+                // `a` adds in the list view, so it adds here too rather than typing an "a".
+                KeyCode::Char('a') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.add_and_return()
+                }
                 KeyCode::Down => app.browser.as_mut().unwrap().move_down(),
                 KeyCode::Up => app.browser.as_mut().unwrap().move_up(),
                 KeyCode::Backspace => {
@@ -735,6 +799,14 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             continue;
         }
 
+        // Ctrl+R re-reads state in both views: the list here, the marketplace index in the
+        // browser. Plain `r` is restore, following lazy.nvim.
+        if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            app.refresh();
+            app.flash = Some("re-read your list and what is installed".to_string());
+            continue;
+        }
+
         match classify(&key) {
             Action::Quit => return Ok(()),
             Action::Ignore if !matches!(key.code, KeyCode::Char(_)) => {}
@@ -754,9 +826,15 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             KeyCode::Char('g') | KeyCode::Home => app.cursor = 0,
             KeyCode::Char('G') | KeyCode::End => app.cursor = app.rows.len().saturating_sub(1),
 
-            // Lowercase acts on the row under the cursor; uppercase on the whole list.
-            KeyCode::Char('s') => app.sync_selected()?,
-            KeyCode::Char('S') => {
+            // One rule: lowercase acts on the row under the cursor, uppercase on everything.
+            //
+            // The letters follow lazy.nvim (i/I install, u/U update, x/X clean, r/R restore),
+            // because most people arriving here already have those in their fingers. lazy's
+            // `S` (sync = install + clean + update) is deliberately NOT copied: it sits
+            // outside that rule, and a key that quietly uninstalls things under a gentle name
+            // is the wrong thing to inherit. See the `S` arm below.
+            KeyCode::Char('i') => app.sync_selected()?,
+            KeyCode::Char('I') => {
                 suspended(|| {
                     let _ = crate::cmd_sync(false, &[]);
                 })?;
@@ -776,11 +854,35 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                 })?;
                 app.refresh();
             }
+            KeyCode::Char('r') => app.restore_selected()?,
+            KeyCode::Char('R') => {
+                suspended(|| {
+                    let _ = crate::cmd_restore(&[]);
+                })?;
+                app.refresh();
+            }
             KeyCode::Char('a') => app.adopt_selected(),
             KeyCode::Char('d') => app.drop_selected(),
             KeyCode::Char('/') => app.open_browser(false),
             KeyCode::Char('?') => app.help = true,
-            KeyCode::Char('r') => app.refresh(),
+
+            // Keys lazy.nvim has that this does not. Rather than doing nothing — which reads
+            // as "the pane is broken" to someone whose fingers know lazy — say where the
+            // equivalent lives.
+            KeyCode::Char('S') => {
+                app.flash = Some(
+                    "no single sync key here — [I] install all · [U] update all · \
+                     [X] remove what is not in your list"
+                        .to_string(),
+                )
+            }
+            KeyCode::Char('C') | KeyCode::Char('c') => {
+                app.flash = Some("no check yet — [U] updates and reports what moved".to_string())
+            }
+            KeyCode::Char('L') => {
+                app.flash =
+                    Some("no log here — `herdr plugin log list` shows plugin output".to_string())
+            }
             _ => {}
         }
     }
@@ -981,6 +1083,28 @@ mod tests {
     /// which a pty sends at end of input, and which users press to mean "end"/"quit" — ran
     /// "drop from list" on whatever the cursor was on. Two entries were silently deleted from
     /// a real list before this was noticed.
+    /// lazy.nvim users arrive with `i`/`u`/`x`/`r` in their fingers, and `S` too. The first
+    /// four must act; `S` must explain itself rather than doing nothing or, worse, doing
+    /// something destructive under a gentle name.
+    #[test]
+    fn the_keymap_follows_lazy_nvim_where_it_can() {
+        let plain = |c| classify(&KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        for c in ['i', 'u', 'x', 'r', 'a', 'd', '/', '?'] {
+            assert_eq!(plain(c), Action::Command(c), "{} should be a command", c);
+        }
+        for c in ['I', 'U', 'X', 'R'] {
+            assert_eq!(
+                classify(&KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT)),
+                Action::Command(c),
+                "{} should be a command",
+                c
+            );
+        }
+        // `s` no longer does anything: it used to install, and silently re-binding a key that
+        // people may have learned is worse than leaving it inert.
+        assert_eq!(plain('s'), Action::Command('s'));
+    }
+
     #[test]
     fn modified_keys_are_not_treated_as_commands() {
         let plain = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);

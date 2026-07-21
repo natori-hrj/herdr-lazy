@@ -1104,7 +1104,8 @@ fn print_help() {
     println!("  probe             verify the plugin <-> herdr CLI bridge (run this first)");
     println!("  init [--force]    write the curated default bundle (the distro layer)");
     println!("  list              show desired plugins");
-    println!("  sync [--prune]    converge installed plugins to the bundle");
+    println!("  install [<repo>…] install what is missing, restore drifted pins");
+    println!("  sync [--prune]    the same, plus --prune to remove what is not listed");
     println!("  update [<repo>…]  re-resolve unpinned entries to their latest commit");
     println!("  restore [<repo>…] put plugins back to the commits in the lockfile");
     println!("  ui                open the manage pane (also `manage`)");
@@ -1122,7 +1123,9 @@ fn main() {
         "probe" => cmd_probe(),
         "init" => cmd_init(rest.contains(&"--force")),
         "list" => cmd_list(),
-        "sync" => {
+        // `install` is what people look for; `sync` is what the operation is. Both, rather
+        // than choosing and leaving the other as a dead end.
+        "install" | "sync" => {
             let targets: Vec<&str> = rest
                 .iter()
                 .copied()

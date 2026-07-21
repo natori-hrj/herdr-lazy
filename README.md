@@ -29,7 +29,8 @@ machine. herdr-lazy adds both.
   actually checked out. Copy the lock to another machine, `sync`, and you get the same
   plugins at the same commits.
 - **A manage pane.** A herdr overlay pane with the same operations on single keys —
-  lowercase acts on the row under the cursor, SHIFT on the whole list.
+  `i`/`u`/`x`/`r` as in lazy.nvim, lowercase for the selected row and uppercase for the
+  whole list. `?` shows the full keymap.
 - **Marketplace search, in the pane.** Press `/` to search all published herdr plugins by
   name, description or topic, and add one to your list without leaving the terminal.
 - **A curated default set.** `init` writes a starting bundle so a fresh herdr is useful
@@ -91,7 +92,8 @@ herdr-lazy update smarzban/herdr-file-viewer
 |---|---|
 | `init [--force]` | write the curated default bundle |
 | `list` | show the desired plugin set |
-| `sync [<repo>…] [--prune]` | converge installed plugins to the list |
+| `install [<repo>…]` | install what is missing, restore drifted pins |
+| `sync [<repo>…] [--prune]` | the same, plus `--prune` to uninstall what is not listed |
 | `update [<repo>…]` | re-resolve unpinned entries to their latest commit |
 | `restore [<repo>…]` | put plugins back to the commits in the lockfile |
 | `ui` / `manage` | open the manage pane (`/` inside it searches the marketplace) |
