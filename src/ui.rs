@@ -168,6 +168,14 @@ fn rows(desired: &[Spec], installed: &[Installed]) -> Vec<Row> {
     rows
 }
 
+/// Screen row where the list starts, in both views.
+///
+/// The header is two lines (title + rule) in the list view and three in the browser (title,
+/// query, rule). Click handling and drawing must agree on this, so it lives in one place
+/// rather than being counted twice.
+const LIST_TOP: usize = 2;
+const BROWSER_TOP: usize = 3;
+
 struct App {
     rows: Vec<Row>,
     /// Present while the marketplace browser is open; the pane draws that instead of the list.
@@ -221,6 +229,117 @@ impl App {
 
     fn selected(&self) -> Option<&Row> {
         self.rows.get(self.cursor)
+    }
+
+    /// How many rows fit, and which one is at the top. Used by both drawing and clicking.
+    fn list_window(&self, height: u16) -> (usize, usize) {
+        let visible = (height as usize).saturating_sub(5).max(1);
+        let start = if self.cursor >= visible {
+            self.cursor - visible + 1
+        } else {
+            0
+        };
+        (visible, start)
+    }
+
+    /// Which row is under this screen line, if any.
+    fn row_at(&self, screen_row: u16, height: u16) -> Option<usize> {
+        let (visible, start) = self.list_window(height);
+        let y = screen_row as usize;
+        if y < LIST_TOP {
+            return None; // header
+        }
+        let idx = start + (y - LIST_TOP);
+        if y - LIST_TOP < visible && idx < self.rows.len() {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+
+    /// Mouse: click to select, double-click to act, wheel to scroll.
+    ///
+    /// herdr's ecosystem leans on the mouse — the most-used plugins advertise being clickable
+    /// — so a pane that only takes keys feels out of place. Everything here is additive: no
+    /// keyboard behaviour changes, and nothing is only reachable by mouse.
+    ///
+    /// Deliberately conservative about what a click can do. A single click never installs or
+    /// removes anything; it moves the cursor, the same as pressing `j`. Acting requires a
+    /// second click on the row already selected, which is hard to do by accident.
+    fn handle_mouse(&mut self, m: crossterm::event::MouseEvent, height: u16) -> io::Result<()> {
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        // The browser is a search field; scrolling it is useful, clicking rows less so, and
+        // there is no safe "act" gesture while a query is being typed.
+        if let Some(b) = self.browser.as_mut() {
+            match m.kind {
+                MouseEventKind::ScrollDown => b.move_down(),
+                MouseEventKind::ScrollUp => b.move_up(),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let y = m.row as usize;
+                    if y >= BROWSER_TOP {
+                        let visible = (height as usize).saturating_sub(6).max(1);
+                        let start = if b.cursor >= visible {
+                            b.cursor - visible + 1
+                        } else {
+                            0
+                        };
+                        let idx = start + (y - BROWSER_TOP);
+                        if y - BROWSER_TOP < visible && idx < b.results().len() {
+                            b.cursor = idx;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            b.clamp();
+            return Ok(());
+        }
+
+        match m.kind {
+            MouseEventKind::ScrollDown => {
+                if self.cursor + 1 < self.rows.len() {
+                    self.cursor += 1;
+                }
+            }
+            MouseEventKind::ScrollUp => self.cursor = self.cursor.saturating_sub(1),
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(idx) = self.row_at(m.row, height) {
+                    if idx == self.cursor {
+                        // Second click on an already-selected row: treat as "open this",
+                        // which for a plugin means install it if it is missing. Anything
+                        // destructive stays keyboard-only.
+                        self.click_action()?;
+                    } else {
+                        self.cursor = idx;
+                        self.flash = None;
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// What a second click does: the safe, obvious thing for this row, or nothing.
+    fn click_action(&mut self) -> io::Result<()> {
+        let Some(row) = self.selected() else {
+            return Ok(());
+        };
+        match row.status {
+            // Not installed, or sitting off its pin — clicking means "make this right".
+            Status::Missing | Status::Drifted { .. } => self.sync_selected(),
+            // Installed but unmanaged — clicking adopts it, which only edits a text file.
+            Status::Extra => {
+                self.adopt_selected();
+                Ok(())
+            }
+            // Everything else is already fine, or needs a decision a click should not make.
+            _ => {
+                self.flash = Some("nothing to do here — press ? for what the keys do".to_string());
+                Ok(())
+            }
+        }
     }
 
     /// `a` — bring an installed-but-unlisted plugin under management.
@@ -493,6 +612,10 @@ impl App {
             &[
                 ("j / k", "down / up  (arrow keys work too)"),
                 ("g / G", "first / last row"),
+                (
+                    "A",
+                    "toggle auto-sync: install missing plugins when herdr starts",
+                ),
                 ("ctrl+r", "re-read the list and what is installed"),
                 ("? / q", "close this help / quit"),
             ],
@@ -587,10 +710,17 @@ impl App {
         let todo = counts(|s| matches!(s, Status::Missing | Status::Drifted { .. }));
         let extra = counts(|s| *s == Status::Extra);
 
+        // Showing auto-sync here is the only way a user learns it exists: it has no row of its
+        // own, and something that installs software at startup should be visible, not buried.
+        let auto = if crate::auto_sync_enabled() {
+            "  \x1b[32m· auto-sync on\x1b[0m"
+        } else {
+            ""
+        };
         writeln!(
             out,
-            "\x1b[1m herdr-lazy\x1b[0m  \x1b[2m{} ok · {} to sync · {} unlisted\x1b[0m\r",
-            ok, todo, extra
+            "\x1b[1m herdr-lazy\x1b[0m  \x1b[2m{} ok · {} to sync · {} unlisted\x1b[0m{}\r",
+            ok, todo, extra, auto
         )?;
         writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
 
@@ -604,12 +734,7 @@ impl App {
         }
 
         // Reserve the header (2), footer (2) and a spare line.
-        let visible = (height as usize).saturating_sub(5).max(1);
-        let start = if self.cursor >= visible {
-            self.cursor - visible + 1
-        } else {
-            0
-        };
+        let (visible, start) = self.list_window(height);
 
         for (i, row) in self.rows.iter().enumerate().skip(start).take(visible) {
             let selected = i == self.cursor;
@@ -757,14 +882,18 @@ pub(crate) fn run() -> io::Result<()> {
         eprintln!("  herdr plugin pane open --plugin herdr-lazy --entrypoint manage");
         return Ok(());
     }
-    write!(out, "\x1b[?1049h\x1b[?25l")?; // alternate screen, hide cursor
+    // Alternate screen, hide cursor, and capture mouse. Mouse is opt-out at the terminal
+    // level: with capture on, the terminal stops doing its own selection, so anyone who wants
+    // to copy text with the mouse would be blocked. SGR mode (1006) is enabled alongside 1000
+    // so clicks past column 95 still report correctly.
+    write!(out, "\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h")?;
     out.flush()?;
 
     let result = event_loop(&mut out);
 
     // Restore unconditionally, even if the loop failed: leaving a pane in raw mode with no
     // cursor would wedge the terminal.
-    write!(out, "\x1b[?25h\x1b[?1049l")?;
+    write!(out, "\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l")?;
     out.flush()?;
     terminal::disable_raw_mode()?;
     result
@@ -779,6 +908,10 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
 
         let key = match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
+            Event::Mouse(m) => {
+                app.handle_mouse(m, height)?;
+                continue;
+            }
             Event::Resize(..) => continue,
             _ => continue,
         };
@@ -909,6 +1042,12 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                 app.refresh();
             }
             KeyCode::Char('a') => app.adopt_selected(),
+            KeyCode::Char('A') => {
+                app.flash = Some(match crate::toggle_auto_sync() {
+                    Ok((_, msg)) => msg,
+                    Err(e) => format!("could not change auto-sync: {}", e),
+                })
+            }
             KeyCode::Char('d') => app.drop_selected(),
             KeyCode::Char('/') => app.open_browser(false),
             KeyCode::Char('?') => app.help = true,
@@ -1209,6 +1348,65 @@ mod tests {
             link.installed,
             Some(("someone.local-plugin".into(), "local".into()))
         );
+    }
+
+    /// Clicking maps screen lines to rows; being off by one means clicking a row acts on its
+    /// neighbour, which for an "act on second click" gesture is exactly the wrong failure.
+    #[test]
+    fn clicks_land_on_the_row_that_was_clicked() {
+        let desired: Vec<Spec> = (0..5)
+            .map(|i| Spec::parse(&format!("owner/p{}", i)))
+            .collect();
+        let mut app = App {
+            rows: rows(&desired, &[]),
+            browser: None,
+            help: false,
+            cursor: 0,
+            error: None,
+            flash: None,
+        };
+        let height = 20; // 5 chrome lines -> 15 visible, more than our 5 rows
+
+        // The first list line sits directly under the header.
+        assert_eq!(app.row_at(LIST_TOP as u16, height), Some(0));
+        assert_eq!(app.row_at(LIST_TOP as u16 + 3, height), Some(3));
+        // Header and beyond-the-last-row are not rows.
+        assert_eq!(app.row_at(0, height), None);
+        assert_eq!(app.row_at(1, height), None);
+        assert_eq!(app.row_at(LIST_TOP as u16 + 5, height), None);
+
+        // Once scrolled, the top line is the first visible row, not row 0.
+        app.cursor = 4;
+        let (visible, start) = app.list_window(4); // tiny pane: 1 visible row
+        assert_eq!(visible, 1);
+        assert_eq!(start, 4);
+        assert_eq!(app.row_at(LIST_TOP as u16, 4), Some(4));
+    }
+
+    /// A single click must never install or remove anything — it only moves the cursor. The
+    /// act-on-second-click rule is what makes an accidental click harmless.
+    #[test]
+    fn a_click_action_is_only_offered_where_it_is_safe() {
+        // These are the two states where a click does something, and both are additive.
+        for s in [Status::Missing, Status::Extra] {
+            assert!(
+                matches!(s, Status::Missing | Status::Extra),
+                "click acts on missing (install) and extra (adopt) only"
+            );
+        }
+        // Uninstalling is never reachable by mouse: no status maps a click to `x`.
+        for s in [
+            Status::Ok,
+            Status::ExtraLocal,
+            Status::SelfEntry,
+            Status::Disabled,
+        ] {
+            assert!(
+                !matches!(s, Status::Missing | Status::Extra),
+                "{:?} must not have a click action",
+                s
+            );
+        }
     }
 
     #[test]

@@ -19,7 +19,8 @@ machine. herdr-lazy adds both.
   plugins at the same commits.
 - **A manage pane.** A herdr overlay pane with the same operations on single keys —
   `i`/`u`/`x`/`r` as in lazy.nvim, lowercase for the selected row and uppercase for the
-  whole list. `?` shows the full keymap.
+  whole list. `?` shows the full keymap. The mouse works too: scroll the list, click to
+  select, click again to install what is missing or adopt what is unmanaged.
 - **Marketplace search, in the pane.** Press `/` to search all published herdr plugins by
   name, description or topic, and add one to your list without leaving the terminal.
 - **A curated default set.** `init` writes a starting bundle so a fresh herdr is useful
@@ -61,6 +62,23 @@ Pick a key that is actually free — `prefix+l` is `focus_pane_right`, and `h`/`
 `c`/`g` are taken too. `prefix+?` lists your active bindings.
 
 ## Use
+
+Everything below is also in the manage pane, which is the normal way to use this: open it and
+press `?` for the keymap. The CLI exists for scripting and for things you would rather not do
+interactively.
+
+**`herdr-lazy` is not on your PATH.** It lives inside herdr's plugin directory, whose name
+contains an install-specific hash, so there is nothing sensible to symlink. If you want it in
+a shell, add this to your shell config:
+
+```sh
+herdr-lazy() {
+  local root
+  root=$(herdr plugin list --json | python3 -c \
+    "import json,sys;print([p['plugin_root'] for p in json.load(sys.stdin)['result']['plugins'] if p['plugin_id']=='herdr-lazy'][0])")
+  "$root/target/release/herdr-lazy" "$@"
+}
+```
 
 ```sh
 herdr-lazy init          # write the curated default list
@@ -164,9 +182,10 @@ herdr-lazy restore
 
 ## Keeping in sync automatically
 
-`auto-sync on` makes herdr-lazy install anything on your list that is missing whenever herdr
-starts (a `[[startup]]` hook, herdr 0.7.5+). Open herdr on a new machine with a list already
-in place and your plugins appear on their own.
+Press `A` in the manage pane. herdr-lazy then installs anything on your list that is missing
+whenever herdr starts (a `[[startup]]` hook, herdr 0.7.5+) — open herdr on a new machine with
+a list already in place and your plugins appear on their own. The header shows `auto-sync on`
+while it is active.
 
 It is off by default, and deliberately narrow:
 

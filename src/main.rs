@@ -678,8 +678,33 @@ fn cmd_startup() -> io::Result<()> {
 ///
 /// A one-line marker file next to the list, rather than a config format: herdr-lazy has no
 /// config file, and inventing one for a single boolean is not worth it. Presence = on.
-fn auto_sync_enabled() -> bool {
+pub(crate) fn auto_sync_enabled() -> bool {
     config_dir().join("auto-sync").exists()
+}
+
+/// Flip startup auto-sync, returning the new state and a line to show the user.
+///
+/// Lives here rather than in the pane because the CLI and the pane must agree on what the
+/// marker file means; two implementations of "is it on" would eventually disagree.
+pub(crate) fn toggle_auto_sync() -> io::Result<(bool, String)> {
+    let marker = config_dir().join("auto-sync");
+    if marker.exists() {
+        fs::remove_file(&marker)?;
+        Ok((
+            false,
+            "auto-sync off — herdr start will not install anything".to_string(),
+        ))
+    } else {
+        ensure_parent(&marker)?;
+        fs::write(
+            &marker,
+            "startup auto-sync is on; delete this file to turn it off\n",
+        )?;
+        Ok((
+            true,
+            "auto-sync on — missing plugins install themselves when herdr starts".to_string(),
+        ))
+    }
 }
 
 fn cmd_auto_sync(arg: Option<&str>) -> io::Result<()> {
