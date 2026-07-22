@@ -590,6 +590,121 @@ pub(crate) fn cmd_sync(prune: bool, targets: &[&str]) -> io::Result<()> {
 ///
 /// `write_lock` is false for `restore`, whose input IS the lock — rewriting it there would let
 /// a partial restore quietly redefine the thing being restored to.
+/// What `sync` would have to do, without doing any of it.
+///
+/// Returns the bundle entries that are missing or drifted — the ones a converge would act on.
+/// Used by `startup`, which must decide whether there is anything to do before making any
+/// noise or touching the network.
+fn pending_work(all: &[Spec], installed: &[Installed]) -> Vec<Spec> {
+    all.iter()
+        .filter(|spec| {
+            let hit = installed
+                .iter()
+                .map(|p| (p, p.matches(spec)))
+                .filter(|(_, m)| *m != Match::None)
+                .max_by_key(|(_, m)| (*m == Match::Strong) as u8);
+            match hit {
+                None => true, // not installed
+                Some((p, _)) => matches!(pin_state(spec, p), PinState::Drifted { .. }),
+            }
+        })
+        .cloned()
+        .collect()
+}
+
+/// herdr's `[[startup]]` hook: converge the machine to the list when herdr starts, but only
+/// when there is a gap, and only for gaps that can be closed without a network round trip
+/// per plugin or a surprising rebuild.
+///
+/// The constraint that shapes this: startup runs on every server start and live handoff, for
+/// a human who did not ask for it right then. So it must be silent when nothing is wrong (the
+/// common case), and it must not turn a routine `herdr` launch into a minutes-long install of
+/// everything in a fresh list. It installs what is missing — that is the "I opened herdr on a
+/// new machine and my plugins appeared" story — but it never prunes and never updates, because
+/// those change a working setup rather than complete an incomplete one.
+///
+/// Opt-in: does nothing unless `auto_sync` is enabled, because a plugin that installs other
+/// software when herdr starts is not something to turn on by surprise.
+fn cmd_startup() -> io::Result<()> {
+    if !auto_sync_enabled() {
+        return Ok(()); // silent: the hook fires for everyone, most have not opted in
+    }
+    let all: Vec<Spec> = desired_plugins().iter().map(|l| Spec::parse(l)).collect();
+    if all.is_empty() {
+        return Ok(());
+    }
+    let installed = match installed_plugins() {
+        Ok(v) => v,
+        Err(_) => return Ok(()), // herdr not answering yet; try again next start
+    };
+
+    let pending = pending_work(&all, &installed);
+    let missing: Vec<&Spec> = pending
+        .iter()
+        .filter(|spec| !installed.iter().any(|p| p.matches(spec) != Match::None))
+        .collect();
+
+    if missing.is_empty() {
+        return Ok(()); // already converged, or the only gaps are drifted pins (left alone)
+    }
+
+    // Only install what is absent. A drifted pin is a deliberate-looking state that `sync`
+    // repairs on request; silently rewriting it at every launch would be a surprise.
+    println!(
+        "herdr-lazy: installing {} plugin(s) declared in your list…",
+        missing.len()
+    );
+    for spec in missing {
+        let mut args = vec!["plugin", "install", spec.repo.as_str()];
+        if let Some(r) = &spec.reference {
+            args.push("--ref");
+            args.push(r.as_str());
+        }
+        args.push("--yes");
+        match run_herdr(&args) {
+            Ok((true, _, _)) => println!("  installed {}", spec.display()),
+            Ok((false, _, err)) => println!("  FAILED {}: {}", spec.display(), err.trim()),
+            Err(e) => println!("  could not run herdr: {}", e),
+        }
+    }
+    // Refresh the lock so it reflects what is now installed.
+    if let Ok(after) = installed_plugins() {
+        let _ = write_lock(&all, &after);
+    }
+    Ok(())
+}
+
+/// Is startup auto-sync turned on?
+///
+/// A one-line marker file next to the list, rather than a config format: herdr-lazy has no
+/// config file, and inventing one for a single boolean is not worth it. Presence = on.
+fn auto_sync_enabled() -> bool {
+    config_dir().join("auto-sync").exists()
+}
+
+fn cmd_auto_sync(arg: Option<&str>) -> io::Result<()> {
+    let marker = config_dir().join("auto-sync");
+    match arg {
+        Some("on") => {
+            ensure_parent(&marker)?;
+            fs::write(
+                &marker,
+                "startup auto-sync is on; delete this file to turn it off\n",
+            )?;
+            println!("auto-sync on — herdr-lazy will install missing plugins when herdr starts.");
+        }
+        Some("off") => {
+            let _ = fs::remove_file(&marker);
+            println!("auto-sync off.");
+        }
+        _ => println!(
+            "auto-sync is {}",
+            if marker.exists() { "on" } else { "off" }
+        ),
+    }
+    Ok(())
+}
+
 fn converge(all: &[Spec], targets: &[&str], prune: bool, write_the_lock: bool) -> io::Result<()> {
     let all: Vec<Spec> = all.to_vec();
     let desired: Vec<Spec> = if targets.is_empty() {
@@ -1111,6 +1226,7 @@ fn print_help() {
     println!("  add <owner/repo>  add a plugin to the bundle");
     println!("  remove <owner/repo>  remove a plugin from the bundle");
     println!("  lock              write the lockfile from the current bundle");
+    println!("  auto-sync [on|off]  install missing plugins automatically when herdr starts");
 }
 
 fn main() {
@@ -1120,6 +1236,8 @@ fn main() {
 
     let result = match cmd {
         "probe" => cmd_probe(),
+        "startup" => cmd_startup(),
+        "auto-sync" => cmd_auto_sync(rest.first().copied()),
         "init" => cmd_init(rest.contains(&"--force")),
         "list" => cmd_list(),
         // `install` is what people look for; `sync` is what the operation is. Both, rather
@@ -1301,6 +1419,53 @@ mod tests {
 
     /// The bug this pins down: an entry pinned to one commit, but sitting at another, was
     /// reported "present" and never repaired, so `sync` could not actually reproduce a bundle.
+    /// `startup` acts only on this set, so it must be exactly "missing or drifted" — an
+    /// installed, on-pin plugin appearing here would make every launch do needless work.
+    /// `from_github` installs commit `10e9303…`; a pin to any other commit is drift.
+    #[test]
+    fn pending_work_is_only_missing_and_drifted() {
+        const INSTALLED: &str = "10e93033263549600e75119c5617dac48137d011";
+        let desired: Vec<Spec> = [
+            "owner/here".to_string(),
+            "owner/gone".to_string(),
+            "owner/moved@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+            format!("owner/pinned-ok@{}", INSTALLED),
+        ]
+        .iter()
+        .map(|l| Spec::parse(l))
+        .collect();
+        let installed = vec![
+            from_github("owner", "here"),
+            from_github("owner", "moved"), // installed at INSTALLED, pinned elsewhere -> drift
+            from_github("owner", "pinned-ok"), // installed at exactly its pin -> satisfied
+        ];
+        let pending = pending_work(&desired, &installed);
+        let repos: Vec<String> = pending.iter().map(|s| s.repo.clone()).collect();
+        assert!(
+            repos.iter().any(|r| r == "owner/gone"),
+            "missing is pending"
+        );
+        assert!(
+            repos.iter().any(|r| r == "owner/moved"),
+            "drifted pin is pending"
+        );
+        assert!(
+            !repos.iter().any(|r| r == "owner/here"),
+            "a satisfied entry is not pending"
+        );
+        assert!(
+            !repos.iter().any(|r| r == "owner/pinned-ok"),
+            "an entry sitting on its pin is not pending"
+        );
+    }
+
+    #[test]
+    fn nothing_pending_when_everything_matches() {
+        let desired = vec![Spec::parse("owner/a"), Spec::parse("owner/b")];
+        let installed = vec![from_github("owner", "a"), from_github("owner", "b")];
+        assert!(pending_work(&desired, &installed).is_empty());
+    }
+
     #[test]
     fn a_pinned_entry_at_the_wrong_commit_is_drift() {
         let spec = Spec::parse("owner/repo@a8f86ec4103bc367b52e547b492483f3b792a952");

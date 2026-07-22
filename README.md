@@ -89,6 +89,7 @@ herdr-lazy update smarzban/herdr-file-viewer
 | `add <owner/repo>` | add an entry to the bundle |
 | `remove <owner/repo>` | remove an entry from the bundle |
 | `lock` | write the lockfile from the current bundle |
+| `auto-sync [on\|off]` | install missing plugins automatically when herdr starts |
 | `probe` | dump what the herdr CLI exposes (for debugging) |
 
 ### Already using herdr?
@@ -160,6 +161,21 @@ scp other-machine:~/.config/herdr/plugins/config/herdr-lazy/plugins.lock .
 cp plugins.lock "$(herdr plugin config-dir herdr-lazy)/"
 herdr-lazy restore
 ```
+
+## Keeping in sync automatically
+
+`auto-sync on` makes herdr-lazy install anything on your list that is missing whenever herdr
+starts (a `[[startup]]` hook, herdr 0.7.5+). Open herdr on a new machine with a list already
+in place and your plugins appear on their own.
+
+It is off by default, and deliberately narrow:
+
+- **Off unless you turn it on** — a plugin that installs other software at startup should not
+  do so by surprise.
+- **Installs only** — it never prunes and never moves a pinned commit. Startup completes a
+  setup that is missing things; it does not change one that is working. Use `sync` for that.
+- **Silent when there is nothing to do** — which is almost always, so a normal `herdr` launch
+  is unaffected.
 
 ## Safety
 

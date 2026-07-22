@@ -19,6 +19,12 @@ command = ["/bin/sh", "scripts/fetch-or-build.sh"]
 platforms = ["windows"]
 command = ["cargo", "build", "--release"]
 
+# herdr runs this once after the server starts (0.7.5+). It converges the machine to your
+# list only when `auto-sync` is on — otherwise it exits immediately and silently. See
+# `cmd_startup` for why it installs missing plugins but never prunes or updates.
+[[startup]]
+command = ["./target/release/herdr-lazy", "startup"]
+
 # NOTE: the leading `./` is required. herdr resolves a pane's command through PATH, so a
 # bare `target/release/herdr-lazy` fails with "No viable candidates found in PATH" even
 # though the process runs with the plugin directory as its cwd. Actions happen to tolerate
