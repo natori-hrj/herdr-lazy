@@ -227,7 +227,10 @@ impl Spec {
 }
 
 /// One entry from `herdr plugin list --json`.
-#[derive(Debug, Clone)]
+///
+/// `Default` exists for tests: this grows a field whenever herdr exposes something new, and
+/// without it every fixture in the suite needs editing for a field it does not care about.
+#[derive(Debug, Clone, Default)]
 pub(crate) struct Installed {
     pub(crate) plugin_id: String,
     pub(crate) name: String,
@@ -242,6 +245,15 @@ pub(crate) struct Installed {
     /// Every string value inside `source`, as a fallback for source kinds we have not seen
     /// (e.g. a plain clone URL) so an unknown shape degrades to a match attempt, not a miss.
     source_values: Vec<String>,
+    /// What this plugin can actually do, straight from its manifest. A distro that installs
+    /// seven plugins has to answer "what did I just get" — and herdr already tells us.
+    pub(crate) description: String,
+    /// `(id, title)` for each action, invokable via `plugin action invoke`.
+    pub(crate) actions: Vec<(String, String)>,
+    /// `(id, title, placement)` for each pane the plugin can open.
+    pub(crate) panes: Vec<(String, String, String)>,
+    /// Event names that trigger this plugin on their own.
+    pub(crate) events: Vec<String>,
 }
 
 /// How confident we are that an installed plugin is the bundle entry.
@@ -374,6 +386,45 @@ fn parse_plugin_list(stdout: &str) -> Result<Vec<Installed>, String> {
                     .and_then(|k| k.as_str())
                     .unwrap_or("unknown")
                     .to_string(),
+                description: p.str_field("description").unwrap_or_default().to_string(),
+                actions: p
+                    .get("actions")
+                    .and_then(|a| a.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .map(|x| {
+                                (
+                                    x.str_field("id").unwrap_or_default().to_string(),
+                                    x.str_field("title").unwrap_or_default().to_string(),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                panes: p
+                    .get("panes")
+                    .and_then(|a| a.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .map(|x| {
+                                (
+                                    x.str_field("id").unwrap_or_default().to_string(),
+                                    x.str_field("title").unwrap_or_default().to_string(),
+                                    x.str_field("placement").unwrap_or_default().to_string(),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                events: p
+                    .get("events")
+                    .and_then(|a| a.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.str_field("on").map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 slug,
                 resolved_commit: p
                     .path(&["source", "resolved_commit"])
@@ -959,6 +1010,23 @@ pub(crate) fn is_self_id(plugin_id: &str) -> bool {
     plugin_id == PLUGIN_ID
 }
 
+/// Run one of a plugin's declared actions.
+///
+/// The details view lists what a plugin can do; without this it could only describe them,
+/// which is half an answer to "how do I use this thing".
+pub(crate) fn invoke_action(plugin_id: &str, action_id: &str) -> String {
+    match run_herdr(&[
+        "plugin", "action", "invoke", action_id, "--plugin", plugin_id,
+    ]) {
+        Ok((true, _, _)) => format!("ran {}.{}", plugin_id, action_id),
+        Ok((false, out, err)) => {
+            let msg = if err.trim().is_empty() { out } else { err };
+            format!("could not run {}: {}", action_id, msg.trim())
+        }
+        Err(e) => format!("could not run herdr: {}", e),
+    }
+}
+
 /// Uninstall one plugin, applying the same rule `--prune` uses.
 ///
 /// Returns a message rather than printing: the manage pane calls this while it owns the
@@ -1344,6 +1412,7 @@ mod tests {
             slug: None,
             resolved_commit: None,
             source_values: source_values.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
         }
     }
 
@@ -1357,6 +1426,7 @@ mod tests {
             slug: Some(format!("{}/{}", owner, repo)),
             resolved_commit: Some("10e93033263549600e75119c5617dac48137d011".to_string()),
             source_values: vec![owner.to_string(), repo.to_string(), "github".to_string()],
+            ..Default::default()
         }
     }
 

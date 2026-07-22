@@ -108,6 +108,32 @@ struct Row {
     /// herdr's id for the installed plugin, and how it was installed. Present only when the
     /// row corresponds to something actually installed — which is exactly when `x` applies.
     installed: Option<(String, String)>,
+    /// Ticked for a bulk operation. Kept on the row rather than as a set of indices so it
+    /// survives the list being rebuilt in a different order.
+    picked: bool,
+    /// What this plugin can do, for the details view. Empty for anything not installed —
+    /// herdr only knows a manifest once it has fetched it.
+    detail: Option<PluginDetail>,
+}
+
+/// The manifest facts worth showing a user who just installed seven plugins at once.
+#[derive(Debug, Clone, Default)]
+struct PluginDetail {
+    description: String,
+    actions: Vec<(String, String)>,
+    panes: Vec<(String, String, String)>,
+    events: Vec<String>,
+    plugin_id: String,
+}
+
+fn detail_of(p: &Installed) -> PluginDetail {
+    PluginDetail {
+        description: p.description.clone(),
+        actions: p.actions.clone(),
+        panes: p.panes.clone(),
+        events: p.events.clone(),
+        plugin_id: p.plugin_id.clone(),
+    }
 }
 
 /// Build the view: every bundle entry, then anything installed that the bundle does not name.
@@ -141,6 +167,8 @@ fn rows(desired: &[Spec], installed: &[Installed]) -> Vec<Row> {
             listed_as: Some(spec.display()),
             slug: Some(spec.repo.clone()),
             installed: hit.map(|(p, _)| (p.plugin_id.clone(), p.source_kind.clone())),
+            picked: false,
+            detail: hit.map(|(p, _)| detail_of(p)),
         });
     }
 
@@ -162,6 +190,8 @@ fn rows(desired: &[Spec], installed: &[Installed]) -> Vec<Row> {
             listed_as: None,
             slug: p.slug.clone(),
             installed: Some((p.plugin_id.clone(), p.source_kind.clone())),
+            picked: false,
+            detail: Some(detail_of(p)),
         });
     }
 
@@ -176,12 +206,19 @@ fn rows(desired: &[Spec], installed: &[Installed]) -> Vec<Row> {
 const LIST_TOP: usize = 2;
 const BROWSER_TOP: usize = 3;
 
+/// `Default` so tests can build one from just the rows they care about; this struct grows a
+/// field per view, and every fixture should not have to know about all of them.
+#[derive(Default)]
 struct App {
     rows: Vec<Row>,
     /// Present while the marketplace browser is open; the pane draws that instead of the list.
     browser: Option<crate::browse::Browser>,
     /// `?` — the full keymap. The footer only has room for the common half.
     help: bool,
+    /// Open details for the row at this index: what the plugin does and how to reach it.
+    detail_of: Option<usize>,
+    /// Which action is highlighted in the details view.
+    detail_cursor: usize,
     cursor: usize,
     /// Set when a refresh fails, so the pane explains itself instead of showing an empty list.
     error: Option<String>,
@@ -202,6 +239,8 @@ impl App {
                 rows: rows(&desired, &installed),
                 browser: None,
                 help: false,
+                detail_of: None,
+                detail_cursor: 0,
                 cursor: 0,
                 error: None,
                 flash: None,
@@ -210,6 +249,8 @@ impl App {
                 rows: Vec::new(),
                 browser: None,
                 help: false,
+                detail_of: None,
+                detail_cursor: 0,
                 cursor: 0,
                 error: Some(e),
                 flash: None,
@@ -257,15 +298,197 @@ impl App {
         }
     }
 
-    /// Mouse: click to select, double-click to act, wheel to scroll.
+    fn open_detail(&mut self) {
+        if self.rows.get(self.cursor).is_some() {
+            self.detail_of = Some(self.cursor);
+            self.detail_cursor = 0;
+            self.flash = None;
+        }
+    }
+
+    fn run_detail_action(&mut self) {
+        let Some(idx) = self.detail_of else { return };
+        let Some(d) = self.rows.get(idx).and_then(|r| r.detail.clone()) else {
+            return;
+        };
+        let Some((action_id, _)) = d.actions.get(self.detail_cursor).cloned() else {
+            self.flash = Some("no actions to run".to_string());
+            return;
+        };
+        self.flash = Some(crate::invoke_action(&d.plugin_id, &action_id));
+    }
+
+    fn any_picked(&self) -> bool {
+        self.rows.iter().any(|r| r.picked)
+    }
+
+    /// Rows a bulk action applies to: the ticked ones, or the cursor row when none are.
+    ///
+    /// This is what makes selection optional — every operation keeps working exactly as it
+    /// did for someone who never touches the checkbox.
+    fn targets(&self) -> Vec<usize> {
+        if self.any_picked() {
+            self.rows
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.picked)
+                .map(|(i, _)| i)
+                .collect()
+        } else {
+            vec![self.cursor]
+        }
+    }
+
+    /// Tick or untick the row under the cursor, and stay there.
+    ///
+    /// An earlier version advanced the cursor afterwards, on the theory that ticking a run of
+    /// rows should be one repeated key. That broke the thing a checkbox promises: press again
+    /// and it comes back off. Pressing twice ticked two different rows instead, which is not
+    /// what any checkbox anywhere does. `j` is right there for moving.
+    fn toggle_pick(&mut self) {
+        if let Some(r) = self.rows.get_mut(self.cursor) {
+            r.picked = !r.picked;
+        }
+    }
+
+    fn clear_picks(&mut self) {
+        for r in self.rows.iter_mut() {
+            r.picked = false;
+        }
+    }
+
+    /// Install every target that needs it, in one pass out of the alternate screen.
+    fn install_targets(&mut self) -> io::Result<()> {
+        let repos: Vec<String> = self
+            .targets()
+            .iter()
+            .filter_map(|&i| self.rows.get(i))
+            .filter(|r| r.listed_as.is_some())
+            .filter_map(|r| r.slug.clone())
+            .collect();
+        if repos.is_empty() {
+            self.flash = Some("nothing selected is in your list — press a to adopt".to_string());
+            return Ok(());
+        }
+        let args: Vec<&str> = repos.iter().map(|s| s.as_str()).collect();
+        suspended(|| {
+            let _ = crate::cmd_sync(false, &args);
+        })?;
+        self.clear_picks();
+        self.refresh();
+        Ok(())
+    }
+
+    fn update_targets(&mut self) -> io::Result<()> {
+        let repos: Vec<String> = self
+            .targets()
+            .iter()
+            .filter_map(|&i| self.rows.get(i))
+            .filter(|r| r.listed_as.is_some())
+            .filter_map(|r| r.slug.clone())
+            .collect();
+        if repos.is_empty() {
+            self.flash = Some("nothing selected is in your list".to_string());
+            return Ok(());
+        }
+        let args: Vec<&str> = repos.iter().map(|s| s.as_str()).collect();
+        suspended(|| {
+            let _ = crate::cmd_update(&args);
+        })?;
+        self.clear_picks();
+        self.refresh();
+        Ok(())
+    }
+
+    /// Uninstall every target. The only bulk operation that destroys anything, so it reports
+    /// what it refused as well as what it did.
+    fn uninstall_targets(&mut self) {
+        let picked: Vec<(String, String, String)> = self
+            .targets()
+            .iter()
+            .filter_map(|&i| self.rows.get(i))
+            .filter_map(|r| {
+                r.installed
+                    .clone()
+                    .map(|(id, kind)| (id, kind, r.label.clone()))
+            })
+            .collect();
+        if picked.is_empty() {
+            self.flash = Some("nothing selected is installed".to_string());
+            return;
+        }
+        let mut done = 0;
+        let mut refused = Vec::new();
+        for (id, kind, _label) in picked {
+            let msg = crate::uninstall_plugin(&id, &kind);
+            if msg.starts_with("uninstalled") {
+                done += 1;
+            } else {
+                refused.push(msg);
+            }
+        }
+        self.flash = Some(if refused.is_empty() {
+            format!("uninstalled {}", done)
+        } else {
+            format!("uninstalled {} · {}", done, refused.join(" · "))
+        });
+        self.clear_picks();
+        self.refresh();
+    }
+
+    /// Adopt every target that is installed but unlisted.
+    fn adopt_targets(&mut self) {
+        let names: Vec<String> = self
+            .targets()
+            .iter()
+            .filter_map(|&i| self.rows.get(i))
+            .filter(|r| r.listed_as.is_none())
+            .filter_map(|r| r.slug.clone())
+            .collect();
+        if names.is_empty() {
+            self.flash = Some("nothing selected to adopt".to_string());
+            return;
+        }
+        let mut added = 0;
+        for n in &names {
+            if crate::add_to_list(n).is_ok() {
+                added += 1;
+            }
+        }
+        self.flash = Some(format!("added {} to your list", added));
+        self.clear_picks();
+        self.refresh();
+    }
+
+    /// `r` — put the targets back to the commits in the lockfile.
+    fn restore_targets(&mut self) -> io::Result<()> {
+        let repos: Vec<String> = self
+            .targets()
+            .iter()
+            .filter_map(|&i| self.rows.get(i))
+            .filter_map(|r| r.slug.clone())
+            .collect();
+        if repos.is_empty() {
+            self.flash = Some("nothing selected the lock can describe".to_string());
+            return Ok(());
+        }
+        let args: Vec<&str> = repos.iter().map(|s| s.as_str()).collect();
+        suspended(|| {
+            let _ = crate::cmd_restore(&args);
+        })?;
+        self.clear_picks();
+        self.refresh();
+        Ok(())
+    }
+
+    /// Mouse: click ticks a row, wheel scrolls.
     ///
     /// herdr's ecosystem leans on the mouse — the most-used plugins advertise being clickable
     /// — so a pane that only takes keys feels out of place. Everything here is additive: no
     /// keyboard behaviour changes, and nothing is only reachable by mouse.
     ///
-    /// Deliberately conservative about what a click can do. A single click never installs or
-    /// removes anything; it moves the cursor, the same as pressing `j`. Acting requires a
-    /// second click on the row already selected, which is hard to do by accident.
+    /// Deliberately conservative: a click only ticks a checkbox. Nothing is installed or
+    /// removed until a separate key is pressed, so no misplaced click can change the machine.
     fn handle_mouse(&mut self, m: crossterm::event::MouseEvent, height: u16) -> io::Result<()> {
         use crossterm::event::{MouseButton, MouseEventKind};
 
@@ -304,63 +527,20 @@ impl App {
             }
             MouseEventKind::ScrollUp => self.cursor = self.cursor.saturating_sub(1),
             MouseEventKind::Down(MouseButton::Left) => {
+                // A click ticks the row, exactly as space does. It used to move the cursor,
+                // and act on a second click — but once rows have checkboxes, "click to tick,
+                // click again to untick" is the only reading anyone will expect. Running
+                // something is then a deliberate second step (`i`, `u`, `x`), which also
+                // means no single click can install or remove anything.
                 if let Some(idx) = self.row_at(m.row, height) {
-                    if idx == self.cursor {
-                        // Second click on an already-selected row: treat as "open this",
-                        // which for a plugin means install it if it is missing. Anything
-                        // destructive stays keyboard-only.
-                        self.click_action()?;
-                    } else {
-                        self.cursor = idx;
-                        self.flash = None;
-                    }
+                    self.cursor = idx;
+                    self.toggle_pick();
+                    self.flash = None;
                 }
             }
             _ => {}
         }
         Ok(())
-    }
-
-    /// What a second click does: the safe, obvious thing for this row, or nothing.
-    fn click_action(&mut self) -> io::Result<()> {
-        let Some(row) = self.selected() else {
-            return Ok(());
-        };
-        match row.status {
-            // Not installed, or sitting off its pin — clicking means "make this right".
-            Status::Missing | Status::Drifted { .. } => self.sync_selected(),
-            // Installed but unmanaged — clicking adopts it, which only edits a text file.
-            Status::Extra => {
-                self.adopt_selected();
-                Ok(())
-            }
-            // Everything else is already fine, or needs a decision a click should not make.
-            _ => {
-                self.flash = Some("nothing to do here — press ? for what the keys do".to_string());
-                Ok(())
-            }
-        }
-    }
-
-    /// `a` — bring an installed-but-unlisted plugin under management.
-    fn adopt_selected(&mut self) {
-        let Some(row) = self.selected() else { return };
-        if row.listed_as.is_some() {
-            self.flash = Some(format!("{} is already in your list", row.label));
-            return;
-        }
-        let Some(slug) = row.slug.clone() else {
-            self.flash = Some(format!(
-                "{} is a local link — it has no owner/repo to record",
-                row.label
-            ));
-            return;
-        };
-        self.flash = Some(match crate::add_to_list(&slug) {
-            Ok(msg) => msg,
-            Err(e) => format!("could not write the list: {}", e),
-        });
-        self.refresh();
     }
 
     /// `/` — open the marketplace browser.
@@ -430,46 +610,6 @@ impl App {
         Some(name)
     }
 
-    /// `s` — install or repair just the selected entry.
-    fn sync_selected(&mut self) -> io::Result<()> {
-        let Some(row) = self.selected() else {
-            return Ok(());
-        };
-        if row.listed_as.is_none() {
-            self.flash = Some(format!(
-                "{} is not in your list — press a to adopt it first",
-                row.label
-            ));
-            return Ok(());
-        }
-        let repo = row.slug.clone().unwrap_or_default();
-        suspended(|| {
-            let _ = crate::cmd_sync(false, &[repo.as_str()]);
-        })?;
-        self.refresh();
-        Ok(())
-    }
-
-    /// `u` — update just the selected entry.
-    fn update_selected(&mut self) -> io::Result<()> {
-        let Some(row) = self.selected() else {
-            return Ok(());
-        };
-        if row.listed_as.is_none() {
-            self.flash = Some(format!(
-                "{} is not in your list — press a to adopt it first",
-                row.label
-            ));
-            return Ok(());
-        }
-        let repo = row.slug.clone().unwrap_or_default();
-        suspended(|| {
-            let _ = crate::cmd_update(&[repo.as_str()]);
-        })?;
-        self.refresh();
-        Ok(())
-    }
-
     /// `o`, in the browser — open the selected repository in a browser.
     ///
     /// Without this the browser can install a stranger's code but not show it to you first,
@@ -505,36 +645,6 @@ impl App {
         });
     }
 
-    /// `r` — put just the selected entry back to the commit in the lockfile.
-    fn restore_selected(&mut self) -> io::Result<()> {
-        let Some(row) = self.selected() else {
-            return Ok(());
-        };
-        let Some(repo) = row.slug.clone() else {
-            self.flash = Some(format!(
-                "{} is not something the lock can describe",
-                row.label
-            ));
-            return Ok(());
-        };
-        suspended(|| {
-            let _ = crate::cmd_restore(&[repo.as_str()]);
-        })?;
-        self.refresh();
-        Ok(())
-    }
-
-    /// `x` — uninstall just the selected plugin.
-    fn uninstall_selected(&mut self) {
-        let Some(row) = self.selected() else { return };
-        let Some((id, kind)) = row.installed.clone() else {
-            self.flash = Some(format!("{} is not installed", row.label));
-            return;
-        };
-        self.flash = Some(crate::uninstall_plugin(&id, &kind));
-        self.refresh();
-    }
-
     /// `d` — stop managing an entry. Never uninstalls; that is `x`.
     fn drop_selected(&mut self) {
         let Some(row) = self.selected() else { return };
@@ -553,10 +663,123 @@ impl App {
         if self.help {
             return self.draw_help(out, width, height);
         }
+        if self.detail_of.is_some() {
+            return self.draw_detail(out, width, height);
+        }
         if self.browser.is_some() {
             return self.draw_browser(out, width, height);
         }
         self.draw_list(out, width, height)
+    }
+
+    /// What this plugin does, and how to actually use it.
+    ///
+    /// A distro that installs seven plugins in one go leaves the user holding seven things
+    /// they did not choose individually and cannot obviously operate. herdr already knows the
+    /// answer — every manifest declares its actions, panes and events — so the pane can just
+    /// show it, and run the actions too.
+    fn draw_detail(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        let rule = "─".repeat((width as usize).clamp(20, 200));
+        let idx = self.detail_of.expect("checked by caller");
+        let Some(row) = self.rows.get(idx) else {
+            return Ok(());
+        };
+        write!(out, "\x1b[H\x1b[2J")?;
+        writeln!(out, "\x1b[1m {}\x1b[0m\r", row.label)?;
+        writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
+
+        let Some(d) = row.detail.as_ref() else {
+            writeln!(
+                out,
+                " \x1b[2mnot installed yet — press i to install, then look again\x1b[0m\r"
+            )?;
+            write!(
+                out,
+                "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m\x1b[2many key goes back\x1b[0m\r",
+                height.saturating_sub(1),
+                rule
+            )?;
+            return out.flush();
+        };
+
+        if !d.description.is_empty() {
+            for line in wrap(&d.description, (width as usize).saturating_sub(3)) {
+                writeln!(out, " {}\r", line)?;
+            }
+            writeln!(out, "\r")?;
+        }
+
+        if d.actions.is_empty() && d.panes.is_empty() && d.events.is_empty() {
+            writeln!(
+                out,
+                " \x1b[2mthis plugin declares no actions, panes or events — it may work \
+                 entirely on its own\x1b[0m\r"
+            )?;
+        }
+
+        if !d.actions.is_empty() {
+            writeln!(out, " \x1b[1mthings you can run\x1b[0m  \x1b[2m(enter runs the highlighted one)\x1b[0m\r")?;
+            for (i, (id, title)) in d.actions.iter().enumerate() {
+                let sel = if i == self.detail_cursor {
+                    "\x1b[7m>"
+                } else {
+                    " "
+                };
+                let label = if title.is_empty() { id } else { title };
+                writeln!(out, "{}\x1b[0m  {:<44} \x1b[2m{}\x1b[0m\r", sel, label, id)?;
+            }
+            writeln!(out, "\r")?;
+        }
+
+        if !d.panes.is_empty() {
+            writeln!(out, " \x1b[1mpanes it can open\x1b[0m\r")?;
+            for (id, title, placement) in &d.panes {
+                let label = if title.is_empty() { id } else { title };
+                writeln!(
+                    out,
+                    "   {:<44} \x1b[2m{} · herdr plugin pane open --plugin {} --entrypoint {}\x1b[0m\r",
+                    label, placement, d.plugin_id, id
+                )?;
+            }
+            writeln!(out, "\r")?;
+        }
+
+        if !d.events.is_empty() {
+            writeln!(
+                out,
+                " \x1b[1mruns by itself on\x1b[0m  \x1b[2m{}\x1b[0m\r",
+                d.events.join(", ")
+            )?;
+            writeln!(out, "\r")?;
+        }
+
+        if !d.actions.is_empty() {
+            writeln!(
+                out,
+                " \x1b[2mbind one to a key:  [[keys.command]] type = \"plugin_action\" \
+                 command = \"{}.{}\"\x1b[0m\r",
+                d.plugin_id,
+                d.actions
+                    .get(self.detail_cursor)
+                    .map(|(id, _)| id.as_str())
+                    .unwrap_or("<action>")
+            )?;
+        }
+
+        let footer = match &self.flash {
+            Some(m) => format!("\x1b[36m{}\x1b[0m", m),
+            None => "\x1b[1m[enter]\x1b[0m run  \x1b[1m[j/k]\x1b[0m move  \
+                     \x1b[1m[esc]\x1b[0m back"
+                .to_string(),
+        };
+        write!(
+            out,
+            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
+            height.saturating_sub(1),
+            rule,
+            footer
+        )?;
+        out.flush()
     }
 
     /// Every key, grouped by what it acts on.
@@ -739,6 +962,18 @@ impl App {
         for (i, row) in self.rows.iter().enumerate().skip(start).take(visible) {
             let selected = i == self.cursor;
             let pointer = if selected { "\x1b[7m>" } else { " " };
+            // A checkbox only when something is ticked: an always-visible column of empty
+            // boxes implies every row needs a decision, when the common case is acting on
+            // the one row under the cursor.
+            let box_ = if self.any_picked() {
+                if row.picked {
+                    "\x1b[32m[x]\x1b[0m "
+                } else {
+                    "\x1b[2m[ ]\x1b[0m "
+                }
+            } else {
+                ""
+            };
             let commit = row
                 .commit
                 .as_deref()
@@ -747,8 +982,9 @@ impl App {
             let note = row.status.note();
             writeln!(
                 out,
-                "{} {}{}\x1b[0m {:<44} \x1b[2m{:<12}\x1b[0m {}\x1b[0m\r",
+                "{} {}{}{}\x1b[0m {:<44} \x1b[2m{:<12}\x1b[0m {}\x1b[0m\r",
                 pointer,
+                box_,
                 row.status.colour(),
                 row.status.marker(),
                 truncate(&row.label, 44),
@@ -800,6 +1036,26 @@ impl App {
 /// Not display columns: a CJK or emoji label counts as one char per glyph while occupying two
 /// terminal cells, so such a row's trailing columns drift right. Plugin slugs are ASCII in
 /// practice, and the alternative is a unicode-width dependency for a cosmetic case.
+/// Break text to a width, on spaces where possible.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(20);
+    let mut out = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+            out.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        out.push(line);
+    }
+    out
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -931,6 +1187,43 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             continue;
         }
 
+        // Details view: a short list of runnable actions.
+        if let Some(idx) = app.detail_of {
+            let n = app
+                .rows
+                .get(idx)
+                .and_then(|r| r.detail.as_ref())
+                .map(|d| d.actions.len())
+                .unwrap_or(0);
+            // Ctrl-chords first: a plain `j` moves, but Ctrl+J is a pty's Enter, and a
+            // later arm would never see it.
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                match key.code {
+                    KeyCode::Char('j') | KeyCode::Char('m') => app.run_detail_action(),
+                    KeyCode::Char('c') => return Ok(()),
+                    _ => {}
+                }
+                continue;
+            }
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    app.detail_of = None;
+                    app.flash = None;
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if app.detail_cursor + 1 < n {
+                        app.detail_cursor += 1;
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    app.detail_cursor = app.detail_cursor.saturating_sub(1)
+                }
+                KeyCode::Enter => app.run_detail_action(),
+                _ => {}
+            }
+            continue;
+        }
+
         // The browser is a text field: printable keys type into it rather than acting as
         // commands, so its input is handled before the list's keymap is consulted.
         if app.browser.is_some() {
@@ -995,7 +1288,17 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
         }
 
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+            KeyCode::Char('q') => return Ok(()),
+            // Esc clears a selection first; only an unselected Esc quits. Quitting while
+            // rows are ticked would silently discard work the user was midway through.
+            KeyCode::Esc => {
+                if app.any_picked() {
+                    app.clear_picks();
+                    app.flash = Some("selection cleared".to_string());
+                } else {
+                    return Ok(());
+                }
+            }
 
             KeyCode::Char('j') | KeyCode::Down => {
                 if app.cursor + 1 < app.rows.len() {
@@ -1013,35 +1316,38 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             // `S` (sync = install + clean + update) is deliberately NOT copied: it sits
             // outside that rule, and a key that quietly uninstalls things under a gentle name
             // is the wrong thing to inherit. See the `S` arm below.
-            KeyCode::Char('i') => app.sync_selected()?,
+            // Space / Enter tick the row; every bulk action then applies to what is ticked.
+            KeyCode::Char(' ') | KeyCode::Enter => app.toggle_pick(),
+            KeyCode::Char('l') | KeyCode::Right => app.open_detail(),
+            KeyCode::Char('i') => app.install_targets()?,
             KeyCode::Char('I') => {
                 suspended(|| {
                     let _ = crate::cmd_sync(false, &[]);
                 })?;
                 app.refresh();
             }
-            KeyCode::Char('u') => app.update_selected()?,
+            KeyCode::Char('u') => app.update_targets()?,
             KeyCode::Char('U') => {
                 suspended(|| {
                     let _ = crate::cmd_update(&[]);
                 })?;
                 app.refresh();
             }
-            KeyCode::Char('x') => app.uninstall_selected(),
+            KeyCode::Char('x') => app.uninstall_targets(),
             KeyCode::Char('X') => {
                 suspended(|| {
                     let _ = crate::cmd_sync(true, &[]);
                 })?;
                 app.refresh();
             }
-            KeyCode::Char('r') => app.restore_selected()?,
+            KeyCode::Char('r') => app.restore_targets()?,
             KeyCode::Char('R') => {
                 suspended(|| {
                     let _ = crate::cmd_restore(&[]);
                 })?;
                 app.refresh();
             }
-            KeyCode::Char('a') => app.adopt_selected(),
+            KeyCode::Char('a') => app.adopt_targets(),
             KeyCode::Char('A') => {
                 app.flash = Some(match crate::toggle_auto_sync() {
                     Ok((_, msg)) => msg,
@@ -1087,6 +1393,7 @@ mod tests {
             slug: Some(format!("{}/{}", owner, repo)),
             resolved_commit: Some(commit.to_string()),
             source_values: vec![owner.to_string(), repo.to_string()],
+            ..Default::default()
         }
     }
 
@@ -1099,6 +1406,7 @@ mod tests {
             slug: None,
             resolved_commit: None,
             source_values: vec!["local".to_string()],
+            ..Default::default()
         }
     }
 
@@ -1359,11 +1667,7 @@ mod tests {
             .collect();
         let mut app = App {
             rows: rows(&desired, &[]),
-            browser: None,
-            help: false,
-            cursor: 0,
-            error: None,
-            flash: None,
+            ..Default::default()
         };
         let height = 20; // 5 chrome lines -> 15 visible, more than our 5 rows
 
@@ -1407,6 +1711,56 @@ mod tests {
                 s
             );
         }
+    }
+
+    /// A checkbox toggles in place: press once to tick, press again to untick, cursor
+    /// unmoved. An earlier version advanced the cursor after ticking, which meant pressing
+    /// twice ticked two rows and there was no way to change your mind without navigating
+    /// back — the one thing a checkbox is supposed to make easy.
+    #[test]
+    fn ticking_toggles_in_place() {
+        let desired: Vec<Spec> = (0..4)
+            .map(|i| Spec::parse(&format!("owner/p{}", i)))
+            .collect();
+        let mut app = App {
+            rows: rows(&desired, &[]),
+            ..Default::default()
+        };
+
+        app.cursor = 1;
+        app.toggle_pick();
+        assert!(app.rows[1].picked, "first press ticks");
+        assert_eq!(app.cursor, 1, "cursor must not move");
+
+        app.toggle_pick();
+        assert!(!app.rows[1].picked, "second press unticks");
+        assert_eq!(app.cursor, 1);
+        assert!(!app.any_picked());
+    }
+
+    /// Bulk actions follow the ticks; with none, they fall back to the cursor row, so someone
+    /// who never touches a checkbox sees no change in behaviour.
+    #[test]
+    fn bulk_actions_target_ticks_or_the_cursor() {
+        let desired: Vec<Spec> = (0..4)
+            .map(|i| Spec::parse(&format!("owner/p{}", i)))
+            .collect();
+        let mut app = App {
+            rows: rows(&desired, &[]),
+            ..Default::default()
+        };
+
+        app.cursor = 2;
+        assert_eq!(app.targets(), vec![2], "no ticks: the cursor row");
+
+        app.cursor = 0;
+        app.toggle_pick();
+        app.cursor = 2;
+        app.toggle_pick();
+        assert_eq!(app.targets(), vec![0, 2], "ticks win over the cursor");
+
+        app.clear_picks();
+        assert_eq!(app.targets(), vec![app.cursor]);
     }
 
     #[test]
