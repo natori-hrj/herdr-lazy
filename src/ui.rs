@@ -807,33 +807,50 @@ impl App {
 
         section(
             out,
-            "this plugin",
+            "choosing what to act on",
             &[
-                ("s / S", "install or repair — selected row / whole list"),
-                ("u / U", "update to the latest commit — selected / all"),
+                ("space", "tick or untick this row (click does the same)"),
+                ("esc", "clear the selection"),
                 (
-                    "x / X",
-                    "uninstall — selected / everything not in your list",
+                    "",
+                    "with nothing ticked, every action below uses the cursor row",
                 ),
+            ],
+        )?;
+        section(
+            out,
+            "acting on it",
+            &[
+                (
+                    "i / I",
+                    "install what is missing, and put drifted pins back",
+                ),
+                (
+                    "u / U",
+                    "update to the latest commit (pinned entries are skipped)",
+                ),
+                ("x / X", "uninstall — X removes everything not in your list"),
+                ("r / R", "restore to the commits recorded in the lockfile"),
             ],
         )?;
         section(
             out,
             "your list",
             &[
-                ("a", "add the selected installed plugin to your list"),
-                ("d", "remove the selected entry (does not uninstall)"),
+                ("a", "add the selected installed plugin(s) to your list"),
+                ("d", "remove this entry (does not uninstall)"),
                 (
                     "/",
-                    "search the marketplace — [o] opens a repo, [enter] adds it",
+                    "search the marketplace — enter adds, ctrl+o opens the repo",
                 ),
             ],
         )?;
         section(
             out,
-            "moving around",
+            "finding your way",
             &[
-                ("j / k", "down / up  (arrow keys work too)"),
+                ("l / →", "what this plugin does, and run its actions"),
+                ("j / k", "down / up  (arrows and the wheel work too)"),
                 ("g / G", "first / last row"),
                 (
                     "A",

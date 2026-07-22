@@ -18,9 +18,12 @@ machine. herdr-lazy adds both.
   actually checked out. Copy the lock to another machine, `sync`, and you get the same
   plugins at the same commits.
 - **A manage pane.** A herdr overlay pane with the same operations on single keys —
-  `i`/`u`/`x`/`r` as in lazy.nvim, lowercase for the selected row and uppercase for the
-  whole list. `?` shows the full keymap. The mouse works too: scroll the list, click to
-  select, click again to install what is missing or adopt what is unmanaged.
+  `i`/`u`/`x`/`r` as in lazy.nvim. Tick rows with space or a click to act on several at
+  once, or act on just the row under the cursor when nothing is ticked. `?` shows the full
+  keymap; the mouse scrolls and ticks.
+- **A way to find out what you just installed.** Press `l` on any plugin to see what it
+  does, which actions it offers, which panes it can open, and what makes it run on its own
+  — then run an action right there.
 - **Marketplace search, in the pane.** Press `/` to search all published herdr plugins by
   name, description or topic, and add one to your list without leaving the terminal.
 - **A curated default set.** `init` writes a starting bundle so a fresh herdr is useful
@@ -126,6 +129,43 @@ herdr-lazy` prints it:
 
 Run from a shell, herdr-lazy asks herdr for that path rather than guessing, so the CLI and
 the manage pane always read the same files.
+
+## What did I just install?
+
+Installing a curated set hands you plugins you did not pick one by one. Press `l` on any row
+to see what one actually does — herdr's own manifest already knows, so this is not a
+description someone had to remember to write:
+
+```
+ cloudmanic/herdr-plus
+ ─────────────────────────────────────────────────────────────────────────────
+ An extension for herdr — a collection of tools that make it better. Projects:
+ fuzzy-pick a declarative template to spin up a whole workspace…
+
+ things you can run  (enter runs the highlighted one)
+ >  Herdr Plus: Projects                     projects
+    Herdr Plus: Quick Actions                quick-actions
+
+ panes it can open
+    Herdr Plus: Projects    zoomed · herdr plugin pane open --plugin … --entrypoint picker
+
+ runs by itself on  worktree.created, worktree.opened
+
+ bind one to a key:  [[keys.command]] type = "plugin_action" command = "…"
+```
+
+Enter runs the highlighted action, so you can try something without first working out how to
+reach it. The last line is the config snippet for binding it to a key.
+
+## Acting on several at once
+
+Space ticks the row under the cursor; press it again to untick. A click does the same. Then
+`i`, `u`, `x`, `r` and `a` apply to everything ticked.
+
+With nothing ticked they apply to the row under the cursor, so this changes nothing for
+anyone who never touches a checkbox. `esc` clears the selection.
+
+A click only ever ticks — nothing installs or uninstalls until you press a key for it.
 
 ## Finding plugins
 
