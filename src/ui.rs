@@ -1142,6 +1142,14 @@ impl App {
         let todo = counts(|s| matches!(s, Status::Missing | Status::Drifted { .. }));
         let extra = counts(|s| *s == Status::Extra);
         let stale = self.rows.iter().filter(|r| r.maybe_stale).count();
+        // Say how old the update information is once it is old enough to mislead. Without
+        // this, "nothing has updates" is indistinguishable from "I last looked two days ago",
+        // and the only cure — pressing `/` — is not something anyone would think to try.
+        let freshness = match crate::registry::cache_age_hours() {
+            Some(h) if h >= 12 => format!(" \x1b[2m· update info {}h old, / refreshes\x1b[0m", h),
+            None => " \x1b[2m· no update info yet, / fetches it\x1b[0m".to_string(),
+            _ => String::new(),
+        };
 
         // Showing auto-sync here is the only way a user learns it exists: it has no row of its
         // own, and something that installs software at startup should be visible, not buried.
@@ -1152,7 +1160,7 @@ impl App {
         };
         writeln!(
             out,
-            "\x1b[1m herdr-lazy\x1b[0m  \x1b[2m{} ok · {} to sync · {} unlisted{}\x1b[0m{}\r",
+            "\x1b[1m herdr-lazy\x1b[0m  \x1b[2m{} ok · {} to sync · {} unlisted{}\x1b[0m{}{}\r",
             ok,
             todo,
             extra,
@@ -1161,7 +1169,8 @@ impl App {
             } else {
                 String::new()
             },
-            auto
+            auto,
+            freshness
         )?;
         writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
 
@@ -1500,8 +1509,14 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
         if app.browser.is_some() {
             match key.code {
                 KeyCode::Esc => {
+                    // Rebuild the list, not just hide the browser. Opening the browser
+                    // refreshes the marketplace cache, and the `↑` markers are computed from
+                    // that cache when the rows are built — so without this, the one action
+                    // that fetches fresh information is also the one whose result you cannot
+                    // see until something else happens to reload.
                     app.browser = None;
                     app.flash = None;
+                    app.refresh();
                 }
                 // Enter, plus the raw bytes some terminals deliver instead of it: Ctrl+J is
                 // LF and Ctrl+M is CR. A pty that translates CR to LF would otherwise leave
