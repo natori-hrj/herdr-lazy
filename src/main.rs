@@ -1010,6 +1010,177 @@ pub(crate) fn is_self_id(plugin_id: &str) -> bool {
     plugin_id == PLUGIN_ID
 }
 
+/// herdr's config.toml.
+///
+/// Derived from `HERDR_SOCKET_PATH` (herdr sets it for every plugin, and the socket lives in
+/// the config directory) rather than assuming `~/.config/herdr` — a user with XDG_CONFIG_HOME
+/// set elsewhere would otherwise get a second config file that herdr never reads.
+pub(crate) fn herdr_config_path() -> Option<PathBuf> {
+    // Overridable so the write path can be exercised against a throwaway file. Without it the
+    // only way to test binding is to point HERDR_SOCKET_PATH somewhere else, which also cuts
+    // the CLI off from the running server — so the pane has nothing to bind.
+    if let Ok(p) = env::var("HERDR_LAZY_CONFIG_PATH") {
+        return Some(PathBuf::from(p));
+    }
+    let sock = env::var("HERDR_SOCKET_PATH").ok()?;
+    let dir = PathBuf::from(sock).parent()?.to_path_buf();
+    Some(dir.join("config.toml"))
+}
+
+/// Keys already bound in config.toml, as written.
+///
+/// A deliberately shallow read: find `key = "…"` lines. Parsing TOML properly would mean a
+/// dependency, and this only has to answer "is this string already spoken for" — a question
+/// where a false positive (refusing to bind) is harmless and a false negative would silently
+/// shadow an existing binding.
+fn bound_keys(config: &str) -> Vec<String> {
+    config
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim();
+            if l.starts_with('#') || !l.starts_with("key") {
+                return None;
+            }
+            let (_, rest) = l.split_once('=')?;
+            let rest = rest.trim();
+            rest.strip_prefix('"')?
+                .split('"')
+                .next()
+                .map(|s| s.to_string())
+        })
+        .collect()
+}
+
+/// Would this key collide with something already bound?
+///
+/// Separate from `bind_action` so the pane can check before showing a confirmation screen —
+/// asking someone to confirm a write that is going to be refused is a waste of their time.
+pub(crate) fn check_bind_conflict(key: &str) -> Result<(), String> {
+    let Some(path) = herdr_config_path() else {
+        return Err("cannot locate herdr's config.toml (no HERDR_SOCKET_PATH)".to_string());
+    };
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    if bound_keys(&existing).iter().any(|k| k == key) {
+        return Err(format!(
+            "{} is already bound in config.toml — pick another, or edit it by hand",
+            key
+        ));
+    }
+    Ok(())
+}
+
+/// Append a `[[keys.command]]` binding for a plugin action.
+///
+/// Writing to someone's herdr config is the most invasive thing herdr-lazy does, so: refuse
+/// on a conflict rather than shadowing, back the file up first, and mark what was added so it
+/// can be found and removed by hand later.
+/// What a binding will invoke.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BindTarget {
+    /// A declared action: herdr has a first-class binding type for these.
+    Action(String),
+    /// A pane. herdr's `[[keys.command]]` has no type for opening one, so this binds the CLI
+    /// command instead, as `type = "shell"`. Without this, the four plugins in the default
+    /// set that expose only panes could not be bound at all.
+    Pane(String),
+}
+
+impl BindTarget {
+    /// The `type` and `command` fields for this target.
+    pub(crate) fn toml_fields(&self, plugin_id: &str) -> (String, String) {
+        match self {
+            BindTarget::Action(id) => {
+                ("plugin_action".to_string(), format!("{}.{}", plugin_id, id))
+            }
+            BindTarget::Pane(id) => (
+                "shell".to_string(),
+                format!(
+                    "herdr plugin pane open --plugin {} --entrypoint {}",
+                    plugin_id, id
+                ),
+            ),
+        }
+    }
+
+    pub(crate) fn id(&self) -> &str {
+        match self {
+            BindTarget::Action(id) | BindTarget::Pane(id) => id,
+        }
+    }
+}
+
+pub(crate) fn bind_action(
+    plugin_id: &str,
+    target: &BindTarget,
+    key: &str,
+) -> Result<String, String> {
+    let Some(path) = herdr_config_path() else {
+        return Err("cannot locate herdr's config.toml (no HERDR_SOCKET_PATH)".to_string());
+    };
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+
+    if bound_keys(&existing).iter().any(|k| k == key) {
+        return Err(format!(
+            "{} is already bound in config.toml — pick another, or edit it by hand",
+            key
+        ));
+    }
+
+    // Back up before touching it. Same name every time: one restore point is what someone
+    // needs after a mistake, and a directory of timestamped copies is its own mess.
+    if !existing.is_empty() {
+        let _ = fs::write(path.with_extension("toml.herdr-lazy-backup"), &existing);
+    }
+
+    let (kind, command) = target.toml_fields(plugin_id);
+    let mut body = existing;
+    if !body.is_empty() && !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body.push_str(&format!(
+        "\n# added by herdr-lazy\n[[keys.command]]\nkey = \"{}\"\ntype = \"{}\"\ncommand = \"{}\"\n",
+        key, kind, command
+    ));
+    fs::write(&path, body).map_err(|e| format!("could not write config.toml: {}", e))?;
+
+    // Ask herdr to pick it up; without this the binding does nothing until the next restart.
+    let reloaded = matches!(run_herdr(&["server", "reload-config"]), Ok((true, _, _)));
+    Ok(if reloaded {
+        format!("bound {} to {}.{}", key, plugin_id, target.id())
+    } else {
+        format!(
+            "wrote {} to config.toml — run `herdr server reload-config` to activate",
+            key
+        )
+    })
+}
+
+/// The `type` and `command` a binding would use — so the confirmation screen can show the
+/// exact lines that will be written rather than a paraphrase of them.
+pub(crate) fn bind_toml_fields(target: &BindTarget, plugin_id: &str) -> (String, String) {
+    target.toml_fields(plugin_id)
+}
+
+/// Open one of a plugin's panes.
+pub(crate) fn open_pane(plugin_id: &str, entrypoint: &str) -> String {
+    match run_herdr(&[
+        "plugin",
+        "pane",
+        "open",
+        "--plugin",
+        plugin_id,
+        "--entrypoint",
+        entrypoint,
+    ]) {
+        Ok((true, _, _)) => format!("opened {} ({})", entrypoint, plugin_id),
+        Ok((false, out, err)) => {
+            let msg = if err.trim().is_empty() { out } else { err };
+            format!("could not open {}: {}", entrypoint, msg.trim())
+        }
+        Err(e) => format!("could not run herdr: {}", e),
+    }
+}
+
 /// Run one of a plugin's declared actions.
 ///
 /// The details view lists what a plugin can do; without this it could only describe them,
@@ -1661,6 +1832,85 @@ mod tests {
             .map(|s| s.repo.as_str())
             .collect();
         assert_eq!(floating, vec!["owner/a", "owner/c"]);
+    }
+
+    /// herdr has a first-class binding type for actions but none for panes, so panes go
+    /// through `type = "shell"` and the CLI. Getting this wrong writes a config line herdr
+    /// silently ignores — the user presses the key and nothing happens, with no error.
+    #[test]
+    fn actions_and_panes_produce_different_bindings() {
+        let (kind, cmd) =
+            BindTarget::Action("projects".into()).toml_fields("cloudmanic.herdr-plus");
+        assert_eq!(kind, "plugin_action");
+        assert_eq!(cmd, "cloudmanic.herdr-plus.projects");
+
+        let (kind, cmd) = BindTarget::Pane("list".into()).toml_fields("triage");
+        assert_eq!(
+            kind, "shell",
+            "herdr has no keybinding type for opening a pane"
+        );
+        assert_eq!(
+            cmd,
+            "herdr plugin pane open --plugin triage --entrypoint list"
+        );
+    }
+
+    #[test]
+    fn a_bind_target_reports_its_id() {
+        assert_eq!(BindTarget::Action("a".into()).id(), "a");
+        assert_eq!(BindTarget::Pane("p".into()).id(), "p");
+    }
+
+    /// Refusing on a conflict is the whole safety story for writing to someone's herdr
+    /// config: a second `[[keys.command]]` on the same key silently shadows the first, and
+    /// the user would have no idea which binding they lost.
+    #[test]
+    fn existing_bindings_are_detected() {
+        let config = r#"
+onboarding = false
+
+[[keys.command]]
+key = "prefix+shift+l"
+type = "plugin_action"
+command = "herdr-lazy.manage"
+
+# a commented-out one must not count
+# key = "prefix+shift+z"
+
+[[keys.command]]
+key   =    "ctrl+alt+g"
+command = "something.else"
+"#;
+        let keys = bound_keys(config);
+        assert!(keys.contains(&"prefix+shift+l".to_string()));
+        assert!(
+            keys.contains(&"ctrl+alt+g".to_string()),
+            "whitespace around = must not hide a binding"
+        );
+        assert!(
+            !keys.contains(&"prefix+shift+z".to_string()),
+            "a commented line is not a binding"
+        );
+    }
+
+    #[test]
+    fn an_empty_config_has_no_bindings() {
+        assert!(bound_keys("").is_empty());
+        assert!(bound_keys("onboarding = false\n[ui]\nx = 1\n").is_empty());
+    }
+
+    /// The config path comes from the socket herdr itself told us about, so a user with
+    /// XDG_CONFIG_HOME pointed elsewhere does not get a second config file herdr never reads.
+    #[test]
+    fn config_path_sits_beside_the_socket() {
+        // Safety: single-threaded test, and the variable is read immediately.
+        unsafe { env::set_var("HERDR_SOCKET_PATH", "/somewhere/odd/herdr.sock") };
+        assert_eq!(
+            herdr_config_path(),
+            Some(PathBuf::from("/somewhere/odd/config.toml"))
+        );
+        unsafe { env::remove_var("HERDR_SOCKET_PATH") };
+        assert_eq!(herdr_config_path(), None, "no socket, no guessing");
     }
 
     #[test]

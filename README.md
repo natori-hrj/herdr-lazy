@@ -154,8 +154,43 @@ description someone had to remember to write:
  bind one to a key:  [[keys.command]] type = "plugin_action" command = "…"
 ```
 
-Enter runs the highlighted action, so you can try something without first working out how to
-reach it. The last line is the config snippet for binding it to a key.
+Enter runs the highlighted entry — an action, or a pane it opens — so you can try something
+without first working out how to reach it.
+
+### Binding it to a key
+
+herdr has no command palette, and a plugin manifest cannot suggest a keybinding. Until an
+action is written into `config.toml` by hand there is no way to reach it, and nothing tells
+you it exists in the first place.
+
+Press `b`, then a letter: the entry gets bound to `prefix+shift+<letter>`. Shift is not
+optional — herdr's own defaults live on `prefix+<letter>` and are not exposed by the CLI, so
+staying out of that range is the only way to be sure nothing is shadowed.
+
+Panes can be bound too. herdr has a binding type for actions (`plugin_action`) but none for
+opening a pane, so those are written as `type = "shell"` running `herdr plugin pane open`.
+This matters more than it sounds: several plugins expose only a pane, and without it `b`
+would do nothing for them.
+
+Before writing anything, the pane shows the exact lines and the file they go into:
+
+```
+ This appends to /Users/you/.config/herdr/config.toml:
+
+   # added by herdr-lazy
+   [[keys.command]]
+   key = "prefix+shift+z"
+   type = "shell"
+   command = "herdr plugin pane open --plugin triage --entrypoint list"
+
+ [y] write it   [n / esc] cancel
+```
+
+That confirmation is not a formality. The pane is launched by herdr, so an environment
+variable set in your shell never reaches it — there is no way to point this at a scratch file
+and try it safely. Your config is copied to `config.toml.herdr-lazy-backup` before the first
+write, every added block is marked `# added by herdr-lazy`, and a key that is already bound
+is refused rather than shadowed.
 
 ## Acting on several at once
 
