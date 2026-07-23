@@ -22,6 +22,7 @@
 //! only its name can be compared), and `--prune` acts on Strong only.
 
 mod browse;
+mod github;
 mod json;
 mod registry;
 mod ui;

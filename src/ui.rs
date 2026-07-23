@@ -254,6 +254,10 @@ struct App {
     detail_of: Option<usize>,
     /// Which action is highlighted in the details view.
     detail_cursor: usize,
+    /// Changes fetched for the currently open details, and which row they belong to. Keyed by
+    /// row so reopening the same plugin does not re-hit the network, and a stale result for a
+    /// different plugin never shows.
+    detail_changes: Option<(usize, crate::github::Changes)>,
     /// Set while waiting for the letter to bind an action to.
     awaiting_bind: bool,
     /// `(action_id, key)` chosen but not yet written, while the user confirms.
@@ -288,6 +292,7 @@ impl App {
                 help: false,
                 detail_of: None,
                 detail_cursor: 0,
+                detail_changes: None,
                 awaiting_bind: false,
                 pending_bind: None,
                 cursor: 0,
@@ -300,6 +305,7 @@ impl App {
                 help: false,
                 detail_of: None,
                 detail_cursor: 0,
+                detail_changes: None,
                 awaiting_bind: false,
                 pending_bind: None,
                 cursor: 0,
@@ -312,9 +318,11 @@ impl App {
     fn refresh(&mut self) {
         let (cursor, flash) = (self.cursor, self.flash.take());
         let (browser, help) = (self.browser.take(), self.help);
+        let changes = self.detail_changes.take();
         *self = App::load();
         self.browser = browser;
         self.help = help;
+        self.detail_changes = changes;
         self.cursor = cursor.min(self.rows.len().saturating_sub(1));
         self.flash = flash;
     }
@@ -350,10 +358,29 @@ impl App {
     }
 
     fn open_detail(&mut self) {
-        if self.rows.get(self.cursor).is_some() {
-            self.detail_of = Some(self.cursor);
-            self.detail_cursor = 0;
-            self.flash = None;
+        let Some(row) = self.rows.get(self.cursor) else {
+            return;
+        };
+        self.detail_of = Some(self.cursor);
+        self.detail_cursor = 0;
+        self.flash = None;
+
+        // Fetch only for a plugin the offline marker already flagged. Opening the details of
+        // an up-to-date plugin must stay instant — going to the network for every `l` would
+        // make the common case (nothing changed) the slow one, which is backwards. The marker
+        // can lag a very recent push by up to a day; that a just-pushed plugin waits one more
+        // day for its diff is a fair price for `l` never blocking on a plugin that is current.
+        //
+        // Reuse a result already fetched for this row so reopening does not re-hit the network.
+        if matches!(&self.detail_changes, Some((i, _)) if *i == self.cursor) {
+            return;
+        }
+        self.detail_changes = None;
+        if row.maybe_stale {
+            if let (Some(slug), Some(commit)) = (row.slug.clone(), row.commit.clone()) {
+                let changes = crate::github::changes_since(&slug, &commit);
+                self.detail_changes = Some((self.cursor, changes));
+            }
         }
     }
 
@@ -938,6 +965,52 @@ impl App {
             writeln!(out, "\r")?;
         }
 
+        // What changed since install — the point of the whole feature. Only present when this
+        // plugin was flagged and the fetch happened on open; a plugin with no marker shows
+        // nothing here, which is correct.
+        if let Some((row_idx, changes)) = &self.detail_changes {
+            if *row_idx == idx {
+                use crate::github::Changes;
+                match changes {
+                    Changes::Commits(cs) if !cs.is_empty() => {
+                        writeln!(
+                            out,
+                            " \x1b[1m\x1b[33m{} new commit(s) since you installed\x1b[0m  \
+                             \x1b[2m(press u to update)\x1b[0m\r",
+                            cs.len()
+                        )?;
+                        for subject in cs.iter().take(8) {
+                            writeln!(
+                                out,
+                                "   \x1b[2m·\x1b[0m {}\r",
+                                truncate(subject, width.saturating_sub(6) as usize)
+                            )?;
+                        }
+                        if cs.len() > 8 {
+                            writeln!(out, "   \x1b[2m… and {} more\x1b[0m\r", cs.len() - 8)?;
+                        }
+                        writeln!(out, "\r")?;
+                    }
+                    Changes::Commits(_) => {} // marker was stale; nothing actually newer
+                    Changes::ManyPlus(n) => {
+                        writeln!(
+                            out,
+                            " \x1b[33m{}+ commits behind\x1b[0m \x1b[2m— more than one page; \
+                             press u to catch up\x1b[0m\r\r",
+                            n
+                        )?;
+                    }
+                    Changes::Unknown(why) => {
+                        writeln!(
+                            out,
+                            " \x1b[2mcould not check for changes: {}\x1b[0m\r\r",
+                            why
+                        )?;
+                    }
+                }
+            }
+        }
+
         if let Some((target, _)) = items.get(self.detail_cursor) {
             // Show the lines that `b` would actually write, not a fixed example — panes and
             // actions produce different `type` values, and a wrong example here would send
@@ -1040,7 +1113,11 @@ impl App {
             &[
                 (
                     "l / →",
-                    "what this plugin does — run its actions, or bind one to a key",
+                    "what this plugin does — its actions, and (if ↑) what changed since install",
+                ),
+                (
+                    "↑",
+                    "beside a commit: the repo moved since you installed; open with l",
                 ),
                 ("j / k", "down / up  (arrows and the wheel work too)"),
                 ("g / G", "first / last row"),
@@ -1213,12 +1290,13 @@ impl App {
             } else {
                 " "
             };
-            // The marker alone does not say what it means; on an otherwise-quiet row there is
-            // space to say it.
+            // Point at `l`, not `u`. The whole point of this feature is reading the change
+            // before applying it — telling the user to update straight away skips the review
+            // it exists to offer. `l` opens the details, which fetch and show what changed;
+            // `u` is the step after they have decided.
             let note = match (row.maybe_stale, row.status.note()) {
                 (true, n) if n.is_empty() => {
-                    "its repo has been pushed to since you installed — press u to update"
-                        .to_string()
+                    "updates available — press l to see what changed".to_string()
                 }
                 (_, n) => n,
             };
