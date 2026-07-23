@@ -219,6 +219,15 @@ struct App {
     detail_of: Option<usize>,
     /// Which action is highlighted in the details view.
     detail_cursor: usize,
+    /// Set while waiting for the letter to bind an action to.
+    awaiting_bind: bool,
+    /// `(action_id, key)` chosen but not yet written, while the user confirms.
+    ///
+    /// Writing to `config.toml` cannot be sandboxed: the pane is launched by herdr, so an
+    /// environment variable set in a shell never reaches it, and there is no "try it against
+    /// a copy" mode to offer. The only honest safeguard is to show exactly what will be
+    /// appended, and to where, before touching the file.
+    pending_bind: Option<(crate::BindTarget, String)>,
     cursor: usize,
     /// Set when a refresh fails, so the pane explains itself instead of showing an empty list.
     error: Option<String>,
@@ -241,6 +250,8 @@ impl App {
                 help: false,
                 detail_of: None,
                 detail_cursor: 0,
+                awaiting_bind: false,
+                pending_bind: None,
                 cursor: 0,
                 error: None,
                 flash: None,
@@ -251,6 +262,8 @@ impl App {
                 help: false,
                 detail_of: None,
                 detail_cursor: 0,
+                awaiting_bind: false,
+                pending_bind: None,
                 cursor: 0,
                 error: Some(e),
                 flash: None,
@@ -306,16 +319,92 @@ impl App {
         }
     }
 
+    /// Bind the highlighted action to `prefix+shift+<letter>`.
+    ///
+    /// Shift is not negotiable here: herdr's own defaults live on `prefix+<letter>`, and this
+    /// cannot see them (the CLI does not expose them), so the one thing it can do is stay out
+    /// of that space entirely. Conflicts with the user's own bindings are detected.
+    /// Everything in this plugin that a key could be bound to, in the order shown.
+    ///
+    /// Actions first, then panes. Panes are included because four of the seven plugins in the
+    /// default set expose only a pane — leaving them unbindable would mean the feature does
+    /// not work for most of what a new user has installed.
+    fn bindable(d: &PluginDetail) -> Vec<(crate::BindTarget, String)> {
+        let mut out: Vec<(crate::BindTarget, String)> = d
+            .actions
+            .iter()
+            .map(|(id, title)| {
+                (
+                    crate::BindTarget::Action(id.clone()),
+                    if title.is_empty() {
+                        id.clone()
+                    } else {
+                        title.clone()
+                    },
+                )
+            })
+            .collect();
+        out.extend(d.panes.iter().map(|(id, title, _)| {
+            (
+                crate::BindTarget::Pane(id.clone()),
+                if title.is_empty() {
+                    id.clone()
+                } else {
+                    title.clone()
+                },
+            )
+        }));
+        out
+    }
+
+    fn bind_selected(&mut self, letter: char) {
+        let Some(idx) = self.detail_of else { return };
+        let Some(d) = self.rows.get(idx).and_then(|r| r.detail.clone()) else {
+            return;
+        };
+        let Some((target, _)) = Self::bindable(&d).into_iter().nth(self.detail_cursor) else {
+            return;
+        };
+        let key = format!("prefix+shift+{}", letter.to_ascii_lowercase());
+        // Check for a conflict now, so the confirmation screen is never shown for a binding
+        // that would be refused anyway.
+        if let Err(msg) = crate::check_bind_conflict(&key) {
+            self.flash = Some(msg);
+            return;
+        }
+        self.pending_bind = Some((target, key));
+    }
+
+    /// `y` on the confirmation screen.
+    fn commit_bind(&mut self) {
+        let Some((target, key)) = self.pending_bind.take() else {
+            return;
+        };
+        let Some(d) = self
+            .detail_of
+            .and_then(|i| self.rows.get(i))
+            .and_then(|r| r.detail.clone())
+        else {
+            return;
+        };
+        self.flash = Some(match crate::bind_action(&d.plugin_id, &target, &key) {
+            Ok(msg) | Err(msg) => msg,
+        });
+    }
+
     fn run_detail_action(&mut self) {
         let Some(idx) = self.detail_of else { return };
         let Some(d) = self.rows.get(idx).and_then(|r| r.detail.clone()) else {
             return;
         };
-        let Some((action_id, _)) = d.actions.get(self.detail_cursor).cloned() else {
-            self.flash = Some("no actions to run".to_string());
+        let Some((target, _)) = Self::bindable(&d).into_iter().nth(self.detail_cursor) else {
+            self.flash = Some("nothing to run".to_string());
             return;
         };
-        self.flash = Some(crate::invoke_action(&d.plugin_id, &action_id));
+        self.flash = Some(match &target {
+            crate::BindTarget::Action(id) => crate::invoke_action(&d.plugin_id, id),
+            crate::BindTarget::Pane(id) => crate::open_pane(&d.plugin_id, id),
+        });
     }
 
     fn any_picked(&self) -> bool {
@@ -663,6 +752,9 @@ impl App {
         if self.help {
             return self.draw_help(out, width, height);
         }
+        if self.pending_bind.is_some() {
+            return self.draw_bind_confirm(out, width, height);
+        }
         if self.detail_of.is_some() {
             return self.draw_detail(out, width, height);
         }
@@ -670,6 +762,56 @@ impl App {
             return self.draw_browser(out, width, height);
         }
         self.draw_list(out, width, height)
+    }
+
+    /// Show the exact change before making it.
+    fn draw_bind_confirm(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        let rule = "─".repeat((width as usize).clamp(20, 200));
+        let (target, key) = self.pending_bind.clone().expect("checked by caller");
+        let plugin_id = self
+            .detail_of
+            .and_then(|i| self.rows.get(i))
+            .and_then(|r| r.detail.as_ref())
+            .map(|d| d.plugin_id.clone())
+            .unwrap_or_default();
+        let path = crate::herdr_config_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(herdr's config.toml — location unknown)".to_string());
+
+        write!(out, "\x1b[H\x1b[2J")?;
+        writeln!(out, "\x1b[1m bind {}.{}\x1b[0m\r", plugin_id, target.id())?;
+        writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
+        writeln!(out, " This appends to \x1b[1m{}\x1b[0m:\r", path)?;
+        writeln!(out, "\r")?;
+        let (kind, command) = crate::bind_toml_fields(&target, &plugin_id);
+        for line in [
+            "# added by herdr-lazy".to_string(),
+            "[[keys.command]]".to_string(),
+            format!("key = \"{}\"", key),
+            format!("type = \"{}\"", kind),
+            format!("command = \"{}\"", command),
+        ] {
+            writeln!(out, "   \x1b[32m{}\x1b[0m\r", line)?;
+        }
+        writeln!(out, "\r")?;
+        writeln!(
+            out,
+            " \x1b[2mYour current config is copied to config.toml.herdr-lazy-backup first.\x1b[0m\r"
+        )?;
+        writeln!(
+            out,
+            " \x1b[2mThis is your real herdr config — the pane is launched by herdr, so there \
+             is no copy to test against.\x1b[0m\r"
+        )?;
+
+        write!(
+            out,
+            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m\x1b[1m[y]\x1b[0m write it  \
+             \x1b[1m[n / esc]\x1b[0m cancel\r",
+            height.saturating_sub(1),
+            rule
+        )?;
+        out.flush()
     }
 
     /// What this plugin does, and how to actually use it.
@@ -702,6 +844,8 @@ impl App {
             return out.flush();
         };
 
+        let items = Self::bindable(d);
+
         if !d.description.is_empty() {
             for line in wrap(&d.description, (width as usize).saturating_sub(3)) {
                 writeln!(out, " {}\r", line)?;
@@ -709,7 +853,7 @@ impl App {
             writeln!(out, "\r")?;
         }
 
-        if d.actions.is_empty() && d.panes.is_empty() && d.events.is_empty() {
+        if items.is_empty() && d.events.is_empty() {
             writeln!(
                 out,
                 " \x1b[2mthis plugin declares no actions, panes or events — it may work \
@@ -717,28 +861,31 @@ impl App {
             )?;
         }
 
-        if !d.actions.is_empty() {
-            writeln!(out, " \x1b[1mthings you can run\x1b[0m  \x1b[2m(enter runs the highlighted one)\x1b[0m\r")?;
-            for (i, (id, title)) in d.actions.iter().enumerate() {
+        // Actions and panes in one list, because `enter` and `b` treat them the same way and
+        // the cursor indexes into it. Two separate sections would mean two things claiming to
+        // be "the highlighted one".
+        if !items.is_empty() {
+            writeln!(
+                out,
+                " \x1b[1mthings you can run\x1b[0m  \x1b[2m(enter runs it · b binds it to a key)\x1b[0m\r"
+            )?;
+            for (i, (target, label)) in items.iter().enumerate() {
                 let sel = if i == self.detail_cursor {
                     "\x1b[7m>"
                 } else {
                     " "
                 };
-                let label = if title.is_empty() { id } else { title };
-                writeln!(out, "{}\x1b[0m  {:<44} \x1b[2m{}\x1b[0m\r", sel, label, id)?;
-            }
-            writeln!(out, "\r")?;
-        }
-
-        if !d.panes.is_empty() {
-            writeln!(out, " \x1b[1mpanes it can open\x1b[0m\r")?;
-            for (id, title, placement) in &d.panes {
-                let label = if title.is_empty() { id } else { title };
+                let kind = match target {
+                    crate::BindTarget::Action(_) => "action",
+                    crate::BindTarget::Pane(_) => "pane",
+                };
                 writeln!(
                     out,
-                    "   {:<44} \x1b[2m{} · herdr plugin pane open --plugin {} --entrypoint {}\x1b[0m\r",
-                    label, placement, d.plugin_id, id
+                    "{}\x1b[0m  {:<44} \x1b[2m{:<7}{}\x1b[0m\r",
+                    sel,
+                    truncate(label, 44),
+                    kind,
+                    target.id()
                 )?;
             }
             writeln!(out, "\r")?;
@@ -753,24 +900,28 @@ impl App {
             writeln!(out, "\r")?;
         }
 
-        if !d.actions.is_empty() {
+        if let Some((target, _)) = items.get(self.detail_cursor) {
+            // Show the lines that `b` would actually write, not a fixed example — panes and
+            // actions produce different `type` values, and a wrong example here would send
+            // someone to hand-write a binding herdr ignores.
+            let (kind, command) = crate::bind_toml_fields(target, &d.plugin_id);
             writeln!(
                 out,
-                " \x1b[2mbind one to a key:  [[keys.command]] type = \"plugin_action\" \
-                 command = \"{}.{}\"\x1b[0m\r",
-                d.plugin_id,
-                d.actions
-                    .get(self.detail_cursor)
-                    .map(|(id, _)| id.as_str())
-                    .unwrap_or("<action>")
+                " \x1b[2mb binds the highlighted one:  type = \"{}\"  command = \"{}\"\x1b[0m\r",
+                kind, command
             )?;
         }
 
-        let footer = match &self.flash {
-            Some(m) => format!("\x1b[36m{}\x1b[0m", m),
-            None => "\x1b[1m[enter]\x1b[0m run  \x1b[1m[j/k]\x1b[0m move  \
-                     \x1b[1m[esc]\x1b[0m back"
-                .to_string(),
+        let footer = if self.awaiting_bind {
+            "\x1b[33mpress a letter to bind this to prefix+shift+<letter>, or esc\x1b[0m"
+                .to_string()
+        } else {
+            match &self.flash {
+                Some(m) => format!("\x1b[36m{}\x1b[0m", m),
+                None => "\x1b[1m[enter]\x1b[0m run  \x1b[1m[b]\x1b[0m bind to a key  \
+                         \x1b[1m[j/k]\x1b[0m move  \x1b[1m[esc]\x1b[0m back"
+                    .to_string(),
+            }
         };
         write!(
             out,
@@ -849,7 +1000,10 @@ impl App {
             out,
             "finding your way",
             &[
-                ("l / →", "what this plugin does, and run its actions"),
+                (
+                    "l / →",
+                    "what this plugin does — run its actions, or bind one to a key",
+                ),
                 ("j / k", "down / up  (arrows and the wheel work too)"),
                 ("g / G", "first / last row"),
                 (
@@ -1205,12 +1359,24 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
         }
 
         // Details view: a short list of runnable actions.
+        // Confirmation is modal: only y / n / esc mean anything here.
+        if app.pending_bind.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => app.commit_bind(),
+                _ => {
+                    app.pending_bind = None;
+                    app.flash = Some("not bound".to_string());
+                }
+            }
+            continue;
+        }
+
         if let Some(idx) = app.detail_of {
             let n = app
                 .rows
                 .get(idx)
                 .and_then(|r| r.detail.as_ref())
-                .map(|d| d.actions.len())
+                .map(|d| App::bindable(d).len())
                 .unwrap_or(0);
             // Ctrl-chords first: a plain `j` moves, but Ctrl+J is a pty's Enter, and a
             // later arm would never see it.
@@ -1222,7 +1388,32 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                 }
                 continue;
             }
+            // Waiting for the letter to bind to: take it and nothing else.
+            if app.awaiting_bind {
+                app.awaiting_bind = false;
+                match key.code {
+                    KeyCode::Char(c) if c.is_ascii_alphabetic() => app.bind_selected(c),
+                    KeyCode::Esc => app.flash = Some("not bound".to_string()),
+                    _ => app.flash = Some("that is not a letter — nothing bound".to_string()),
+                }
+                continue;
+            }
+
             match key.code {
+                KeyCode::Char('b') => {
+                    if app
+                        .rows
+                        .get(idx)
+                        .and_then(|r| r.detail.as_ref())
+                        .map(|d| App::bindable(d).is_empty())
+                        .unwrap_or(true)
+                    {
+                        app.flash = Some("no actions to bind".to_string());
+                    } else {
+                        app.awaiting_bind = true;
+                        app.flash = None;
+                    }
+                }
                 KeyCode::Esc | KeyCode::Char('q') => {
                     app.detail_of = None;
                     app.flash = None;
@@ -1778,6 +1969,56 @@ mod tests {
 
         app.clear_picks();
         assert_eq!(app.targets(), vec![app.cursor]);
+    }
+
+    /// The bug this pins down: `b` only ever offered actions, and four of the seven plugins
+    /// in the default set expose a pane and no actions at all. Pressing `b` on those said
+    /// "no actions to bind" — so for most of what a new user has installed, the feature did
+    /// nothing.
+    #[test]
+    fn panes_are_bindable_not_just_actions() {
+        let pane_only = PluginDetail {
+            plugin_id: "triage".into(),
+            panes: vec![("list".into(), "Triage".into(), "split".into())],
+            ..Default::default()
+        };
+        let items = App::bindable(&pane_only);
+        assert_eq!(items.len(), 1, "a pane-only plugin must still be bindable");
+        assert_eq!(items[0].0, crate::BindTarget::Pane("list".into()));
+        assert_eq!(items[0].1, "Triage");
+
+        let neither = PluginDetail {
+            plugin_id: "x".into(),
+            ..Default::default()
+        };
+        assert!(App::bindable(&neither).is_empty());
+    }
+
+    /// Actions come first, then panes, and the order must match what is drawn — the cursor
+    /// indexes into this list, so a mismatch binds the wrong thing.
+    #[test]
+    fn bindable_lists_actions_before_panes() {
+        let both = PluginDetail {
+            plugin_id: "p".into(),
+            actions: vec![("run".into(), "Run it".into())],
+            panes: vec![("side".into(), "Sidebar".into(), "split".into())],
+            ..Default::default()
+        };
+        let items = App::bindable(&both);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].0, crate::BindTarget::Action("run".into()));
+        assert_eq!(items[1].0, crate::BindTarget::Pane("side".into()));
+    }
+
+    /// A missing title falls back to the id, so a row is never blank.
+    #[test]
+    fn an_untitled_entry_shows_its_id() {
+        let d = PluginDetail {
+            plugin_id: "p".into(),
+            actions: vec![("bare".into(), String::new())],
+            ..Default::default()
+        };
+        assert_eq!(App::bindable(&d)[0].1, "bare");
     }
 
     #[test]
