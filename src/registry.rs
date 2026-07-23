@@ -257,6 +257,11 @@ pub(crate) fn load(force: bool) -> Result<(Vec<Entry>, String), String> {
     }
 }
 
+/// How old the cached index is, in hours. `None` when there is no cache.
+pub(crate) fn cache_age_hours() -> Option<u64> {
+    cache_age_seconds().map(|s| s / 3600)
+}
+
 /// Entries from the cache, or nothing. Never fetches.
 ///
 /// Used by the list view, which runs on every keypress-driven redraw and must not depend on
