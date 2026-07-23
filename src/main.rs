@@ -239,6 +239,9 @@ pub(crate) struct Installed {
     /// `owner/repo` rebuilt from `source.owner` + `source.repo`. herdr stores them as two
     /// separate fields, never as a joined slug, so this has to be assembled.
     pub(crate) slug: Option<String>,
+    /// `source.installed_unix_ms` — when herdr fetched this. Compared against the
+    /// marketplace's `pushedAt` to spot plugins that have moved since.
+    pub(crate) installed_unix_ms: Option<u64>,
     /// `source.resolved_commit` — the exact commit herdr checked out. This is what makes a
     /// lockfile real: we can record what is actually installed, not merely what was asked for.
     pub(crate) resolved_commit: Option<String>,
@@ -425,6 +428,12 @@ fn parse_plugin_list(stdout: &str) -> Result<Vec<Installed>, String> {
                             .collect()
                     })
                     .unwrap_or_default(),
+                installed_unix_ms: p
+                    .path(&["source", "installed_unix_ms"])
+                    .and_then(|v| match v {
+                        json::Value::Num(n) if *n >= 0.0 => Some(*n as u64),
+                        _ => None,
+                    }),
                 slug,
                 resolved_commit: p
                     .path(&["source", "resolved_commit"])

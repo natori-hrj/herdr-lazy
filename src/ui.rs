@@ -105,6 +105,9 @@ struct Row {
     /// `owner/repo`, when known — what `a` adds. `None` for a local link, which has no repo
     /// to record, so it can never be adopted into the list.
     slug: Option<String>,
+    /// The plugin's repository has been pushed to since this copy was installed. A hint, not
+    /// a fact — see `registry::pushed_since`.
+    maybe_stale: bool,
     /// herdr's id for the installed plugin, and how it was installed. Present only when the
     /// row corresponds to something actually installed — which is exactly when `x` applies.
     installed: Option<(String, String)>,
@@ -137,7 +140,37 @@ fn detail_of(p: &Installed) -> PluginDetail {
 }
 
 /// Build the view: every bundle entry, then anything installed that the bundle does not name.
+/// The view without update information — what the tests use, since they are checking status
+/// and selection rather than what the marketplace happens to say today.
+#[cfg(test)]
 fn rows(desired: &[Spec], installed: &[Installed]) -> Vec<Row> {
+    rows_with_updates(desired, installed, &[])
+}
+
+/// Build the view, marking anything the marketplace says has moved since it was installed.
+///
+/// `market` is whatever is already cached; browsing has usually populated it, and when it is
+/// empty the column simply does not appear. Checking for updates should never be the reason
+/// the pane makes a network call.
+fn rows_with_updates(
+    desired: &[Spec],
+    installed: &[Installed],
+    market: &[crate::registry::Entry],
+) -> Vec<Row> {
+    let stale = |p: &Installed, spec: Option<&Spec>| -> bool {
+        // A pinned entry is meant to sit still; calling it out of date is noise.
+        if spec.map(|s| s.reference.is_some()).unwrap_or(false) {
+            return false;
+        }
+        let (Some(slug), Some(ms)) = (p.slug.as_ref(), p.installed_unix_ms) else {
+            return false;
+        };
+        market
+            .iter()
+            .find(|e| e.full_name.eq_ignore_ascii_case(slug))
+            .map(|e| crate::registry::pushed_since(&e.pushed_at, ms))
+            .unwrap_or(false)
+    };
     let mut rows = Vec::new();
 
     for spec in desired {
@@ -167,6 +200,7 @@ fn rows(desired: &[Spec], installed: &[Installed]) -> Vec<Row> {
             listed_as: Some(spec.display()),
             slug: Some(spec.repo.clone()),
             installed: hit.map(|(p, _)| (p.plugin_id.clone(), p.source_kind.clone())),
+            maybe_stale: hit.map(|(p, _)| stale(p, Some(spec))).unwrap_or(false),
             picked: false,
             detail: hit.map(|(p, _)| detail_of(p)),
         });
@@ -190,6 +224,7 @@ fn rows(desired: &[Spec], installed: &[Installed]) -> Vec<Row> {
             listed_as: None,
             slug: p.slug.clone(),
             installed: Some((p.plugin_id.clone(), p.source_kind.clone())),
+            maybe_stale: stale(p, None),
             picked: false,
             detail: Some(detail_of(p)),
         });
@@ -243,9 +278,12 @@ impl App {
             .iter()
             .map(|l| Spec::parse(l))
             .collect();
+        // Cached only: `false` never fetches. If nothing is cached the update column is
+        // simply absent, which is better than making every pane open hit the network.
+        let market = crate::registry::cached_entries();
         match installed_plugins() {
             Ok(installed) => App {
-                rows: rows(&desired, &installed),
+                rows: rows_with_updates(&desired, &installed, &market),
                 browser: None,
                 help: false,
                 detail_of: None,
@@ -1103,6 +1141,7 @@ impl App {
         let ok = counts(|s| *s == Status::Ok);
         let todo = counts(|s| matches!(s, Status::Missing | Status::Drifted { .. }));
         let extra = counts(|s| *s == Status::Extra);
+        let stale = self.rows.iter().filter(|r| r.maybe_stale).count();
 
         // Showing auto-sync here is the only way a user learns it exists: it has no row of its
         // own, and something that installs software at startup should be visible, not buried.
@@ -1113,8 +1152,16 @@ impl App {
         };
         writeln!(
             out,
-            "\x1b[1m herdr-lazy\x1b[0m  \x1b[2m{} ok · {} to sync · {} unlisted\x1b[0m{}\r",
-            ok, todo, extra, auto
+            "\x1b[1m herdr-lazy\x1b[0m  \x1b[2m{} ok · {} to sync · {} unlisted{}\x1b[0m{}\r",
+            ok,
+            todo,
+            extra,
+            if stale > 0 {
+                format!(" · \x1b[33m{} may have updates\x1b[0m\x1b[2m", stale)
+            } else {
+                String::new()
+            },
+            auto
         )?;
         writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
 
@@ -1150,16 +1197,32 @@ impl App {
                 .as_deref()
                 .map(crate::short)
                 .unwrap_or_else(|| "-".to_string());
-            let note = row.status.note();
+            // `↑` next to the commit rather than a column of its own: it qualifies the commit
+            // that is shown, and the row is already wide.
+            let up = if row.maybe_stale {
+                "\x1b[33m↑\x1b[0m"
+            } else {
+                " "
+            };
+            // The marker alone does not say what it means; on an otherwise-quiet row there is
+            // space to say it.
+            let note = match (row.maybe_stale, row.status.note()) {
+                (true, n) if n.is_empty() => {
+                    "its repo has been pushed to since you installed — press u to update"
+                        .to_string()
+                }
+                (_, n) => n,
+            };
             writeln!(
                 out,
-                "{} {}{}{}\x1b[0m {:<44} \x1b[2m{:<12}\x1b[0m {}\x1b[0m\r",
+                "{} {}{}{}\x1b[0m {:<44} \x1b[2m{:<12}\x1b[0m{} {}\x1b[0m\r",
                 pointer,
                 box_,
                 row.status.colour(),
                 row.status.marker(),
                 truncate(&row.label, 44),
                 commit,
+                up,
                 if note.is_empty() {
                     String::new()
                 } else {
@@ -2019,6 +2082,69 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(App::bindable(&d)[0].1, "bare");
+    }
+
+    fn market(name: &str, pushed_at: &str) -> crate::registry::Entry {
+        crate::registry::Entry {
+            full_name: name.to_string(),
+            pushed_at: pushed_at.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn installed_at(owner: &str, repo: &str, ms: u64) -> Installed {
+        let mut p = github(owner, repo, SHA, true);
+        p.installed_unix_ms = Some(ms);
+        p
+    }
+
+    /// Day 20000 of the epoch, in ms — a fixed point so the test does not drift with the clock.
+    const DAY_MS: u64 = 86_400_000;
+
+    #[test]
+    fn a_repo_pushed_after_install_is_flagged() {
+        let desired = vec![Spec::parse("o/moved"), Spec::parse("o/still")];
+        let installed = vec![
+            installed_at("o", "moved", 20_000 * DAY_MS),
+            installed_at("o", "still", 20_010 * DAY_MS),
+        ];
+        let market = vec![
+            market("o/moved", "2024-10-05T00:00:00Z"), // long after day 20000
+            market("o/still", "1970-01-05T00:00:00Z"), // long before
+        ];
+        let r = rows_with_updates(&desired, &installed, &market);
+        assert!(r[0].maybe_stale, "a later push must be reported");
+        assert!(!r[1].maybe_stale, "an older push must not be");
+    }
+
+    /// A pin says "this commit, deliberately". Reporting it as out of date would train people
+    /// to ignore the marker.
+    #[test]
+    fn a_pinned_entry_is_never_flagged() {
+        let sha = "10e93033263549600e75119c5617dac48137d011";
+        let desired = vec![Spec::parse(&format!("o/pinned@{}", sha))];
+        let installed = vec![installed_at("o", "pinned", 20_000 * DAY_MS)];
+        let market = vec![market("o/pinned", "2024-10-05T00:00:00Z")];
+        assert!(!rows_with_updates(&desired, &installed, &market)[0].maybe_stale);
+    }
+
+    /// With no cached index — a fresh install that has never opened the browser — the column
+    /// is simply absent. It must never become a reason to reach for the network.
+    #[test]
+    fn without_a_cached_index_nothing_is_flagged() {
+        let desired = vec![Spec::parse("o/x")];
+        let installed = vec![installed_at("o", "x", 0)];
+        assert!(!rows_with_updates(&desired, &installed, &[])[0].maybe_stale);
+    }
+
+    /// An unlisted plugin can be stale too — it is installed, and `u` would update it.
+    #[test]
+    fn unlisted_plugins_are_checked_as_well() {
+        let installed = vec![installed_at("someone", "extra", 20_000 * DAY_MS)];
+        let market = vec![market("someone/extra", "2024-10-05T00:00:00Z")];
+        let r = rows_with_updates(&[], &installed, &market);
+        assert_eq!(r.len(), 1);
+        assert!(r[0].maybe_stale);
     }
 
     #[test]

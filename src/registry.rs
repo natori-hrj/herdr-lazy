@@ -27,7 +27,7 @@ const INDEX_URL: &str = "https://assets.herdr.dev/plugins/index.json";
 const CACHE_SECONDS: u64 = 6 * 60 * 60;
 
 /// One plugin as the marketplace describes it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct Entry {
     pub(crate) full_name: String,
     pub(crate) description: String,
@@ -99,6 +99,28 @@ pub(crate) fn age_label(pushed_at: &str, today: i64) -> String {
         30..=364 => format!("{}mo", days / 30),
         _ => format!("{}y", days / 365),
     }
+}
+
+/// Has this repository been pushed to since the given instant?
+///
+/// The comparison behind the "update?" marker. Both halves are approximations and the result
+/// is worded as a question on purpose:
+///
+///   - `pushedAt` is the last push to *any* branch, so a tag or a topic branch counts even
+///     though the default branch — the thing herdr installs — has not moved.
+///   - a plugin installed at a pinned commit is deliberately not tracking the branch, so it
+///     is excluded by the caller rather than reported as stale.
+///
+/// A false "maybe" costs a wasted `u`; a false "you are current" would hide real updates,
+/// which is the worse failure, so it errs toward reporting.
+pub(crate) fn pushed_since(pushed_at: &str, installed_unix_ms: u64) -> bool {
+    let Some(pushed_day) = days_from_iso(pushed_at) else {
+        return false;
+    };
+    let installed_day = (installed_unix_ms / 1000 / 86_400) as i64;
+    // Day resolution: the index only carries a date we can rely on parsing, and an install
+    // and a push on the same day is not worth flagging either way.
+    pushed_day > installed_day
 }
 
 /// Today, as days since the epoch.
@@ -235,6 +257,17 @@ pub(crate) fn load(force: bool) -> Result<(Vec<Entry>, String), String> {
     }
 }
 
+/// Entries from the cache, or nothing. Never fetches.
+///
+/// Used by the list view, which runs on every keypress-driven redraw and must not depend on
+/// the network being there — or on someone else's CDN being willing.
+pub(crate) fn cached_entries() -> Vec<Entry> {
+    fs::read_to_string(cache_path())
+        .ok()
+        .and_then(|b| parse_index(&b).ok())
+        .unwrap_or_default()
+}
+
 fn write_cache(body: &str) -> io::Result<()> {
     let p = cache_path();
     if let Some(parent) = p.parent() {
@@ -300,6 +333,29 @@ mod tests {
         );
         assert_eq!(days_from_iso("not a date"), None);
         assert_eq!(days_from_iso("2026-13-01"), None, "month out of range");
+    }
+
+    #[test]
+    fn a_push_after_the_install_is_reported() {
+        let day = 86_400_000u64;
+        // installed on day 20000, pushed on day 20001
+        let installed = 20_000 * day;
+        assert!(
+            pushed_since("2024-10-05T00:00:00Z", 0),
+            "any push beats epoch"
+        );
+        assert!(!pushed_since("", installed), "no date, no claim");
+        assert!(!pushed_since("not a date", installed));
+    }
+
+    #[test]
+    fn same_day_is_not_an_update() {
+        // 2026-07-21 as ms; a push the same day must not be flagged.
+        let d = days_from_iso("2026-07-21").unwrap() as u64;
+        let installed_ms = d * 86_400_000;
+        assert!(!pushed_since("2026-07-21T23:59:00Z", installed_ms));
+        assert!(pushed_since("2026-07-22T00:01:00Z", installed_ms));
+        assert!(!pushed_since("2026-07-20T00:01:00Z", installed_ms));
     }
 
     #[test]
