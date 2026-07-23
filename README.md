@@ -17,6 +17,8 @@ machine. herdr-lazy adds both.
 - **A real lockfile.** Entries pin to a commit, and the lock records the commit herdr
   actually checked out. Copy the lock to another machine, `sync`, and you get the same
   plugins at the same commits.
+- **A hint when something has moved.** `↑` marks a plugin whose repository has been pushed
+  to since you installed it, so `u` is worth pressing.
 - **A manage pane.** A herdr overlay pane with the same operations on single keys —
   `i`/`u`/`x`/`r` as in lazy.nvim. Tick rows with space or a click to act on several at
   once, or act on just the row under the cursor when nothing is ticked. `?` shows the full
@@ -191,6 +193,22 @@ variable set in your shell never reaches it — there is no way to point this at
 and try it safely. Your config is copied to `config.toml.herdr-lazy-backup` before the first
 write, every added block is marked `# added by herdr-lazy`, and a key that is already bound
 is refused rather than shadowed.
+
+## Spotting updates
+
+`↑` beside a commit means the plugin's repository has been pushed to since that copy was
+installed, and the header counts how many. `u` updates them.
+
+It is a hint, and worded as one. The comparison is between the marketplace index's
+`pushedAt` and when herdr fetched the plugin, so a push to any branch counts even if the
+default branch — the thing that actually gets installed — has not moved. Erring toward
+reporting is deliberate: a needless `u` costs a moment, while a missed update stays missed.
+
+Pinned entries are never marked. A pin means "this commit, deliberately", and flagging it
+would teach you to ignore the marker.
+
+This costs no network access. It reads the marketplace index that browsing already cached;
+with nothing cached, the column is simply absent.
 
 ## Acting on several at once
 
