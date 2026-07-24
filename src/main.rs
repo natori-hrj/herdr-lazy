@@ -107,17 +107,34 @@ fn legacy_config_dir() -> PathBuf {
     PathBuf::from(home).join(".config").join("herdr-lazy")
 }
 
+/// The declared plugin list.
+///
+/// `HERDR_LAZY_LIST` moves it anywhere — the point being that a dotfiles user keeps it in
+/// their repo and points here, instead of the file living buried in herdr's plugin config
+/// dir mixed in with a cache they do not want to commit. Unset, it stays exactly where it
+/// always was, so nothing changes for anyone not asking for this.
 pub(crate) fn bundle_path() -> PathBuf {
+    if let Ok(p) = env::var("HERDR_LAZY_LIST") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
     config_dir().join("plugins.list")
 }
 
-/// The lock sits beside the bundle, not in a state dir.
+/// The lock sits beside the list, wherever the list is.
 ///
 /// It is generated, but it is also the file you copy to another machine to reproduce a
-/// setup — the same reasoning that puts Cargo.lock next to Cargo.toml. Keeping both in one
-/// directory also means there is exactly one location to reason about.
+/// setup — the same reasoning that puts Cargo.lock next to Cargo.toml. So a dotfiles user who
+/// moved their list into their repo gets the lock there too, both git-managed together.
 fn lock_path() -> PathBuf {
-    config_dir().join("plugins.lock")
+    lock_beside(&bundle_path())
+}
+
+/// The lock that belongs next to a given list. Split out so the "beside the list" rule can be
+/// tested without touching the environment the real path reads from.
+fn lock_beside(list: &Path) -> PathBuf {
+    list.with_file_name("plugins.lock")
 }
 
 fn ensure_parent(p: &Path) -> io::Result<()> {
@@ -160,6 +177,12 @@ pub(crate) fn desired_plugins() -> Vec<String> {
 /// the legacy file is left alone and nothing is overwritten. Copy rather than move, so a
 /// mistake here cannot lose the user's list.
 fn migrate_legacy_bundle() {
+    // When the location was chosen explicitly, do not auto-populate it. That path is likely a
+    // dotfiles repo, and silently writing a legacy list into it is not ours to do — `init` or
+    // `add` will, when the user asks.
+    if env::var("HERDR_LAZY_LIST").is_ok_and(|v| !v.is_empty()) {
+        return;
+    }
     let current = bundle_path();
     if current.exists() {
         return;
@@ -1921,6 +1944,20 @@ command = "something.else"
         );
         unsafe { env::remove_var("HERDR_SOCKET_PATH") };
         assert_eq!(herdr_config_path(), None, "no socket, no guessing");
+    }
+
+    #[test]
+    fn the_lock_always_sits_beside_the_list() {
+        // Wherever the list is moved, the lock follows into the same directory, so a dotfiles
+        // user gets both in their repo rather than the lock stranded in herdr's config dir.
+        assert_eq!(
+            lock_beside(Path::new("/home/me/dotfiles/herdr/plugins.list")),
+            Path::new("/home/me/dotfiles/herdr/plugins.lock")
+        );
+        assert_eq!(
+            lock_beside(Path::new("plugins.list")),
+            Path::new("plugins.lock")
+        );
     }
 
     #[test]

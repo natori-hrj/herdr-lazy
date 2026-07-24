@@ -131,8 +131,22 @@ pub(crate) fn today_days() -> i64 {
         .unwrap_or(0)
 }
 
+/// Where the marketplace cache lives.
+///
+/// A cache, not configuration — so it goes in the cache directory, not beside the list. This
+/// matters once `HERDR_LAZY_LIST` points the list into a dotfiles repo: a 140 KB marketplace
+/// dump appearing there on first browse, needing a `.gitignore` entry, is exactly the kind of
+/// mess this separation avoids. `XDG_CACHE_HOME` when set, else `~/.cache`.
 fn cache_path() -> PathBuf {
-    crate::config_dir().join("marketplace.json")
+    let base = std::env::var("XDG_CACHE_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            PathBuf::from(home).join(".cache")
+        });
+    base.join("herdr-lazy").join("marketplace.json")
 }
 
 fn cache_age_seconds() -> Option<u64> {
