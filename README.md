@@ -23,6 +23,9 @@ machine. herdr-lazy adds both.
   `i`/`u`/`x`/`r` as in lazy.nvim. Tick rows with space or a click to act on several at
   once, or act on just the row under the cursor when nothing is ticked. `?` shows the full
   keymap; the mouse scrolls and ticks.
+- **A list that tells you what each plugin is.** Every installed row shows its own one-line
+  description, so you can tell what you have and spot two plugins that do the same thing
+  without opening each one.
 - **A way to find out what you just installed.** Press `l` on any plugin to see what it
   does, which actions it offers, which panes it can open, and what makes it run on its own
   — then run an action right there.
