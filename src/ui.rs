@@ -119,6 +119,30 @@ struct Row {
     detail: Option<PluginDetail>,
 }
 
+impl Row {
+    /// What the trailing column shows: a status note when there is one, otherwise the
+    /// plugin's own description.
+    ///
+    /// The order is the whole design. A status note ("not installed", "updates available")
+    /// is about what to *do*; the description is about what the plugin *is*. When there is
+    /// something to do, that wins — you need to know a plugin is missing before you care what
+    /// it is for. When the row is healthy the description fills the space that used to be
+    /// blank, which is where "the name alone doesn't tell me what it does" came from.
+    fn trailing_text(&self) -> String {
+        if self.maybe_stale && self.status.note().is_empty() {
+            return "updates available — press l to see what changed".to_string();
+        }
+        let note = self.status.note();
+        if !note.is_empty() {
+            return note;
+        }
+        self.detail
+            .as_ref()
+            .map(|d| d.description.clone())
+            .unwrap_or_default()
+    }
+}
+
 /// The manifest facts worth showing a user who just installed seven plugins at once.
 #[derive(Debug, Clone, Default)]
 struct PluginDetail {
@@ -1294,12 +1318,10 @@ impl App {
             // before applying it — telling the user to update straight away skips the review
             // it exists to offer. `l` opens the details, which fetch and show what changed;
             // `u` is the step after they have decided.
-            let note = match (row.maybe_stale, row.status.note()) {
-                (true, n) if n.is_empty() => {
-                    "updates available — press l to see what changed".to_string()
-                }
-                (_, n) => n,
-            };
+            let note = row.trailing_text();
+            // The trailing text gets whatever width is left, so a narrow pane truncates the
+            // description rather than wrapping or pushing the row off-screen.
+            let trailing_width = (width as usize).saturating_sub(66);
             writeln!(
                 out,
                 "{} {}{}{}\x1b[0m {:<44} \x1b[2m{:<12}\x1b[0m{} {}\x1b[0m\r",
@@ -1313,7 +1335,7 @@ impl App {
                 if note.is_empty() {
                     String::new()
                 } else {
-                    format!("\x1b[2m{}\x1b[0m", note)
+                    format!("\x1b[2m{}\x1b[0m", truncate(&note, trailing_width))
                 },
             )?;
         }
@@ -2238,6 +2260,47 @@ mod tests {
         let r = rows_with_updates(&[], &installed, &market);
         assert_eq!(r.len(), 1);
         assert!(r[0].maybe_stale);
+    }
+
+    /// The description fills the trailing column only when the row is healthy — a status note
+    /// or an update hint always wins, because what to do beats what the plugin is.
+    #[test]
+    fn a_healthy_row_shows_its_description() {
+        let mut p = github("owner", "thing", SHA, true);
+        p.description = "does a useful thing".into();
+        let r = rows(&[Spec::parse("owner/thing")], &[p]);
+        assert_eq!(r[0].status, Status::Ok);
+        assert_eq!(r[0].trailing_text(), "does a useful thing");
+    }
+
+    #[test]
+    fn a_status_note_wins_over_the_description() {
+        // Missing: not installed, so there is no description anyway, and the note must show.
+        let r = rows(&[Spec::parse("owner/absent")], &[]);
+        assert_eq!(r[0].status, Status::Missing);
+        assert!(r[0].trailing_text().contains("not installed"));
+    }
+
+    #[test]
+    fn the_update_hint_wins_over_the_description() {
+        let mut p = github("owner", "thing", SHA, true);
+        p.description = "does a thing".into();
+        p.installed_unix_ms = Some(20_000 * 86_400_000);
+        let market = vec![crate::registry::Entry {
+            full_name: "owner/thing".into(),
+            pushed_at: "2024-10-05T00:00:00Z".into(),
+            ..Default::default()
+        }];
+        let r = rows_with_updates(&[Spec::parse("owner/thing")], &[p], &market);
+        assert!(r[0].maybe_stale);
+        assert!(r[0].trailing_text().contains("press l"));
+    }
+
+    #[test]
+    fn a_plugin_with_no_description_trails_nothing() {
+        let p = github("owner", "bare", SHA, true); // description defaults empty
+        let r = rows(&[Spec::parse("owner/bare")], &[p]);
+        assert_eq!(r[0].trailing_text(), "");
     }
 
     #[test]
