@@ -62,7 +62,7 @@ VERSION=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' herdr-plugin.toml | head -1
 
 case "$(uname -s)" in
     Darwin) OS="apple-darwin" ;;
-    Linux)  OS="unknown-linux-gnu" ;;
+    Linux)  OS="unknown-linux-musl" ;;
     *)      log "unrecognised OS $(uname -s)"; build_from_source ;;
 esac
 
