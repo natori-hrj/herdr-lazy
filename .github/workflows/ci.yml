@@ -14,14 +14,22 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: macos-latest
+            target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       # `--component` takes one value; a bare second name is parsed as a toolchain.
-      - run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup target add ${{ matrix.target }}
+      - if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --locked
+      - run: cargo clippy --all-targets --target ${{ matrix.target }} -- -D warnings
+      - run: cargo test --locked --target ${{ matrix.target }}
 
   # The declared MSRV is a promise; check it rather than letting it rot.
   msrv:
@@ -33,4 +41,6 @@ jobs:
           set -euo pipefail
           msrv=$(sed -n 's/^rust-version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -1)
           rustup toolchain install "$msrv" --profile minimal
-          cargo "+$msrv" test --locked
+          rustup target add x86_64-unknown-linux-musl --toolchain "$msrv"
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          cargo "+$msrv" test --locked --target x86_64-unknown-linux-musl
