@@ -300,6 +300,43 @@ normally one, so this also stops prune from removing the tool running it.
 
 Under-removing is recoverable. Uninstalling the wrong plugin is not.
 
+## Managing your list with dotfiles
+
+Your `plugins.list` is the whole declaration — one `owner/repo` per line — and `plugins.lock`
+is the exact commits it resolved to. Both are plain text, both belong in a dotfiles repo, and
+together they are all another machine needs.
+
+Point herdr-lazy at a file in your repo with `HERDR_LAZY_LIST`:
+
+```sh
+# in your shell profile, or a herdr-lazy env
+export HERDR_LAZY_LIST="$HOME/dotfiles/herdr/plugins.list"
+```
+
+The lock is written next to it (`plugins.lock`), so both live in your repo. The marketplace
+cache is kept out of the way in `$XDG_CACHE_HOME/herdr-lazy/` (or `~/.cache/herdr-lazy/`), so
+nothing you did not choose ends up staged.
+
+On a new machine:
+
+```sh
+git clone …/dotfiles && export HERDR_LAZY_LIST="$HOME/dotfiles/herdr/plugins.list"
+herdr-lazy restore     # the exact commits from plugins.lock
+# or: herdr-lazy sync   # the latest of whatever the list asks for
+```
+
+`restore` reproduces the lock commit-for-commit; `sync` installs the latest each entry
+resolves to. Commit both files after a change and the next machine is one command behind.
+
+### Nix
+
+herdr's own flake packages the CLI; plugins are herdr-lazy's job, not the flake's. There is no
+home-manager module yet — if that is something you would use, open an issue. In the meantime a
+Nix user can generate `plugins.list` from their config and set `HERDR_LAZY_LIST` to it, which
+keeps the plugin set declarative without herdr-lazy needing to know about Nix at all. Note that
+`auto-sync` installs on herdr startup, a side effect a purist may want off (it is off by
+default); `restore` in an activation script is the more Nix-shaped fit.
+
 ## The default bundle
 
 A distro is an opinion, so here is the reasoning rather than just the list. Two criteria,
