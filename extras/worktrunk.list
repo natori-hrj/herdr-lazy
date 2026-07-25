@@ -1,0 +1,3 @@
+# category: worktree
+# Switch git worktrees from a picker, with per-worktree setup. Needs the `worktrunk` CLI and fzf.
+devashish2203/herdr-worktrunk
