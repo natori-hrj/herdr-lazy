@@ -55,6 +55,35 @@ Self-submissions are fine and are judged the same way. Note that the current set
 plugins by this project's author, which is a fair thing to point at — the criteria above are
 the answer, and they apply to those entries too.
 
+## Adding a plugin to the extras
+
+Extras are opt-in categories — `init --extras worktree` — for capabilities the default set
+deliberately leaves out because the right answer depends on you: which worktree tool, which
+notifier. An extra is proposed by a pull request and judged against a checklist, the same way
+a default-set entry is. It differs from the default-set bar in one direction only: because an
+extra is opt-in, it is allowed to be an opinionated, personal choice.
+
+An extra earns its place when:
+
+1. **It installs cleanly.** The same rule as the default set, and just as non-negotiable — a
+   prebuilt binary or no build step. An install that fails under herdr's build PATH is not
+   made acceptable by being opt-in.
+2. **It is one coherent capability, not a category dump.** The unit is `worktrunk`, not "all
+   the worktree plugins". Naming an extra after a single job is what keeps `--extras worktree`
+   from installing three things that do the same thing.
+3. **Within a category, overlapping plugins are alternatives, not a stack.** If two plugins
+   both manage worktrees, they are two extras you choose between; enabling one must not pull
+   in the other. This is the default set's "swap, not add", applied to the menu.
+4. **Someone actually uses it, and it does what its description says.** The person proposing
+   it is the obvious someone — "I built this and use it daily" is a good way to open the PR.
+5. **Any external setup is stated up front.** If it needs a Slack app, an account, a running
+   service, or a CLI installed separately, the extra's one-line description says so. The point
+   of opting in is that the choice is informed.
+
+Self-submissions are welcome and held to exactly this list, and so are the maintainer's own
+plugins: being written by the author is not a reason to include something here, the same way
+it is not for the default set.
+
 ## Reporting a bug
 
 The useful ones tend to include:

@@ -22,6 +22,7 @@
 //! only its name can be compared), and `--prune` acts on Strong only.
 
 mod browse;
+mod extras;
 mod github;
 mod json;
 mod registry;
@@ -61,10 +62,8 @@ const DEFAULT_BUNDLE: &[&str] = &[
     "smarzban/herdr-file-viewer",               // git-aware read-only file pane
     "persiyanov/herdr-reviewr",                 // comment on an agent's diff, send it back
     "razajamil/herdr-plugin-workspace-manager", // per-workspace tab/pane layouts; no build step
-    // Gaps nothing else covers: keeping a human oriented across several running agents.
-    "natori-hrj/herdr-triage",  // which agent needs you most
-    "natori-hrj/herdr-green",   // did its tests pass when it finished
-    "natori-hrj/herdr-standup", // what all your agents actually changed
+    // Gap nothing else covers: keeping a human oriented across several running agents.
+    "natori-hrj/herdr-triage", // which agent needs you most
 ];
 
 fn herdr_bin() -> String {
@@ -574,8 +573,32 @@ fn cmd_probe() -> io::Result<()> {
     Ok(())
 }
 
-/// Write the curated default bundle (the distro layer).
-fn cmd_init(force: bool) -> io::Result<()> {
+/// Parse `--extras a,b` or `--extras=a,b` (repeatable) into a list of extra ids.
+fn extras_arg(rest: &[&str]) -> Vec<String> {
+    let split = |v: &str| {
+        v.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+    };
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        if let Some(v) = rest[i].strip_prefix("--extras=") {
+            out.extend(split(v));
+        } else if rest[i] == "--extras" {
+            if let Some(v) = rest.get(i + 1) {
+                out.extend(split(v));
+                i += 1;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Write the curated default bundle (the distro layer), plus any opt-in extras.
+fn cmd_init(force: bool, extra_ids: &[String]) -> io::Result<()> {
     let p = bundle_path();
     if p.exists() && !force {
         println!(
@@ -584,6 +607,24 @@ fn cmd_init(force: bool) -> io::Result<()> {
         );
         return Ok(());
     }
+
+    // Resolve requested extras before writing anything, so an unknown id fails fast rather than
+    // leaving a half-written bundle.
+    let mut chosen = Vec::new();
+    let mut unknown = Vec::new();
+    for id in extra_ids {
+        match extras::find(id) {
+            Some(e) => chosen.push(e),
+            None => unknown.push(id.as_str()),
+        }
+    }
+    if !unknown.is_empty() {
+        let known: Vec<&str> = extras::all().iter().map(|e| e.id).collect();
+        eprintln!("unknown extra(s): {}", unknown.join(", "));
+        eprintln!("available: {} (see `herdr-lazy extras`)", known.join(", "));
+        return Ok(());
+    }
+
     ensure_parent(&p)?;
     let mut body = String::new();
     body.push_str("# herdr-lazy bundle — your declarative plugin set.\n");
@@ -593,9 +634,61 @@ fn cmd_init(force: bool) -> io::Result<()> {
         body.push_str(d);
         body.push('\n');
     }
+
+    // Each extra's plugins go under a comment naming it, skipping anything the defaults already
+    // cover so a plugin is never listed twice.
+    let mut seen: Vec<String> = DEFAULT_BUNDLE.iter().map(|s| s.to_string()).collect();
+    for e in &chosen {
+        let fresh: Vec<&String> = e.plugins.iter().filter(|pl| !seen.contains(pl)).collect();
+        if fresh.is_empty() {
+            continue;
+        }
+        body.push_str("\n# extra: ");
+        body.push_str(e.id);
+        body.push_str(" — ");
+        body.push_str(&e.description);
+        body.push('\n');
+        for pl in fresh {
+            body.push_str(pl);
+            body.push('\n');
+            seen.push(pl.clone());
+        }
+    }
+
     fs::write(&p, body)?;
     println!("wrote curated default bundle -> {}", p.display());
+    if !chosen.is_empty() {
+        println!("with extras:");
+        for e in &chosen {
+            println!("  {} — {}", e.id, e.description);
+        }
+    }
     println!("edit it if you like, then run `herdr-lazy sync`.");
+    Ok(())
+}
+
+/// List the opt-in extras, grouped by category.
+fn cmd_extras() -> io::Result<()> {
+    let all = extras::all();
+    if all.is_empty() {
+        println!("no extras are defined.");
+        return Ok(());
+    }
+    println!("opt-in extras — add with `herdr-lazy init --extras <id,…>`:\n");
+    // Categories in first-seen order; a plain Vec is enough for a handful of entries.
+    let mut categories: Vec<String> = Vec::new();
+    for e in &all {
+        if !categories.iter().any(|c| c == &e.category) {
+            categories.push(e.category.clone());
+        }
+    }
+    for cat in &categories {
+        println!("{}:", cat);
+        for e in all.iter().filter(|e| &e.category == cat) {
+            println!("  {:<12} {}", e.id, e.description);
+        }
+        println!();
+    }
     Ok(())
 }
 
@@ -1513,7 +1606,8 @@ fn print_help() {
     println!("herdr-lazy — be lazy: a curated plugin distro & manager for herdr\n");
     println!("USAGE: herdr-lazy <command>\n");
     println!("  probe             verify the plugin <-> herdr CLI bridge (run this first)");
-    println!("  init [--force]    write the curated default bundle (the distro layer)");
+    println!("  init [--force] [--extras <id,…>]  write the default bundle (the distro layer)");
+    println!("  extras            list the opt-in extras you can pass to `init --extras`");
     println!("  list              show desired plugins");
     println!("  install [<repo>…] install what is missing, restore drifted pins");
     println!("  sync [--prune]    the same, plus --prune to remove what is not listed");
@@ -1535,7 +1629,8 @@ fn main() {
         "probe" => cmd_probe(),
         "startup" => cmd_startup(),
         "auto-sync" => cmd_auto_sync(rest.first().copied()),
-        "init" => cmd_init(rest.contains(&"--force")),
+        "init" => cmd_init(rest.contains(&"--force"), &extras_arg(&rest)),
+        "extras" => cmd_extras(),
         "list" => cmd_list(),
         // `install` is what people look for; `sync` is what the operation is. Both, rather
         // than choosing and leaving the other as a dead end.

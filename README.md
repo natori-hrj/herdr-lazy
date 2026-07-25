@@ -94,6 +94,9 @@ herdr-lazy list          # show what the list asks for
 herdr-lazy sync          # install what is missing
 herdr-lazy update        # move unpinned entries to their latest commit
 herdr-lazy sync --prune  # also uninstall anything not in the list
+
+herdr-lazy extras                    # list the opt-in extras
+herdr-lazy init --extras worktrunk   # defaults plus a chosen extra
 ```
 
 `sync` and `update` take plugin names to work on just those:
@@ -105,7 +108,8 @@ herdr-lazy update smarzban/herdr-file-viewer
 
 | command | what it does |
 |---|---|
-| `init [--force]` | write the curated default bundle |
+| `init [--force] [--extras <id,…>]` | write the curated default bundle, plus any opt-in extras |
+| `extras` | list the opt-in extras you can pass to `init --extras` |
 | `list` | show the desired plugin set |
 | `install [<repo>…]` | install what is missing, restore drifted pins |
 | `sync [<repo>…] [--prune]` | the same, plus `--prune` to uninstall what is not listed |
@@ -354,13 +358,10 @@ a file pane is a worse default than one.
 | [persiyanov/herdr-reviewr](https://github.com/persiyanov/herdr-reviewr) | review an agent's diff line by line and send comments back to it |
 | [razajamil/herdr-plugin-workspace-manager](https://github.com/razajamil/herdr-plugin-workspace-manager) | per-workspace tab/pane layouts, applied automatically |
 | [natori-hrj/herdr-triage](https://github.com/natori-hrj/herdr-triage) | ranks agents by who needs you most |
-| [natori-hrj/herdr-green](https://github.com/natori-hrj/herdr-green) | runs a project's tests when its agent finishes |
-| [natori-hrj/herdr-standup](https://github.com/natori-hrj/herdr-standup) | digest of what every agent actually changed |
 
-The last three are by this project's author. They are here because running several agents
-at once creates a problem the ecosystem does not otherwise address — knowing which one to
-look at, whether its work is sound, and what it did — not because of who wrote them. If
-that is not your problem, remove them.
+The last one is by this project's author. It is here because running several agents at once
+creates a problem the ecosystem does not otherwise address — knowing which one to look at —
+not because of who wrote it. If that is not your problem, remove it.
 
 A third criterion showed up during testing: it has to actually install. herdr runs plugin
 builds with a minimal PATH that excludes `~/.cargo/bin`, so a plugin whose build is a bare
@@ -378,6 +379,27 @@ depends on where you want to be pinged — not a decision a default set should m
 
 None of this is load-bearing: `init` just writes these lines into `plugins.list`. Edit it,
 or skip `init` and build your own with `add`.
+
+## Extras
+
+The default bundle stays out of choices that depend on you — which worktree tool, which
+notifier. Extras are how you opt into those, by name:
+
+```sh
+herdr-lazy extras                    # see what is on offer, grouped by category
+herdr-lazy init --extras worktrunk   # curated defaults, plus the worktrunk workflow
+```
+
+An extra is one coherent capability, not a category dump. Where two plugins do the same job
+they are two extras you choose between — `--extras` never stacks them, the same way the
+default set swaps rather than adds. Each extra's description names any external setup it needs
+(a CLI to install, a service to configure) so opting in is an informed choice.
+
+Extras are plain `owner/repo` lists under [`extras/`](extras/), embedded at build time, so
+listing one never touches the network. Adding an extra is a small, reviewed pull request —
+drop a file in `extras/` and add a line to the registry. The bar it clears is in
+[CONTRIBUTING.md](CONTRIBUTING.md#adding-a-plugin-to-the-extras), and it is the same bar for a
+contributor's plugin and the author's.
 
 ## Roadmap
 
