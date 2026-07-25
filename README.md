@@ -6,14 +6,21 @@ A declarative plugin **manager** and curated **distro** for [herdr](https://herd
 
 herdr installs plugins one imperative command at a time. There is no way to declare the
 set you want, and no lockfile — so a working setup cannot be reproduced on another
-machine. herdr-lazy adds both.
+machine.
+
+herdr-lazy replaces that with one file you own. `plugins.list` is a plain list of
+`owner/repo` lines: readable, editable by hand, keepable in git, copyable to another
+machine. Everything the tool does is a way to reach that file — `init` writes a good
+starting one, extras append curated bundles, `add` and `remove` edit it, the manage pane
+edits it on single keys — and `sync` makes your machine match it, at the exact commits the
+lockfile records.
 
 ![herdr-lazy: the manage pane, searching the marketplace and adding a plugin](docs/demo.gif)
 
 ## What it gives you
 
-- **A declarative plugin list.** One `owner/repo` per line. `sync` converges your
-  machine to it — installing what is missing, and (with `--prune`) removing the rest.
+- **A declarative plugin list.** `sync` converges your machine to it — installing what is
+  missing, and (with `--prune`) removing the rest.
 - **A real lockfile.** Entries pin to a commit, and the lock records the commit herdr
   actually checked out. Copy the lock to another machine, `sync`, and you get the same
   plugins at the same commits.
