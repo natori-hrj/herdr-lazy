@@ -265,6 +265,152 @@ fn rows_with_updates(
 const LIST_TOP: usize = 2;
 const BROWSER_TOP: usize = 3;
 
+/// One line of the extras picker. Categories are drawn but never landed on — a heading is not
+/// something you can add.
+enum PickerLine {
+    Category(String),
+    Item(PickerItem),
+}
+
+struct PickerItem {
+    extra: crate::extras::Extra,
+    /// Ticked for the bulk add, exactly as a list row is.
+    picked: bool,
+    /// Every plugin this extra names is already in the list, so applying it would do nothing.
+    listed: bool,
+}
+
+/// `e` — the opt-in extras, in the pane.
+///
+/// The CLI (`herdr-lazy extras`) prints the same menu, and the pane exists because that is the
+/// wrong place to browse a menu from: the README says the pane is the normal way to use this,
+/// and extras shipped without one.
+struct ExtrasPicker {
+    lines: Vec<PickerLine>,
+    /// Index into `lines`, always on an `Item` — `new` refuses to build an empty picker.
+    cursor: usize,
+}
+
+impl ExtrasPicker {
+    /// Build the menu, grouped by category in first-seen order — the same grouping the CLI
+    /// prints, so the two views cannot present the same data in two different shapes.
+    ///
+    /// `listed` is the repos already declared, so an extra you have can say so.
+    fn new(listed: &[String]) -> Option<ExtrasPicker> {
+        let mut remaining = crate::extras::all();
+        let mut categories: Vec<String> = Vec::new();
+        for e in &remaining {
+            if !categories.iter().any(|c| c == &e.category) {
+                categories.push(e.category.clone());
+            }
+        }
+        let mut lines = Vec::new();
+        for cat in categories {
+            let (mine, rest): (Vec<_>, Vec<_>) =
+                remaining.into_iter().partition(|e| e.category == cat);
+            remaining = rest;
+            lines.push(PickerLine::Category(cat));
+            for extra in mine {
+                let listed = extra.plugins.iter().all(|p| listed.iter().any(|l| l == p));
+                lines.push(PickerLine::Item(PickerItem {
+                    extra,
+                    picked: false,
+                    listed,
+                }));
+            }
+        }
+        let cursor = lines
+            .iter()
+            .position(|l| matches!(l, PickerLine::Item(_)))?;
+        Some(ExtrasPicker { lines, cursor })
+    }
+
+    fn items(&self) -> impl Iterator<Item = (usize, &PickerItem)> {
+        self.lines.iter().enumerate().filter_map(|(i, l)| match l {
+            PickerLine::Item(it) => Some((i, it)),
+            PickerLine::Category(_) => None,
+        })
+    }
+
+    fn count(&self) -> usize {
+        self.items().count()
+    }
+
+    /// Move to the next/previous item, stepping over headings and stopping at the ends.
+    fn move_cursor(&mut self, down: bool) {
+        let next = if down {
+            self.items().map(|(i, _)| i).find(|&i| i > self.cursor)
+        } else {
+            self.items()
+                .map(|(i, _)| i)
+                .filter(|&i| i < self.cursor)
+                .last()
+        };
+        if let Some(i) = next {
+            self.cursor = i;
+        }
+    }
+
+    /// Put the cursor on this line if it is an item. Used by clicks, which can land anywhere.
+    fn focus(&mut self, line: usize) -> bool {
+        if matches!(self.lines.get(line), Some(PickerLine::Item(_))) {
+            self.cursor = line;
+            return true;
+        }
+        false
+    }
+
+    /// How many lines fit, and which is at the top — shared by drawing and clicking, so the
+    /// two cannot disagree about what is on screen. The header is two lines, as in the list.
+    fn window(&self, height: u16) -> (usize, usize) {
+        let visible = (height as usize).saturating_sub(5).max(1);
+        let start = if self.cursor >= visible {
+            self.cursor - visible + 1
+        } else {
+            0
+        };
+        (visible, start)
+    }
+
+    /// Which line is under this screen row, if any.
+    fn line_at(&self, screen_row: u16, height: u16) -> Option<usize> {
+        let (visible, start) = self.window(height);
+        let y = screen_row as usize;
+        if y < LIST_TOP {
+            return None;
+        }
+        let idx = start + (y - LIST_TOP);
+        if y - LIST_TOP < visible && idx < self.lines.len() {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+
+    fn toggle(&mut self) {
+        if let Some(PickerLine::Item(it)) = self.lines.get_mut(self.cursor) {
+            it.picked = !it.picked;
+        }
+    }
+
+    /// What Enter applies: the ticked extras, or the one under the cursor when none are — the
+    /// same rule the list view uses for `i`/`u`/`x`.
+    fn targets(&self) -> Vec<&PickerItem> {
+        let picked: Vec<&PickerItem> = self
+            .items()
+            .map(|(_, it)| it)
+            .filter(|it| it.picked)
+            .collect();
+        if !picked.is_empty() {
+            return picked;
+        }
+        match self.lines.get(self.cursor) {
+            Some(PickerLine::Item(it)) => vec![it],
+            _ => Vec::new(),
+        }
+    }
+}
+
 /// `Default` so tests can build one from just the rows they care about; this struct grows a
 /// field per view, and every fixture should not have to know about all of them.
 #[derive(Default)]
@@ -272,6 +418,8 @@ struct App {
     rows: Vec<Row>,
     /// Present while the marketplace browser is open; the pane draws that instead of the list.
     browser: Option<crate::browse::Browser>,
+    /// Present while the extras picker is open, for the same reason.
+    extras: Option<ExtrasPicker>,
     /// `?` — the full keymap. The footer only has room for the common half.
     help: bool,
     /// Open details for the row at this index: what the plugin does and how to reach it.
@@ -313,6 +461,7 @@ impl App {
             Ok(installed) => App {
                 rows: rows_with_updates(&desired, &installed, &market),
                 browser: None,
+                extras: None,
                 help: false,
                 detail_of: None,
                 detail_cursor: 0,
@@ -326,6 +475,7 @@ impl App {
             Err(e) => App {
                 rows: Vec::new(),
                 browser: None,
+                extras: None,
                 help: false,
                 detail_of: None,
                 detail_cursor: 0,
@@ -342,9 +492,11 @@ impl App {
     fn refresh(&mut self) {
         let (cursor, flash) = (self.cursor, self.flash.take());
         let (browser, help) = (self.browser.take(), self.help);
+        let extras = self.extras.take();
         let changes = self.detail_changes.take();
         *self = App::load();
         self.browser = browser;
+        self.extras = extras;
         self.help = help;
         self.detail_changes = changes;
         self.cursor = cursor.min(self.rows.len().saturating_sub(1));
@@ -697,6 +849,26 @@ impl App {
             return Ok(());
         }
 
+        // The picker is drawn over the list, so it must consume the mouse too — otherwise a
+        // click lands on a row nobody can see, and the tick it leaves behind is still there
+        // when the picker closes.
+        if let Some(p) = self.extras.as_mut() {
+            match m.kind {
+                MouseEventKind::ScrollDown => p.move_cursor(true),
+                MouseEventKind::ScrollUp => p.move_cursor(false),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(line) = p.line_at(m.row, height) {
+                        if p.focus(line) {
+                            p.toggle();
+                            self.flash = None;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
         match m.kind {
             MouseEventKind::ScrollDown => {
                 if self.cursor + 1 < self.rows.len() {
@@ -823,6 +995,84 @@ impl App {
         });
     }
 
+    /// `e` — open the extras picker.
+    fn open_extras(&mut self) {
+        let listed: Vec<String> = crate::desired_plugins()
+            .iter()
+            .map(|l| crate::Spec::parse(l).repo)
+            .collect();
+        match ExtrasPicker::new(&listed) {
+            Some(p) => {
+                self.extras = Some(p);
+                self.flash = None;
+            }
+            None => self.flash = Some("no extras are defined".to_string()),
+        }
+    }
+
+    /// Enter, in the picker — write the chosen extras into the list, then show what arrived.
+    ///
+    /// Nothing is installed here. The rows that were just added come back ticked, so `i`
+    /// installs exactly them and no more — the one install path the pane already has, rather
+    /// than a second one that could drift from it.
+    fn apply_extras(&mut self) {
+        // Ids first, so the picker is no longer borrowed while the list is written.
+        let ids: Vec<String> = match self.extras.as_ref() {
+            Some(p) => p
+                .targets()
+                .iter()
+                .map(|it| it.extra.id.to_string())
+                .collect(),
+            None => return,
+        };
+        if ids.is_empty() {
+            return;
+        }
+        let mut added: Vec<String> = Vec::new();
+        for id in &ids {
+            let Some(e) = crate::extras::find(id) else {
+                continue;
+            };
+            match crate::add_extra_to_list(&e) {
+                Ok(fresh) => added.extend(fresh),
+                Err(err) => {
+                    self.flash = Some(format!("could not write the list: {}", err));
+                    return;
+                }
+            }
+        }
+
+        self.extras = None;
+        self.refresh();
+        let arrived: Vec<usize> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                added.iter().any(|name| {
+                    r.listed_as.as_deref() == Some(name.as_str())
+                        || r.slug.as_deref() == Some(name.as_str())
+                })
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if let Some(&first) = arrived.first() {
+            self.cursor = first;
+        }
+        for i in arrived {
+            self.rows[i].picked = true;
+        }
+        self.flash = Some(if added.is_empty() {
+            format!("{} — already in your list", ids.join(", "))
+        } else {
+            format!(
+                "added {} from {} — press i to install",
+                added.join(", "),
+                ids.join(", ")
+            )
+        });
+    }
+
     /// `d` — stop managing an entry. Never uninstalls; that is `x`.
     fn drop_selected(&mut self) {
         let Some(row) = self.selected() else { return };
@@ -849,6 +1099,9 @@ impl App {
         }
         if self.browser.is_some() {
             return self.draw_browser(out, width, height);
+        }
+        if self.extras.is_some() {
+            return self.draw_extras(out, width, height);
         }
         self.draw_list(out, width, height)
     }
@@ -1129,6 +1382,10 @@ impl App {
                     "/",
                     "search the marketplace — enter adds, ctrl+o opens the repo",
                 ),
+                (
+                    "e",
+                    "extras — opt-in picks, ticked with space and added with enter",
+                ),
             ],
         )?;
         section(
@@ -1219,6 +1476,67 @@ impl App {
             None => "\x1b[1m[enter]\x1b[0m add to your list  \x1b[1m[ctrl+o]\x1b[0m open repo  \
                      \x1b[1m[↑↓]\x1b[0m move  \x1b[1m[ctrl+r]\x1b[0m refresh  \
                      \x1b[1m[esc]\x1b[0m back"
+                .to_string(),
+        };
+        write!(
+            out,
+            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
+            height.saturating_sub(1),
+            rule,
+            footer
+        )?;
+        out.flush()
+    }
+
+    fn draw_extras(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        let p = self.extras.as_ref().expect("checked by caller");
+        let rule = "─".repeat((width as usize).clamp(20, 200));
+
+        write!(out, "\x1b[H\x1b[2J")?;
+        writeln!(
+            out,
+            "\x1b[1m extras\x1b[0m  \x1b[2m{} opt-in picks · space ticks, enter adds to your \
+             list\x1b[0m\r",
+            p.count()
+        )?;
+        writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
+
+        let (visible, start) = p.window(height);
+        for (i, line) in p.lines.iter().enumerate().skip(start).take(visible) {
+            match line {
+                PickerLine::Category(c) => writeln!(out, "   \x1b[2m{}\x1b[0m\r", c)?,
+                PickerLine::Item(it) => {
+                    let pointer = if i == p.cursor {
+                        "\x1b[7m>\x1b[0m"
+                    } else {
+                        " "
+                    };
+                    // Ticked is what enter will add; ✔ is what the list already has. Both are
+                    // needed at once — otherwise "add" on something you have looks like a
+                    // no-op you cannot explain.
+                    let tick = if it.picked {
+                        "\x1b[1m[x]\x1b[0m"
+                    } else {
+                        "[ ]"
+                    };
+                    let mark = if it.listed { "\x1b[32m✔\x1b[0m" } else { " " };
+                    writeln!(
+                        out,
+                        "{} {} {} {:<12} \x1b[2m{}\x1b[0m\r",
+                        pointer,
+                        tick,
+                        mark,
+                        truncate(it.extra.id, 12),
+                        truncate(&it.extra.description, width.saturating_sub(24) as usize)
+                    )?;
+                }
+            }
+        }
+
+        let footer = match &self.flash {
+            Some(msg) => format!("\x1b[36m{}\x1b[0m", msg),
+            None => "\x1b[1m[space]\x1b[0m tick  \x1b[1m[enter]\x1b[0m add to your list  \
+                     \x1b[1m[↑↓]\x1b[0m move  \x1b[1m[esc]\x1b[0m back"
                 .to_string(),
         };
         write!(
@@ -1353,6 +1671,7 @@ impl App {
             ("a", "adopt"),
             ("d", "drop"),
             ("/", "search"),
+            ("e", "extras"),
             ("?", "help"),
         ]
         .iter()
@@ -1604,6 +1923,35 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             continue;
         }
 
+        // The picker is a menu, not a text field, so plain letters can stay commands here —
+        // but it is still modal: nothing below may act on the list hidden behind it.
+        if app.extras.is_some() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    app.extras = None;
+                    app.flash = None;
+                }
+                KeyCode::Char(' ') => app.extras.as_mut().unwrap().toggle(),
+                // Enter, plus the raw bytes a pty may send instead of it — the same pair the
+                // browser handles, for the same reason.
+                KeyCode::Enter => app.apply_extras(),
+                KeyCode::Char('j') | KeyCode::Char('m')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    app.apply_extras()
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Ok(())
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    app.extras.as_mut().unwrap().move_cursor(true)
+                }
+                KeyCode::Char('k') | KeyCode::Up => app.extras.as_mut().unwrap().move_cursor(false),
+                _ => {}
+            }
+            continue;
+        }
+
         // The browser is a text field: printable keys type into it rather than acting as
         // commands, so its input is handled before the list's keymap is consulted.
         if app.browser.is_some() {
@@ -1742,6 +2090,7 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             }
             KeyCode::Char('d') => app.drop_selected(),
             KeyCode::Char('/') => app.open_browser(false),
+            KeyCode::Char('e') => app.open_extras(),
             KeyCode::Char('?') => app.help = true,
 
             // Keys lazy.nvim has that this does not. Rather than doing nothing — which reads
@@ -2301,6 +2650,98 @@ mod tests {
         let p = github("owner", "bare", SHA, true); // description defaults empty
         let r = rows(&[Spec::parse("owner/bare")], &[p]);
         assert_eq!(r[0].trailing_text(), "");
+    }
+
+    /// The picker is built from the real registry, so these exercise the shipped extras. They
+    /// assert shape, not membership — an extras/*.list added tomorrow must not fail them.
+    #[test]
+    fn the_picker_opens_on_an_extra_never_on_a_heading() {
+        let p = ExtrasPicker::new(&[]).expect("extras are registered");
+        assert!(matches!(p.lines.get(p.cursor), Some(PickerLine::Item(_))));
+        assert!(matches!(p.lines.first(), Some(PickerLine::Category(_))));
+        assert_eq!(p.count(), crate::extras::all().len());
+    }
+
+    /// Headings are drawn but not landed on, and the ends of the menu hold.
+    #[test]
+    fn the_cursor_steps_over_headings_and_stops_at_the_ends() {
+        let mut p = ExtrasPicker::new(&[]).expect("extras are registered");
+        let first = p.cursor;
+        p.move_cursor(false);
+        assert_eq!(p.cursor, first, "up at the top must stay put");
+        for _ in 0..p.lines.len() + 2 {
+            p.move_cursor(true);
+            assert!(matches!(p.lines.get(p.cursor), Some(PickerLine::Item(_))));
+        }
+        let last = p.cursor;
+        p.move_cursor(true);
+        assert_eq!(p.cursor, last, "down at the bottom must stay put");
+    }
+
+    /// Same rule as the list view: ticks if there are any, otherwise the cursor row.
+    #[test]
+    fn enter_applies_the_ticks_or_the_cursor() {
+        let mut p = ExtrasPicker::new(&[]).expect("extras are registered");
+        assert_eq!(p.targets().len(), 1);
+        let under_cursor = p.targets()[0].extra.id;
+        p.move_cursor(true);
+        p.toggle();
+        let ticked: Vec<&str> = p.targets().iter().map(|it| it.extra.id).collect();
+        assert_eq!(ticked.len(), 1);
+        assert_ne!(ticked[0], under_cursor, "the tick wins, not the cursor");
+        // Untick and the cursor is back in charge — this one is still under it.
+        p.toggle();
+        assert_eq!(p.targets()[0].extra.id, ticked[0]);
+    }
+
+    /// A click on a category line must do nothing at all — not move the cursor, not tick the
+    /// extra that happens to follow it.
+    #[test]
+    fn clicking_a_heading_neither_moves_nor_ticks() {
+        let mut p = ExtrasPicker::new(&[]).expect("extras are registered");
+        let heading = p
+            .lines
+            .iter()
+            .position(|l| matches!(l, PickerLine::Category(_)))
+            .expect("a heading exists");
+        let before = p.cursor;
+        assert!(!p.focus(heading));
+        assert_eq!(p.cursor, before);
+        assert!(p.items().all(|(_, it)| !it.picked));
+    }
+
+    /// Drawing it: every extra appears, under its category, with a box to tick. Narrow panes
+    /// are checked too, because the description column is sized by subtraction.
+    #[test]
+    fn the_picker_draws_every_extra_under_its_category() {
+        let app = App {
+            extras: ExtrasPicker::new(&[]),
+            ..Default::default()
+        };
+        for width in [100, 20] {
+            let mut buf = Vec::new();
+            app.draw_extras(&mut buf, width, 24).unwrap();
+            let out = String::from_utf8(buf).unwrap();
+            for e in crate::extras::all() {
+                assert!(out.contains(e.id), "{} missing at width {}", e.id, width);
+                assert!(out.contains(&e.category), "category missing at {}", width);
+            }
+            assert!(out.contains("[ ]"), "no tick box at width {}", width);
+        }
+    }
+
+    /// An extra you already have says so, so "add" on it is not a mystery no-op.
+    #[test]
+    fn an_extra_whose_plugins_are_all_listed_is_marked() {
+        let all = crate::extras::all();
+        let first = all.first().expect("extras are registered");
+        let p = ExtrasPicker::new(&first.plugins).expect("extras are registered");
+        let it = p
+            .items()
+            .map(|(_, it)| it)
+            .find(|it| it.extra.id == first.id)
+            .expect("the extra is in the menu");
+        assert!(it.listed);
     }
 
     #[test]

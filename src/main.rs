@@ -643,10 +643,8 @@ fn cmd_init(force: bool, extra_ids: &[String]) -> io::Result<()> {
         if fresh.is_empty() {
             continue;
         }
-        body.push_str("\n# extra: ");
-        body.push_str(e.id);
-        body.push_str(" — ");
-        body.push_str(&e.description);
+        body.push('\n');
+        body.push_str(&e.header());
         body.push('\n');
         for pl in fresh {
             body.push_str(pl);
@@ -1565,6 +1563,56 @@ pub(crate) fn add_to_list(spec: &str) -> io::Result<String> {
     Ok(format!("added {} to your list", spec))
 }
 
+/// Which of an extra's plugins a list does not already declare.
+///
+/// Compared by repo rather than by line, so an entry the user has pinned (`owner/repo@v1`)
+/// counts as present — re-adding it unpinned would quietly undo their pin on the next sync.
+fn fresh_plugins(e: &extras::Extra, existing: &[String]) -> Vec<String> {
+    let listed: Vec<String> = existing.iter().map(|l| Spec::parse(l).repo).collect();
+    e.plugins
+        .iter()
+        .filter(|pl| !listed.iter().any(|l| l == *pl))
+        .cloned()
+        .collect()
+}
+
+/// Append an extra's plugins to the list, under the comment naming it. Returns what was added,
+/// which is empty when the list already covers the whole extra.
+///
+/// Skipping what is already listed is what makes this safe to press twice: the same extra
+/// applied again is a no-op rather than a second copy of its entries. The header is only
+/// written when there is something to write under it, so a repeat leaves no orphan comment.
+pub(crate) fn add_extra_to_list(e: &extras::Extra) -> io::Result<Vec<String>> {
+    add_extra_at(&bundle_path(), e)
+}
+
+/// The whole of the above, against a given file — so the write can be tested against a real
+/// one without an environment variable that other tests would race on.
+fn add_extra_at(p: &Path, e: &extras::Extra) -> io::Result<Vec<String>> {
+    let fresh = fresh_plugins(e, &read_lines(p));
+    if fresh.is_empty() {
+        return Ok(fresh);
+    }
+    ensure_parent(p)?;
+    let mut body = fs::read_to_string(p).unwrap_or_default();
+    // A blank line separates the block from what is above it — but only when there is
+    // something above it, so a list created by this does not start with an empty line.
+    if !body.is_empty() {
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push('\n');
+    }
+    body.push_str(&e.header());
+    body.push('\n');
+    for pl in &fresh {
+        body.push_str(pl);
+        body.push('\n');
+    }
+    fs::write(p, body)?;
+    Ok(fresh)
+}
+
 /// Drop an entry from the list. Does NOT uninstall — that is `sync --prune`.
 pub(crate) fn remove_from_list(spec: &str) -> io::Result<String> {
     let p = bundle_path();
@@ -2138,6 +2186,90 @@ command = "something.else"
         assert_eq!(
             p.matches(&Spec::parse("owner/repo/plugins/wm")),
             Match::Strong
+        );
+    }
+
+    fn extra(plugins: &[&str]) -> extras::Extra {
+        extras::Extra {
+            id: "worktrunk",
+            category: "worktree".to_string(),
+            description: "switch worktrees from a picker".to_string(),
+            plugins: plugins.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn an_extra_only_adds_what_the_list_does_not_have() {
+        let existing = vec!["owner/have".to_string()];
+        assert_eq!(
+            fresh_plugins(&extra(&["owner/have", "owner/new"]), &existing),
+            vec!["owner/new".to_string()]
+        );
+    }
+
+    /// Applying an extra twice must be a no-op, not a second copy of its entries.
+    #[test]
+    fn an_extra_already_listed_adds_nothing() {
+        let existing = vec!["owner/have".to_string()];
+        assert!(fresh_plugins(&extra(&["owner/have"]), &existing).is_empty());
+    }
+
+    /// A pinned entry is the same plugin. Re-adding it unpinned would undo the pin, which is
+    /// the one way this feature could take something away from a user rather than add to it.
+    #[test]
+    fn a_pinned_entry_counts_as_already_listed() {
+        let existing = vec!["owner/have@v1.2.0".to_string()];
+        assert!(fresh_plugins(&extra(&["owner/have"]), &existing).is_empty());
+    }
+
+    /// A path of our own in the temp directory, named after the test so two never collide.
+    fn scratch_list(name: &str) -> PathBuf {
+        let p = env::temp_dir().join(format!("herdr-lazy-{}-{}.list", std::process::id(), name));
+        let _ = fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn applying_an_extra_appends_it_under_a_comment_naming_it() {
+        let p = scratch_list("append");
+        fs::write(&p, "owner/already\n").unwrap();
+        let added = add_extra_at(&p, &extra(&["owner/already", "owner/new"])).unwrap();
+        assert_eq!(added, vec!["owner/new".to_string()]);
+        assert_eq!(
+            fs::read_to_string(&p).unwrap(),
+            "owner/already\n\n# extra: worktrunk — switch worktrees from a picker\nowner/new\n"
+        );
+        let _ = fs::remove_file(&p);
+    }
+
+    /// The picker cannot stop someone pressing enter twice, so the write has to be idempotent —
+    /// no duplicate entry, and no orphan comment with nothing under it.
+    #[test]
+    fn applying_the_same_extra_twice_changes_nothing_the_second_time() {
+        let p = scratch_list("twice");
+        let e = extra(&["owner/new"]);
+        add_extra_at(&p, &e).unwrap();
+        let after_first = fs::read_to_string(&p).unwrap();
+        assert!(add_extra_at(&p, &e).unwrap().is_empty());
+        assert_eq!(fs::read_to_string(&p).unwrap(), after_first);
+        let _ = fs::remove_file(&p);
+    }
+
+    /// Applied to a list that does not exist yet, the file must not open with a blank line.
+    #[test]
+    fn a_list_created_by_an_extra_starts_with_the_comment() {
+        let p = scratch_list("fresh");
+        add_extra_at(&p, &extra(&["owner/new"])).unwrap();
+        assert!(fs::read_to_string(&p).unwrap().starts_with("# extra: "));
+        let _ = fs::remove_file(&p);
+    }
+
+    /// Both writers of the list use this one line, so it is worth pinning down.
+    #[test]
+    fn the_extra_comment_names_the_extra_and_what_it_is_for() {
+        assert_eq!(
+            extra(&["owner/repo"]).header(),
+            "# extra: worktrunk — switch worktrees from a picker"
         );
     }
 }
