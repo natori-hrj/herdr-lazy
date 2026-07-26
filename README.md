@@ -39,7 +39,7 @@ lockfile records.
 - **Marketplace search, in the pane.** Press `/` to search all published herdr plugins by
   name, description or topic, and add one to your list without leaving the terminal.
 - **A curated default set.** `init` writes a starting bundle so a fresh herdr is useful
-  immediately.
+  immediately, and `e` in the pane opens the opt-in extras on top of it.
 
 herdr-lazy is itself a herdr plugin: it drives the herdr CLI (via `HERDR_BIN_PATH`) to
 manage the *other* plugins.
@@ -116,7 +116,7 @@ herdr-lazy update smarzban/herdr-file-viewer
 | command | what it does |
 |---|---|
 | `init [--force] [--extras <id,…>]` | write the curated default bundle, plus any opt-in extras |
-| `extras` | list the opt-in extras you can pass to `init --extras` |
+| `extras` | list the opt-in extras (`e` in the pane picks them interactively) |
 | `list` | show the desired plugin set |
 | `install [<repo>…]` | install what is missing, restore drifted pins |
 | `sync [<repo>…] [--prune]` | the same, plus `--prune` to uninstall what is not listed |
@@ -390,7 +390,14 @@ or skip `init` and build your own with `add`.
 ## Extras
 
 The default bundle stays out of choices that depend on you — which worktree tool, which
-notifier. Extras are how you opt into those, by name:
+notifier. Extras are how you opt into those.
+
+Press `e` in the pane for the menu: space ticks the ones you want, enter adds them to your
+list, and they come back ticked in the list itself so `i` installs exactly those. A `✔` marks
+an extra you already have. Nothing is installed by the picker — adding to the list is still a
+separate step from running someone's build.
+
+The same menu, from a shell:
 
 ```sh
 herdr-lazy extras                    # see what is on offer, grouped by category

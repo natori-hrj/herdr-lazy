@@ -18,6 +18,17 @@ pub(crate) struct Extra {
     pub plugins: Vec<String>,
 }
 
+impl Extra {
+    /// The comment written above an extra's plugins in `plugins.list`.
+    ///
+    /// One function because two callers write it — `init --extras` builds a fresh list, the
+    /// pane appends to an existing one — and a list where the same extra is labelled two ways
+    /// is a list nobody can read.
+    pub(crate) fn header(&self) -> String {
+        format!("# extra: {} — {}", self.id, self.description)
+    }
+}
+
 /// `(id, embedded definition)`. Add an extra by dropping `extras/<id>.list` and a line here.
 const REGISTRY: &[(&str, &str)] = &[
     ("pluck", include_str!("../extras/pluck.list")),
