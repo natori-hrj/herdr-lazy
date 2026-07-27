@@ -29,3 +29,12 @@ path = "src/main.rs"
 # hand-drawing, ratatui layers on top rather than replacing anything.
 [dependencies]
 crossterm = { version = "0.29", default-features = false, features = ["events"] }
+
+# crossterm's `windows` feature is not optional on Windows — it gates the
+# winapi/crossterm_winapi backends, and the crate hard-fails the build with
+# `compile_error!` when it is absent. default-features = false drops it, so it
+# has to come back explicitly for the Windows target. The feature only pulls
+# dependencies that crossterm itself declares under cfg(windows), so scoping it
+# here keeps the Unix dependency graph exactly as it was.
+[target.'cfg(windows)'.dependencies]
+crossterm = { version = "0.29", default-features = false, features = ["events", "windows"] }
