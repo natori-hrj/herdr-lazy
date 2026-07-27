@@ -418,6 +418,7 @@ fn parse_plugin_list(stdout: &str) -> Result<Vec<Installed>, String> {
                     .and_then(|a| a.as_array())
                     .map(|a| {
                         a.iter()
+                            .filter(|x| runs_here(x))
                             .map(|x| {
                                 (
                                     x.str_field("id").unwrap_or_default().to_string(),
@@ -432,6 +433,7 @@ fn parse_plugin_list(stdout: &str) -> Result<Vec<Installed>, String> {
                     .and_then(|a| a.as_array())
                     .map(|a| {
                         a.iter()
+                            .filter(|x| runs_here(x))
                             .map(|x| {
                                 (
                                     x.str_field("id").unwrap_or_default().to_string(),
@@ -921,23 +923,109 @@ fn bootstrap_if_first_run() {
     let all: Vec<Spec> = desired_plugins().iter().map(|l| Spec::parse(l)).collect();
     install_missing(&all, &installed);
 
-    match bind_action(
-        PLUGIN_ID,
-        &BindTarget::Action("manage".to_string()),
-        BOOTSTRAP_KEY,
-    ) {
-        Ok(msg) => println!("  {}", msg),
-        // A refusal here is the safe outcome, not a failure: the key was already taken, or
-        // there is no config.toml to write. Say what to press instead of dying quietly.
-        Err(msg) => {
-            println!("  did not bind {}: {}", BOOTSTRAP_KEY, msg);
-            println!("  open the pane with: herdr plugin pane open --plugin herdr-lazy --entrypoint manage");
-        }
+    // The action id is read back from herdr rather than hardcoded — see `platform_variant`.
+    let action = installed
+        .iter()
+        .find(|p| is_self(p))
+        .and_then(|me| platform_variant(me.actions.iter().map(|(id, _)| id.as_str()), "manage"));
+    match action {
+        Some(id) => match bind_action(PLUGIN_ID, &BindTarget::Action(id), BOOTSTRAP_KEY) {
+            Ok(msg) => println!("  {}", msg),
+            // A refusal here is the safe outcome, not a failure: the key was already taken, or
+            // there is no config.toml to write. Say what to press instead of dying quietly.
+            Err(msg) => {
+                println!("  did not bind {}: {}", BOOTSTRAP_KEY, msg);
+                println!("  open the pane with: {}", manage_pane_command(&installed));
+            }
+        },
+        None => println!(
+            "  no manage action registered for this platform — open the pane with: {}",
+            manage_pane_command(&installed)
+        ),
     }
 
     let _ = ensure_parent(&marker);
     let _ = fs::write(&marker, DONE_MARKER);
     println!("  done — press {} to manage your plugins.", BOOTSTRAP_KEY);
+}
+
+/// What herdr calls the platform we are running on, for comparing against a manifest's
+/// `platforms`. herdr's own vocabulary, not Rust's — `macos`, not `darwin`.
+fn current_platform() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
+    }
+}
+
+/// Can this action or pane run on this machine?
+///
+/// `plugin list --json` reports every entry a plugin declares, including the ones gated to
+/// other platforms — herdr filters at *invocation* (`platform_unsupported`), not in the
+/// listing. Since a plugin that supports Windows has to declare separate entries with their
+/// own ids, an unfiltered listing shows the same action twice under the same title, half of
+/// which refuse to run. Filtering here means every reader of `Installed` — the details view,
+/// the bind menu, the first-run bootstrap — sees only what this machine can actually do.
+///
+/// No `platforms` means every platform, which is how most manifests are written.
+fn runs_here(entry: &json::Value) -> bool {
+    match entry.get("platforms").and_then(|p| p.as_array()) {
+        Some(ps) if !ps.is_empty() => ps
+            .iter()
+            .filter_map(|p| p.as_str())
+            .any(|p| p == current_platform()),
+        _ => true,
+    }
+}
+
+/// The id herdr registered for one of our own entries on *this* platform.
+///
+/// Not a constant, because it is not the same everywhere. herdr rejects duplicate action and
+/// pane ids even when the entries are gated to platforms that cannot overlap, so a platform
+/// needing a differently-shaped command needs a differently-named entry too — `manage` on
+/// Unix, `manage-windows` on Windows. Binding the wrong one produces a key that reports
+/// success and does nothing, since the refusal (`platform_unsupported`) happens later, at a
+/// keypress, where nobody sees it.
+///
+/// The candidates come from `Installed`, which `runs_here` has already narrowed to this
+/// platform — so this only has to tolerate the naming, not decide the platform. An exact match
+/// wins; otherwise the first `<base>-<suffix>` variant.
+fn platform_variant<'a>(ids: impl Iterator<Item = &'a str>, base: &str) -> Option<String> {
+    let mut variant = None;
+    for id in ids {
+        if id == base {
+            return Some(id.to_string());
+        }
+        if id
+            .strip_prefix(base)
+            .is_some_and(|rest| rest.starts_with('-'))
+            && variant.is_none()
+        {
+            variant = Some(id.to_string());
+        }
+    }
+    variant
+}
+
+/// The command that opens our manage pane by hand, for a message telling someone to run it.
+fn manage_pane_command(installed: &[Installed]) -> String {
+    let id = installed
+        .iter()
+        .find(|p| is_self(p))
+        .and_then(|me| platform_variant(me.panes.iter().map(|(id, _, _)| id.as_str()), "manage"))
+        .unwrap_or_else(|| "manage".to_string());
+    format!(
+        "herdr plugin pane open --plugin {} --entrypoint {} --focus",
+        PLUGIN_ID, id
+    )
+}
+
+/// The same, for a caller that has not already asked herdr what is installed.
+pub(crate) fn manage_pane_hint() -> String {
+    manage_pane_command(&installed_plugins().unwrap_or_default())
 }
 
 const DONE_MARKER: &str = "herdr-lazy set this machine up once; delete this file to redo it\n";
@@ -2311,6 +2399,52 @@ command = "something.else"
 
     /// `init` and the first-run bootstrap write the same file, so a new machine and an explicit
     /// init cannot disagree about what the curated set is.
+    /// Verbatim shape of a plugin that supports Windows: herdr lists every declared entry,
+    /// including the ones gated elsewhere, and each carries its own `platforms`.
+    const WINDOWS_TWINS: &str = r#"{"id":"cli:plugin","result":{"plugins":[{"plugin_id":"herdr-lazy","name":"herdr-lazy","enabled":true,"source":{"kind":"github","owner":"natori-hrj","repo":"herdr-lazy"},"actions":[{"id":"probe","title":"Lazy: probe CLI bridge","platforms":["linux","macos"],"command":["./target/release/herdr-lazy","probe"]},{"id":"probe-windows","title":"Lazy: probe CLI bridge","platforms":["windows"],"command":["powershell","-Command","probe"]},{"id":"everywhere","title":"No platforms declared"}],"panes":[{"id":"manage","title":"herdr-lazy","placement":"overlay","platforms":["linux","macos"]},{"id":"manage-windows","title":"herdr-lazy","placement":"overlay","platforms":["windows"]}]}],"type":"plugin_list"}}"#;
+
+    /// The listing is not filtered by herdr, so it is filtered here. Without this, a plugin
+    /// that supports Windows shows every action twice under the same title on macOS, and half
+    /// of them refuse to run (`platform_unsupported`).
+    #[test]
+    fn entries_for_other_platforms_are_not_shown() {
+        let ps = parse_plugin_list(WINDOWS_TWINS).expect("payload should parse");
+        let ids: Vec<&str> = ps[0].actions.iter().map(|(id, _)| id.as_str()).collect();
+        let panes: Vec<&str> = ps[0].panes.iter().map(|(id, _, _)| id.as_str()).collect();
+
+        // An entry declaring no platforms runs everywhere, which is how most manifests read.
+        assert!(ids.contains(&"everywhere"));
+        if cfg!(target_os = "windows") {
+            assert_eq!(ids, vec!["probe-windows", "everywhere"]);
+            assert_eq!(panes, vec!["manage-windows"]);
+        } else {
+            assert_eq!(ids, vec!["probe", "everywhere"]);
+            assert_eq!(panes, vec!["manage"]);
+        }
+    }
+
+    /// The listing is filtered before this sees it, so exactly one `manage` survives — but its
+    /// id still differs by platform, which is what this resolves.
+    #[test]
+    fn an_ids_platform_variant_is_found_and_an_exact_match_wins() {
+        assert_eq!(
+            platform_variant(["probe", "init", "manage"].into_iter(), "manage"),
+            Some("manage".to_string())
+        );
+        assert_eq!(
+            platform_variant(["probe-windows", "manage-windows"].into_iter(), "manage"),
+            Some("manage-windows".to_string())
+        );
+        // An exact match wins wherever it sits, so a platform registering both is not a toss-up.
+        assert_eq!(
+            platform_variant(["manage-windows", "manage"].into_iter(), "manage"),
+            Some("manage".to_string())
+        );
+        // A name that merely starts with the base is not a variant of it.
+        assert_eq!(platform_variant(["managed"].into_iter(), "manage"), None);
+        assert_eq!(platform_variant([].into_iter(), "manage"), None);
+    }
+
     #[test]
     fn the_bootstrap_writes_the_same_list_init_does() {
         let body = default_bundle_body(&[]);
