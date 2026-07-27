@@ -1797,7 +1797,7 @@ pub(crate) fn run() -> io::Result<()> {
         eprintln!();
         eprintln!("If you ran this as a herdr plugin action or keybinding: actions get no PTY.");
         eprintln!("Open the pane instead:");
-        eprintln!("  herdr plugin pane open --plugin herdr-lazy --entrypoint manage");
+        eprintln!("  {}", crate::manage_pane_hint());
         return Ok(());
     }
     // Alternate screen, hide cursor, and capture mouse. Mouse is opt-out at the terminal

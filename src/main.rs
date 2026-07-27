@@ -418,6 +418,7 @@ fn parse_plugin_list(stdout: &str) -> Result<Vec<Installed>, String> {
                     .and_then(|a| a.as_array())
                     .map(|a| {
                         a.iter()
+                            .filter(|x| runs_here(x))
                             .map(|x| {
                                 (
                                     x.str_field("id").unwrap_or_default().to_string(),
@@ -432,6 +433,7 @@ fn parse_plugin_list(stdout: &str) -> Result<Vec<Installed>, String> {
                     .and_then(|a| a.as_array())
                     .map(|a| {
                         a.iter()
+                            .filter(|x| runs_here(x))
                             .map(|x| {
                                 (
                                     x.str_field("id").unwrap_or_default().to_string(),
@@ -598,6 +600,41 @@ fn extras_arg(rest: &[&str]) -> Vec<String> {
 }
 
 /// Write the curated default bundle (the distro layer), plus any opt-in extras.
+/// The list `init` writes: the curated defaults, then any chosen extras under their comments.
+///
+/// A function rather than inline, because the first-run bootstrap writes the same file. A new
+/// machine and an explicit `init` must produce the same list, or "it worked on my laptop"
+/// becomes a real answer.
+fn default_bundle_body(chosen: &[extras::Extra]) -> String {
+    let mut body = String::new();
+    body.push_str("# herdr-lazy bundle — your declarative plugin set.\n");
+    body.push_str("# One `owner/repo` per line. `#` starts a comment.\n");
+    body.push_str("# Curated defaults below; edit to taste, then run `herdr-lazy sync`.\n\n");
+    for d in DEFAULT_BUNDLE {
+        body.push_str(d);
+        body.push('\n');
+    }
+
+    // Each extra's plugins go under a comment naming it, skipping anything the defaults already
+    // cover so a plugin is never listed twice.
+    let mut seen: Vec<String> = DEFAULT_BUNDLE.iter().map(|s| s.to_string()).collect();
+    for e in chosen {
+        let fresh: Vec<&String> = e.plugins.iter().filter(|pl| !seen.contains(pl)).collect();
+        if fresh.is_empty() {
+            continue;
+        }
+        body.push('\n');
+        body.push_str(&e.header());
+        body.push('\n');
+        for pl in fresh {
+            body.push_str(pl);
+            body.push('\n');
+            seen.push(pl.clone());
+        }
+    }
+    body
+}
+
 fn cmd_init(force: bool, extra_ids: &[String]) -> io::Result<()> {
     let p = bundle_path();
     if p.exists() && !force {
@@ -626,34 +663,7 @@ fn cmd_init(force: bool, extra_ids: &[String]) -> io::Result<()> {
     }
 
     ensure_parent(&p)?;
-    let mut body = String::new();
-    body.push_str("# herdr-lazy bundle — your declarative plugin set.\n");
-    body.push_str("# One `owner/repo` per line. `#` starts a comment.\n");
-    body.push_str("# Curated defaults below; edit to taste, then run `herdr-lazy sync`.\n\n");
-    for d in DEFAULT_BUNDLE {
-        body.push_str(d);
-        body.push('\n');
-    }
-
-    // Each extra's plugins go under a comment naming it, skipping anything the defaults already
-    // cover so a plugin is never listed twice.
-    let mut seen: Vec<String> = DEFAULT_BUNDLE.iter().map(|s| s.to_string()).collect();
-    for e in &chosen {
-        let fresh: Vec<&String> = e.plugins.iter().filter(|pl| !seen.contains(pl)).collect();
-        if fresh.is_empty() {
-            continue;
-        }
-        body.push('\n');
-        body.push_str(&e.header());
-        body.push('\n');
-        for pl in fresh {
-            body.push_str(pl);
-            body.push('\n');
-            seen.push(pl.clone());
-        }
-    }
-
-    fs::write(&p, body)?;
+    fs::write(&p, default_bundle_body(&chosen))?;
     println!("wrote curated default bundle -> {}", p.display());
     if !chosen.is_empty() {
         println!("with extras:");
@@ -801,6 +811,7 @@ fn pending_work(all: &[Spec], installed: &[Installed]) -> Vec<Spec> {
 /// Opt-in: does nothing unless `auto_sync` is enabled, because a plugin that installs other
 /// software when herdr starts is not something to turn on by surprise.
 fn cmd_startup() -> io::Result<()> {
+    bootstrap_if_first_run();
     if !auto_sync_enabled() {
         return Ok(()); // silent: the hook fires for everyone, most have not opted in
     }
@@ -812,23 +823,32 @@ fn cmd_startup() -> io::Result<()> {
         Ok(v) => v,
         Err(_) => return Ok(()), // herdr not answering yet; try again next start
     };
+    install_missing(&all, &installed);
+    Ok(())
+}
 
-    let pending = pending_work(&all, &installed);
+/// Install the entries that are absent, and refresh the lock.
+///
+/// Only what is absent. A drifted pin is a deliberate-looking state that `sync` repairs on
+/// request; silently rewriting it at every launch would be a surprise.
+///
+/// Shared by startup auto-sync and the first-run bootstrap so the two cannot converge a
+/// machine differently.
+fn install_missing(all: &[Spec], installed: &[Installed]) -> usize {
+    let pending = pending_work(all, installed);
     let missing: Vec<&Spec> = pending
         .iter()
         .filter(|spec| !installed.iter().any(|p| p.matches(spec) != Match::None))
         .collect();
-
     if missing.is_empty() {
-        return Ok(()); // already converged, or the only gaps are drifted pins (left alone)
+        return 0;
     }
 
-    // Only install what is absent. A drifted pin is a deliberate-looking state that `sync`
-    // repairs on request; silently rewriting it at every launch would be a surprise.
     println!(
         "herdr-lazy: installing {} plugin(s) declared in your list…",
         missing.len()
     );
+    let mut done = 0;
     for spec in missing {
         let mut args = vec!["plugin", "install", spec.repo.as_str()];
         if let Some(r) = &spec.reference {
@@ -837,16 +857,187 @@ fn cmd_startup() -> io::Result<()> {
         }
         args.push("--yes");
         match run_herdr(&args) {
-            Ok((true, _, _)) => println!("  installed {}", spec.display()),
+            Ok((true, _, _)) => {
+                done += 1;
+                println!("  installed {}", spec.display())
+            }
             Ok((false, _, err)) => println!("  FAILED {}: {}", spec.display(), err.trim()),
             Err(e) => println!("  could not run herdr: {}", e),
         }
     }
     // Refresh the lock so it reflects what is now installed.
     if let Ok(after) = installed_plugins() {
-        let _ = write_lock(&all, &after);
+        let _ = write_lock(all, &after);
     }
-    Ok(())
+    done
+}
+
+/// The key the bootstrap binds. Shift, because herdr's own defaults live on `prefix+<letter>`
+/// and are not exposed by the CLI — staying out of that range is the only way to be sure
+/// nothing is shadowed. `l` for lazy; the README has documented this key since the beginning.
+const BOOTSTRAP_KEY: &str = "prefix+shift+l";
+
+/// Set a fresh machine up on the first herdr start after installing: write the list, install
+/// what it names, and bind a key to the manage pane.
+///
+/// Without this, installing a plugin that calls itself a batteries-included distro leaves you
+/// with an empty list and no way to open the pane — herdr has no command palette, and a
+/// manifest cannot declare a keybinding, so nothing tells you the tool is there. Installing
+/// herdr-lazy is the consent; this is what it consented to.
+///
+/// The opinion stays opt-in for everyone else, because this fires only on a machine that has
+/// plainly never been set up: see `is_first_run`. It also never runs twice, and it never takes
+/// a key that is already spoken for.
+fn bootstrap_if_first_run() {
+    if env::var("HERDR_LAZY_NO_BOOTSTRAP").is_ok_and(|v| !v.is_empty()) {
+        return;
+    }
+    let marker = config_dir().join("bootstrapped");
+    if marker.exists() {
+        return;
+    }
+    // A list means this machine has been set up, whatever else is true. Record the decision so
+    // the check below — which costs a round trip to herdr — never runs again.
+    if bundle_path().exists() {
+        let _ = ensure_parent(&marker);
+        let _ = fs::write(&marker, DECLINED_MARKER);
+        return;
+    }
+    let Ok(installed) = installed_plugins() else {
+        return; // herdr not answering yet; try again next start
+    };
+    if !is_first_run(&installed) {
+        let _ = ensure_parent(&marker);
+        let _ = fs::write(&marker, DECLINED_MARKER);
+        return;
+    }
+
+    println!("herdr-lazy: first run — setting up.");
+    let p = bundle_path();
+    if ensure_parent(&p).is_err() || fs::write(&p, default_bundle_body(&[])).is_err() {
+        println!("  could not write {} — stopping here.", p.display());
+        return;
+    }
+    println!("  wrote {}", p.display());
+
+    let all: Vec<Spec> = desired_plugins().iter().map(|l| Spec::parse(l)).collect();
+    install_missing(&all, &installed);
+
+    // The action id is read back from herdr rather than hardcoded — see `platform_variant`.
+    let action = installed
+        .iter()
+        .find(|p| is_self(p))
+        .and_then(|me| platform_variant(me.actions.iter().map(|(id, _)| id.as_str()), "manage"));
+    match action {
+        Some(id) => match bind_action(PLUGIN_ID, &BindTarget::Action(id), BOOTSTRAP_KEY) {
+            Ok(msg) => println!("  {}", msg),
+            // A refusal here is the safe outcome, not a failure: the key was already taken, or
+            // there is no config.toml to write. Say what to press instead of dying quietly.
+            Err(msg) => {
+                println!("  did not bind {}: {}", BOOTSTRAP_KEY, msg);
+                println!("  open the pane with: {}", manage_pane_command(&installed));
+            }
+        },
+        None => println!(
+            "  no manage action registered for this platform — open the pane with: {}",
+            manage_pane_command(&installed)
+        ),
+    }
+
+    let _ = ensure_parent(&marker);
+    let _ = fs::write(&marker, DONE_MARKER);
+    println!("  done — press {} to manage your plugins.", BOOTSTRAP_KEY);
+}
+
+/// What herdr calls the platform we are running on, for comparing against a manifest's
+/// `platforms`. herdr's own vocabulary, not Rust's — `macos`, not `darwin`.
+fn current_platform() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
+    }
+}
+
+/// Can this action or pane run on this machine?
+///
+/// `plugin list --json` reports every entry a plugin declares, including the ones gated to
+/// other platforms — herdr filters at *invocation* (`platform_unsupported`), not in the
+/// listing. Since a plugin that supports Windows has to declare separate entries with their
+/// own ids, an unfiltered listing shows the same action twice under the same title, half of
+/// which refuse to run. Filtering here means every reader of `Installed` — the details view,
+/// the bind menu, the first-run bootstrap — sees only what this machine can actually do.
+///
+/// No `platforms` means every platform, which is how most manifests are written.
+fn runs_here(entry: &json::Value) -> bool {
+    match entry.get("platforms").and_then(|p| p.as_array()) {
+        Some(ps) if !ps.is_empty() => ps
+            .iter()
+            .filter_map(|p| p.as_str())
+            .any(|p| p == current_platform()),
+        _ => true,
+    }
+}
+
+/// The id herdr registered for one of our own entries on *this* platform.
+///
+/// Not a constant, because it is not the same everywhere. herdr rejects duplicate action and
+/// pane ids even when the entries are gated to platforms that cannot overlap, so a platform
+/// needing a differently-shaped command needs a differently-named entry too — `manage` on
+/// Unix, `manage-windows` on Windows. Binding the wrong one produces a key that reports
+/// success and does nothing, since the refusal (`platform_unsupported`) happens later, at a
+/// keypress, where nobody sees it.
+///
+/// The candidates come from `Installed`, which `runs_here` has already narrowed to this
+/// platform — so this only has to tolerate the naming, not decide the platform. An exact match
+/// wins; otherwise the first `<base>-<suffix>` variant.
+fn platform_variant<'a>(ids: impl Iterator<Item = &'a str>, base: &str) -> Option<String> {
+    let mut variant = None;
+    for id in ids {
+        if id == base {
+            return Some(id.to_string());
+        }
+        if id
+            .strip_prefix(base)
+            .is_some_and(|rest| rest.starts_with('-'))
+            && variant.is_none()
+        {
+            variant = Some(id.to_string());
+        }
+    }
+    variant
+}
+
+/// The command that opens our manage pane by hand, for a message telling someone to run it.
+fn manage_pane_command(installed: &[Installed]) -> String {
+    let id = installed
+        .iter()
+        .find(|p| is_self(p))
+        .and_then(|me| platform_variant(me.panes.iter().map(|(id, _, _)| id.as_str()), "manage"))
+        .unwrap_or_else(|| "manage".to_string());
+    format!(
+        "herdr plugin pane open --plugin {} --entrypoint {} --focus",
+        PLUGIN_ID, id
+    )
+}
+
+/// The same, for a caller that has not already asked herdr what is installed.
+pub(crate) fn manage_pane_hint() -> String {
+    manage_pane_command(&installed_plugins().unwrap_or_default())
+}
+
+const DONE_MARKER: &str = "herdr-lazy set this machine up once; delete this file to redo it\n";
+const DECLINED_MARKER: &str = "this machine was already set up, so herdr-lazy left it alone\n";
+
+/// Is this a machine herdr-lazy has never touched?
+///
+/// Only when the sole installed plugin is herdr-lazy itself. Someone with plugins but no list
+/// built their setup by hand and is a candidate for adopting it (`a` in the pane) — pushing
+/// five more plugins at them uninvited is exactly the imposition this whole design avoids.
+fn is_first_run(installed: &[Installed]) -> bool {
+    installed.iter().all(is_self)
 }
 
 /// Is startup auto-sync turned on?
@@ -2187,6 +2378,92 @@ command = "something.else"
             p.matches(&Spec::parse("owner/repo/plugins/wm")),
             Match::Strong
         );
+    }
+
+    /// The bootstrap fires only on a machine that has plainly never been set up. Getting this
+    /// wrong installs five plugins on someone who did not ask — the one thing it must not do.
+    #[test]
+    fn only_a_machine_with_nothing_but_herdr_lazy_is_a_first_run() {
+        let me = installed("herdr-lazy", "github", &["natori-hrj/herdr-lazy"]);
+        let me = Installed {
+            plugin_id: "herdr-lazy".to_string(),
+            ..me
+        };
+        assert!(is_first_run(&[]), "a herdr with no plugins at all");
+        assert!(is_first_run(std::slice::from_ref(&me)), "only herdr-lazy");
+        assert!(
+            !is_first_run(&[me, from_github("cloudmanic", "herdr-plus")]),
+            "a hand-built setup must be left alone"
+        );
+    }
+
+    /// `init` and the first-run bootstrap write the same file, so a new machine and an explicit
+    /// init cannot disagree about what the curated set is.
+    /// Verbatim shape of a plugin that supports Windows: herdr lists every declared entry,
+    /// including the ones gated elsewhere, and each carries its own `platforms`.
+    const WINDOWS_TWINS: &str = r#"{"id":"cli:plugin","result":{"plugins":[{"plugin_id":"herdr-lazy","name":"herdr-lazy","enabled":true,"source":{"kind":"github","owner":"natori-hrj","repo":"herdr-lazy"},"actions":[{"id":"probe","title":"Lazy: probe CLI bridge","platforms":["linux","macos"],"command":["./target/release/herdr-lazy","probe"]},{"id":"probe-windows","title":"Lazy: probe CLI bridge","platforms":["windows"],"command":["powershell","-Command","probe"]},{"id":"everywhere","title":"No platforms declared"}],"panes":[{"id":"manage","title":"herdr-lazy","placement":"overlay","platforms":["linux","macos"]},{"id":"manage-windows","title":"herdr-lazy","placement":"overlay","platforms":["windows"]}]}],"type":"plugin_list"}}"#;
+
+    /// The listing is not filtered by herdr, so it is filtered here. Without this, a plugin
+    /// that supports Windows shows every action twice under the same title on macOS, and half
+    /// of them refuse to run (`platform_unsupported`).
+    #[test]
+    fn entries_for_other_platforms_are_not_shown() {
+        let ps = parse_plugin_list(WINDOWS_TWINS).expect("payload should parse");
+        let ids: Vec<&str> = ps[0].actions.iter().map(|(id, _)| id.as_str()).collect();
+        let panes: Vec<&str> = ps[0].panes.iter().map(|(id, _, _)| id.as_str()).collect();
+
+        // An entry declaring no platforms runs everywhere, which is how most manifests read.
+        assert!(ids.contains(&"everywhere"));
+        if cfg!(target_os = "windows") {
+            assert_eq!(ids, vec!["probe-windows", "everywhere"]);
+            assert_eq!(panes, vec!["manage-windows"]);
+        } else {
+            assert_eq!(ids, vec!["probe", "everywhere"]);
+            assert_eq!(panes, vec!["manage"]);
+        }
+    }
+
+    /// The listing is filtered before this sees it, so exactly one `manage` survives — but its
+    /// id still differs by platform, which is what this resolves.
+    #[test]
+    fn an_ids_platform_variant_is_found_and_an_exact_match_wins() {
+        assert_eq!(
+            platform_variant(["probe", "init", "manage"].into_iter(), "manage"),
+            Some("manage".to_string())
+        );
+        assert_eq!(
+            platform_variant(["probe-windows", "manage-windows"].into_iter(), "manage"),
+            Some("manage-windows".to_string())
+        );
+        // An exact match wins wherever it sits, so a platform registering both is not a toss-up.
+        assert_eq!(
+            platform_variant(["manage-windows", "manage"].into_iter(), "manage"),
+            Some("manage".to_string())
+        );
+        // A name that merely starts with the base is not a variant of it.
+        assert_eq!(platform_variant(["managed"].into_iter(), "manage"), None);
+        assert_eq!(platform_variant([].into_iter(), "manage"), None);
+    }
+
+    #[test]
+    fn the_bootstrap_writes_the_same_list_init_does() {
+        let body = default_bundle_body(&[]);
+        for d in DEFAULT_BUNDLE {
+            assert!(body.contains(d), "{} missing from the default list", d);
+        }
+        assert!(!body.contains("# extra:"), "no extras unless asked for");
+        assert_eq!(
+            read_lines(Path::new("/nonexistent")).len(),
+            0,
+            "sanity: a missing list reads as empty"
+        );
+    }
+
+    #[test]
+    fn chosen_extras_are_appended_under_their_own_comment() {
+        let body = default_bundle_body(&[extra(&["owner/new"])]);
+        assert!(body.contains("# extra: worktrunk — switch worktrees from a picker"));
+        assert!(body.contains("owner/new"));
     }
 
     fn extra(plugins: &[&str]) -> extras::Extra {
