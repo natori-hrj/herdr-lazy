@@ -61,8 +61,11 @@ with [Rust](https://rustup.rs) (≥ 1.78). No toolchain is needed on the fast pa
 
 **Platform status.** Developed and verified end-to-end on macOS (arm64). Linux binaries are
 built and the test suite runs on Linux in CI, but the install has not been exercised on a
-real Linux machine. Windows has no prebuilt binary and builds from source; nothing about it
-has been tested. If you run either, reports are very welcome — see the open issues.
+real Linux machine. Windows has no prebuilt binary and builds from source, and needs a Rust
+toolchain for that reason; the install, `probe`, and opening the manage pane have been
+verified on Windows 11 with herdr 0.7.5-preview in Windows Terminal (ConPTY), but the pane's
+keymap and a real `sync --prune` have not been exercised there. If you run Linux or Windows,
+reports are very welcome — see the open issues.
 
 **The first herdr start after installing sets the machine up** (a `[[startup]]` hook, herdr
 0.7.5+): it writes the curated list, installs what the list names, and binds `prefix+shift+l`
@@ -88,11 +91,21 @@ description = "manage plugins"
 Pick a key that is actually free — `prefix+l` is `focus_pane_right`, and `h`/`j`/`k`/`n`/`p`/
 `c`/`g` are taken too. `prefix+?` lists your active bindings.
 
+**On Windows** the config lives at `%APPDATA%\herdr\config.toml`, and the action to bind is
+`herdr-lazy.manage-windows`. herdr rejects duplicate action ids even when they are gated to
+platforms that cannot overlap, so the Windows entry needs its own id. Binding the plain
+`herdr-lazy.manage` there is accepted by the config parser and then refused at the keypress,
+where nobody sees it — so it reads as a key that does nothing. The first-run bootstrap binds
+whichever id herdr reports for the platform it is running on, which is the main reason not to
+write this by hand.
+
 herdr has no command palette, so without a binding the only way in is the CLI:
 
 ```sh
 herdr plugin pane open --plugin herdr-lazy --entrypoint manage --focus
 ```
+
+On Windows that entrypoint is `manage-windows`, for the same reason.
 
 ## Use
 

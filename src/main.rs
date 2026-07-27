@@ -2549,4 +2549,85 @@ command = "something.else"
             "# extra: worktrunk — switch worktrees from a picker"
         );
     }
+
+    /// Returns `(table, platforms, program)` for every entry in the manifest, where
+    /// `program` is the first element of `command` and `platforms` is empty when the
+    /// entry declares none.
+    ///
+    /// Hand-rolled rather than pulling in a TOML parser: the shapes here are flat
+    /// single-line arrays, and the project keeps its dependency list at one.
+    fn manifest_entries(src: &str) -> Vec<(String, Vec<String>, String)> {
+        fn array_items(line: &str) -> Vec<String> {
+            let mut out = Vec::new();
+            let rest = match line.split_once('[') {
+                Some((_, r)) => r,
+                None => return out,
+            };
+            let mut chars = rest.chars();
+            let mut cur = String::new();
+            let mut inside = false;
+            for c in chars.by_ref() {
+                match c {
+                    '"' if inside => {
+                        out.push(std::mem::take(&mut cur));
+                        inside = false;
+                    }
+                    '"' => inside = true,
+                    ']' if !inside => break,
+                    _ if inside => cur.push(c),
+                    _ => {}
+                }
+            }
+            out
+        }
+
+        let mut entries: Vec<(String, Vec<String>, String)> = Vec::new();
+        for raw in src.lines() {
+            let line = raw.trim();
+            if line.starts_with('#') {
+                continue;
+            }
+            if line.starts_with("[[") {
+                let table = line.trim_matches(|c| c == '[' || c == ']').to_string();
+                entries.push((table, Vec::new(), String::new()));
+                continue;
+            }
+            let Some(last) = entries.last_mut() else {
+                continue;
+            };
+            if line.starts_with("platforms") {
+                last.1 = array_items(line);
+            } else if line.starts_with("command") {
+                last.2 = array_items(line).first().cloned().unwrap_or_default();
+            }
+        }
+        entries
+    }
+
+    /// herdr hands a plugin's command to the platform's own process spawner. On Windows
+    /// that is CreateProcessW, which neither appends `.exe` nor resolves a relative
+    /// program the way a shell would, so `./target/release/herdr-lazy` never launches —
+    /// the action fails with no exit code and no stderr, which is a miserable thing to
+    /// debug. `/bin/sh` is not there to run either.
+    ///
+    /// An entry that declares no `platforms` applies to every platform, so it counts as
+    /// Windows-reachable. That is precisely how this was wrong: the actions, the startup
+    /// command and the pane were all unqualified, and all four were unspawnable.
+    #[test]
+    fn every_windows_reachable_command_names_a_program_windows_can_spawn() {
+        for (table, platforms, program) in manifest_entries(include_str!("../herdr-plugin.toml")) {
+            let reachable = platforms.is_empty() || platforms.iter().any(|p| p == "windows");
+            if !reachable || program.is_empty() {
+                continue;
+            }
+            assert!(
+                !program.starts_with("./"),
+                "[[{table}]] command `{program}` is relative; CreateProcessW will not resolve it"
+            );
+            assert!(
+                !program.starts_with('/'),
+                "[[{table}]] command `{program}` is a POSIX absolute path that Windows cannot run"
+            );
+        }
+    }
 }
