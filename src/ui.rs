@@ -1435,7 +1435,12 @@ impl App {
             b.all.len(),
             b.source_note
         )?;
-        writeln!(out, " search: \x1b[1m{}\x1b[0m\x1b[7m \x1b[0m\r", b.query)?;
+        writeln!(
+            out,
+            " search: \x1b[1m{}\x1b[0m\x1b[7m \x1b[0m  \x1b[2m[tab]\x1b[0m \x1b[1m{}\x1b[0m\r",
+            b.query,
+            b.category_label()
+        )?;
         writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
 
         let visible = (height as usize).saturating_sub(6).max(1);
@@ -1473,9 +1478,9 @@ impl App {
 
         let footer = match &self.flash {
             Some(msg) => format!("\x1b[36m{}\x1b[0m", msg),
-            None => "\x1b[1m[enter]\x1b[0m add to your list  \x1b[1m[ctrl+o]\x1b[0m open repo  \
-                     \x1b[1m[↑↓]\x1b[0m move  \x1b[1m[ctrl+r]\x1b[0m refresh  \
-                     \x1b[1m[esc]\x1b[0m back"
+            None => "\x1b[1m[enter]\x1b[0m add to your list  \x1b[1m[tab]\x1b[0m category  \
+                     \x1b[1m[ctrl+o]\x1b[0m open repo  \x1b[1m[↑↓]\x1b[0m move  \
+                     \x1b[1m[ctrl+r]\x1b[0m refresh  \x1b[1m[esc]\x1b[0m back"
                 .to_string(),
         };
         write!(
@@ -1984,6 +1989,9 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                 }
                 KeyCode::Down => app.browser.as_mut().unwrap().move_down(),
                 KeyCode::Up => app.browser.as_mut().unwrap().move_up(),
+                // Tab, because every printable key belongs to the query here.
+                KeyCode::Tab => app.browser.as_mut().unwrap().cycle_category(true),
+                KeyCode::BackTab => app.browser.as_mut().unwrap().cycle_category(false),
                 KeyCode::Backspace => {
                     app.flash = None;
                     app.browser.as_mut().unwrap().backspace();
