@@ -279,6 +279,12 @@ because whether a plugin is still maintained matters more than how many stars it
 Search terms are ANDed and each may match the name, description or topics, so `worktree fzf`
 finds a worktree plugin whose description mentions fzf.
 
+`tab` narrows to a category — worktree, notifications, agents, and so on — for when you want
+to see what exists rather than search for something you can already name. It cycles back to
+`all`, and works alongside the query. Categories come from keywords matched against the name,
+description and topics, because GitHub topics alone miss more than half the plugins; anything
+that matches nothing lands in `other` rather than disappearing.
+
 Enter adds to your list rather than installing outright: one keystroke on a fuzzy match
 should not run a stranger's build script. The list is where intent is recorded.
 

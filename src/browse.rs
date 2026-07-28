@@ -21,6 +21,9 @@ pub(crate) struct Browser {
     pub(crate) source_note: String,
     /// Names already in the user's list, so the browser can mark what is already handled.
     pub(crate) listed: Vec<String>,
+    /// The category filter, or `None` for everything. Cycled with tab; independent of the
+    /// query, so "worktree plugins mentioning fzf" is two narrowings rather than one guess.
+    pub(crate) category: Option<&'static str>,
 }
 
 impl Browser {
@@ -31,11 +34,54 @@ impl Browser {
             cursor: 0,
             source_note,
             listed,
+            category: None,
         }
     }
 
     pub(crate) fn results(&self) -> Vec<&Entry> {
-        self.all.iter().filter(|e| e.matches(&self.query)).collect()
+        self.all
+            .iter()
+            .filter(|e| e.matches(&self.query))
+            .filter(|e| match self.category {
+                Some(c) => crate::category::classify(e) == c,
+                None => true,
+            })
+            .collect()
+    }
+
+    /// Tab — step through the categories, ending back at "everything".
+    ///
+    /// A cycle rather than a menu: there are ten of them, the list is short enough to walk, and
+    /// a second overlay on top of the search overlay is a worse way to narrow a list than one
+    /// key you can hold.
+    pub(crate) fn cycle_category(&mut self, forward: bool) {
+        let names = crate::category::names();
+        // `None` is position 0, so the ring is "everything" followed by each category.
+        let at = match self.category {
+            None => 0,
+            Some(c) => names
+                .iter()
+                .position(|n| *n == c)
+                .map(|i| i + 1)
+                .unwrap_or(0),
+        };
+        let len = names.len() + 1;
+        let next = if forward {
+            (at + 1) % len
+        } else {
+            (at + len - 1) % len
+        };
+        self.category = if next == 0 {
+            None
+        } else {
+            names.get(next - 1).copied()
+        };
+        self.cursor = 0;
+    }
+
+    /// What the header says is being shown.
+    pub(crate) fn category_label(&self) -> &'static str {
+        self.category.unwrap_or("all")
     }
 
     pub(crate) fn selected(&self) -> Option<&Entry> {
@@ -209,6 +255,50 @@ mod tests {
             }
             assert_eq!(b.query, q, "{} was mangled", q);
         }
+    }
+
+    #[test]
+    fn a_category_narrows_the_list_and_tab_gets_back_to_everything() {
+        let mut b = browser();
+        assert_eq!(b.category_label(), "all");
+
+        b.category = Some("worktree");
+        let r = b.results();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].full_name, "b/herdr-worktrunk");
+
+        // The ring starts at "everything" and returns to it, so tab is never a trap.
+        b.category = None;
+        let steps = crate::category::names().len() + 1;
+        for _ in 0..steps {
+            b.cycle_category(true);
+        }
+        assert_eq!(b.category, None);
+    }
+
+    /// Filtering by category and typing a query are independent narrowings.
+    #[test]
+    fn a_category_and_a_query_both_apply() {
+        let mut b = browser();
+        b.category = Some("worktree");
+        for c in "phone".chars() {
+            b.push(c);
+        }
+        assert!(
+            b.results().is_empty(),
+            "the phone plugin is not a worktree one"
+        );
+        assert!(b.selected().is_none());
+    }
+
+    /// Changing the filter must not leave the cursor pointing into the old result set.
+    #[test]
+    fn changing_category_returns_to_the_top() {
+        let mut b = browser();
+        b.move_down();
+        b.move_down();
+        b.cycle_category(true);
+        assert_eq!(b.cursor, 0);
     }
 
     #[test]
