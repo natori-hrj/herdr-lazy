@@ -2398,8 +2398,6 @@ command = "something.else"
         );
     }
 
-    /// `init` and the first-run bootstrap write the same file, so a new machine and an explicit
-    /// init cannot disagree about what the curated set is.
     /// Verbatim shape of a plugin that supports Windows: herdr lists every declared entry,
     /// including the ones gated elsewhere, and each carries its own `platforms`.
     const WINDOWS_TWINS: &str = r#"{"id":"cli:plugin","result":{"plugins":[{"plugin_id":"herdr-lazy","name":"herdr-lazy","enabled":true,"source":{"kind":"github","owner":"natori-hrj","repo":"herdr-lazy"},"actions":[{"id":"probe","title":"Lazy: probe CLI bridge","platforms":["linux","macos"],"command":["./target/release/herdr-lazy","probe"]},{"id":"probe-windows","title":"Lazy: probe CLI bridge","platforms":["windows"],"command":["powershell","-Command","probe"]},{"id":"everywhere","title":"No platforms declared"}],"panes":[{"id":"manage","title":"herdr-lazy","placement":"overlay","platforms":["linux","macos"]},{"id":"manage-windows","title":"herdr-lazy","placement":"overlay","platforms":["windows"]}]}],"type":"plugin_list"}}"#;
@@ -2446,6 +2444,8 @@ command = "something.else"
         assert_eq!(platform_variant([].into_iter(), "manage"), None);
     }
 
+    /// `init` and the first-run bootstrap write the same file, so a new machine and an explicit
+    /// init cannot disagree about what the curated set is.
     #[test]
     fn the_bootstrap_writes_the_same_list_init_does() {
         let body = default_bundle_body(&[]);
@@ -2557,7 +2557,24 @@ command = "something.else"
     ///
     /// Hand-rolled rather than pulling in a TOML parser: the shapes here are flat
     /// single-line arrays, and the project keeps its dependency list at one.
-    fn manifest_entries(src: &str) -> Vec<(String, Vec<String>, String)> {
+    struct ManifestEntry {
+        table: String,
+        id: String,
+        platforms: Vec<String>,
+        program: String,
+    }
+
+    impl ManifestEntry {
+        fn declares(&self, platform: &str) -> bool {
+            self.platforms.iter().any(|p| p == platform)
+        }
+        /// No `platforms` means every platform, which is how most entries are written.
+        fn everywhere(&self) -> bool {
+            self.platforms.is_empty()
+        }
+    }
+
+    fn manifest_entries(src: &str) -> Vec<ManifestEntry> {
         fn array_items(line: &str) -> Vec<String> {
             let mut out = Vec::new();
             let rest = match line.split_once('[') {
@@ -2582,24 +2599,35 @@ command = "something.else"
             out
         }
 
-        let mut entries: Vec<(String, Vec<String>, String)> = Vec::new();
+        /// `id = "probe"` -> `probe`
+        fn quoted_value(line: &str) -> String {
+            line.split('"').nth(1).unwrap_or_default().to_string()
+        }
+
+        let mut entries: Vec<ManifestEntry> = Vec::new();
         for raw in src.lines() {
             let line = raw.trim();
             if line.starts_with('#') {
                 continue;
             }
             if line.starts_with("[[") {
-                let table = line.trim_matches(|c| c == '[' || c == ']').to_string();
-                entries.push((table, Vec::new(), String::new()));
+                entries.push(ManifestEntry {
+                    table: line.trim_matches(|c| c == '[' || c == ']').to_string(),
+                    id: String::new(),
+                    platforms: Vec::new(),
+                    program: String::new(),
+                });
                 continue;
             }
             let Some(last) = entries.last_mut() else {
                 continue;
             };
             if line.starts_with("platforms") {
-                last.1 = array_items(line);
+                last.platforms = array_items(line);
             } else if line.starts_with("command") {
-                last.2 = array_items(line).first().cloned().unwrap_or_default();
+                last.program = array_items(line).first().cloned().unwrap_or_default();
+            } else if line.starts_with("id") {
+                last.id = quoted_value(line);
             }
         }
         entries
@@ -2616,11 +2644,11 @@ command = "something.else"
     /// command and the pane were all unqualified, and all four were unspawnable.
     #[test]
     fn every_windows_reachable_command_names_a_program_windows_can_spawn() {
-        for (table, platforms, program) in manifest_entries(include_str!("../herdr-plugin.toml")) {
-            let reachable = platforms.is_empty() || platforms.iter().any(|p| p == "windows");
-            if !reachable || program.is_empty() {
+        for e in manifest_entries(include_str!("../herdr-plugin.toml")) {
+            if !(e.everywhere() || e.declares("windows")) || e.program.is_empty() {
                 continue;
             }
+            let (table, program) = (&e.table, &e.program);
             assert!(
                 !program.starts_with("./"),
                 "[[{table}]] command `{program}` is relative; CreateProcessW will not resolve it"
@@ -2628,6 +2656,58 @@ command = "something.else"
             assert!(
                 !program.starts_with('/'),
                 "[[{table}]] command `{program}` is a POSIX absolute path that Windows cannot run"
+            );
+        }
+    }
+
+    /// Until herdr resolves relative commands on Windows (#28), every action and pane is
+    /// declared twice — once for Unix, once for Windows under a `-windows` id. Nothing stops
+    /// someone adding only one half, and nothing would fail: the test above only checks that
+    /// what *is* declared can be spawned, so a feature silently missing on one platform is
+    /// green CI.
+    ///
+    /// This is the guard that makes carrying the split entries safe rather than merely ugly.
+    /// It goes away with them.
+    #[test]
+    fn platform_split_entries_come_in_pairs() {
+        const SUFFIX: &str = "-windows";
+        let entries = manifest_entries(include_str!("../herdr-plugin.toml"));
+
+        for table in ["actions", "panes"] {
+            let of_table = || entries.iter().filter(|e| e.table == table);
+            let windows: Vec<&str> = of_table()
+                .filter(|e| e.declares("windows"))
+                .map(|e| e.id.as_str())
+                .collect();
+            let unix: Vec<&str> = of_table()
+                .filter(|e| !e.everywhere() && !e.declares("windows"))
+                .map(|e| e.id.as_str())
+                .collect();
+
+            for id in &unix {
+                let twin = format!("{id}{SUFFIX}");
+                assert!(
+                    windows.contains(&twin.as_str()),
+                    "[[{table}]] `{id}` has no `{twin}` — it would be missing on Windows"
+                );
+            }
+            for id in &windows {
+                let stem = id.strip_suffix(SUFFIX).unwrap_or(id);
+                assert!(
+                    unix.contains(&stem),
+                    "[[{table}]] `{id}` has no `{stem}` — it would be missing on Unix"
+                );
+            }
+        }
+
+        // `[[startup]]` has no id to pair on, so the check is coverage: every platform this
+        // plugin claims to support must have a startup hook, or the first-run bootstrap and
+        // auto-sync simply never fire there.
+        let startup = || entries.iter().filter(|e| e.table == "startup");
+        for platform in ["linux", "macos", "windows"] {
+            assert!(
+                startup().any(|e| e.everywhere() || e.declares(platform)),
+                "no [[startup]] entry runs on {platform}"
             );
         }
     }
