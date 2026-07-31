@@ -49,7 +49,8 @@ manage the *other* plugins.
 
 ## Install
 
-Requires herdr ≥ 0.7.0.
+Requires herdr ≥ 0.7.5, which is where the `[[startup]]` hook the first run depends on
+arrives. Earlier versions used to install this and then quietly do nothing.
 
 ```sh
 herdr plugin install natori-hrj/herdr-lazy
@@ -67,9 +68,9 @@ verified on Windows 11 with herdr 0.7.5-preview in Windows Terminal (ConPTY), bu
 keymap and a real `sync --prune` have not been exercised there. If you run Linux or Windows,
 reports are very welcome — see the open issues.
 
-**The first herdr start after installing sets the machine up** (a `[[startup]]` hook, herdr
-0.7.5+): it writes the curated list, installs what the list names, and binds `prefix+shift+l`
-to the manage pane. It prints everything it did. Press the key and you are in.
+**The first herdr start after installing sets the machine up** (a `[[startup]]` hook): it
+writes the curated list, installs what the list names, and binds `prefix+shift+l` to the
+manage pane. It prints everything it did. Press the key and you are in.
 
 That happens only on a machine that has plainly never been set up — no plugin list, and
 nothing installed but herdr-lazy itself. If you already have plugins, or already have a list,
@@ -327,7 +328,7 @@ herdr-lazy restore
 ## Keeping in sync automatically
 
 Press `A` in the manage pane. herdr-lazy then installs anything on your list that is missing
-whenever herdr starts (a `[[startup]]` hook, herdr 0.7.5+) — open herdr on a new machine with
+whenever herdr starts (the same `[[startup]]` hook the first run uses) — open herdr on a new machine with
 a list already in place and your plugins appear on their own. The header shows `auto-sync on`
 while it is active.
 
