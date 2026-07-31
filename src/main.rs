@@ -2660,6 +2660,27 @@ command = "something.else"
         }
     }
 
+    /// The floor herdr enforces and the floor the README promises have to be the same number.
+    ///
+    /// They disagreed once already — the manifest said 0.7.0 while the first-run setup needed
+    /// the 0.7.5 startup hook — and the failure mode was silent: herdr-lazy installed on an
+    /// older herdr and then did nothing, with no way to say why, because the missing hook is
+    /// the thing that would have printed the message.
+    #[test]
+    fn the_readme_and_the_manifest_agree_on_the_herdr_floor() {
+        let floor = include_str!("../herdr-plugin.toml")
+            .lines()
+            .find(|l| l.trim_start().starts_with("min_herdr_version"))
+            .and_then(|l| l.split('"').nth(1))
+            .expect("the manifest declares a floor");
+        let promised = format!("Requires herdr ≥ {}", floor);
+        assert!(
+            include_str!("../README.md").contains(&promised),
+            "README does not say `{}`",
+            promised
+        );
+    }
+
     /// Until herdr resolves relative commands on Windows (#28), every action and pane is
     /// declared twice — once for Unix, once for Windows under a `-windows` id. Nothing stops
     /// someone adding only one half, and nothing would fail: the test above only checks that
