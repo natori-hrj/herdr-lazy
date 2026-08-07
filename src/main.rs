@@ -600,7 +600,19 @@ fn extras_arg(rest: &[&str]) -> Vec<String> {
     out
 }
 
-/// Write the curated default bundle (the distro layer), plus any opt-in extras.
+/// Parse `--from owner/repo` or `--from=owner/repo`.
+fn from_arg<'a>(rest: &[&'a str]) -> Option<&'a str> {
+    for (i, a) in rest.iter().enumerate() {
+        if let Some(v) = a.strip_prefix("--from=") {
+            return (!v.is_empty()).then_some(v);
+        }
+        if *a == "--from" {
+            return rest.get(i + 1).copied().filter(|v| !v.starts_with("--"));
+        }
+    }
+    None
+}
+
 /// The list `init` writes: the curated defaults, then any chosen extras under their comments.
 ///
 /// A function rather than inline, because the first-run bootstrap writes the same file. A new
@@ -636,7 +648,79 @@ fn default_bundle_body(chosen: &[extras::Extra]) -> String {
     body
 }
 
-fn cmd_init(force: bool, extra_ids: &[String]) -> io::Result<()> {
+/// A line that declares a plugin, as opposed to a comment or a blank.
+fn is_entry_line(l: &str) -> bool {
+    let l = l.trim();
+    !l.is_empty() && !l.starts_with('#')
+}
+
+/// `owner/repo`, optionally with a subdirectory — and nothing that looks like prose or markup.
+///
+/// This is the check that stops a fetched HTML error page, or a file that happens to live at
+/// that path and is not a plugin list, from being written over someone's list.
+fn looks_like_entry(l: &str) -> bool {
+    let repo = Spec::parse(l).repo;
+    !repo.is_empty()
+        && repo.contains('/')
+        && !repo.starts_with('/')
+        && !repo.ends_with('/')
+        && repo
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-/".contains(c))
+}
+
+/// Fetch someone else's `plugins.list` and return what to write.
+///
+/// A copy, deliberately: nothing records where it came from except a comment, there is no
+/// upstream to track and no update channel. Adopting a list must not make the manager depend
+/// on someone else's opinion — that is the whole difference between a starter and a
+/// subscription.
+///
+/// The lockfile is not adopted with it. Taking someone's list means the same plugins; taking
+/// their lock would mean the same commits, which is a far stronger claim to place in a
+/// stranger's hands. If that is ever wanted it should be asked for separately.
+fn adopt_body(spec: &str) -> Result<String, String> {
+    let s = Spec::parse(spec);
+    if !looks_like_entry(&s.repo) || s.repo.matches('/').count() != 1 {
+        return Err(format!(
+            "`{}` is not an owner/repo (optionally owner/repo@ref)",
+            spec
+        ));
+    }
+    let body =
+        github::raw_file(&s.repo, s.reference.as_deref(), "plugins.list").ok_or_else(|| {
+            format!(
+                "could not read plugins.list from {} — is there one at the repository root?",
+                spec
+            )
+        })?;
+
+    let entries: Vec<&str> = body.lines().filter(|l| is_entry_line(l)).collect();
+    if entries.is_empty() {
+        return Err(format!("{} has a plugins.list, but it lists nothing", spec));
+    }
+    if let Some(bad) = entries.iter().find(|l| !looks_like_entry(l)) {
+        return Err(format!(
+            "{} does not look like a plugin list — found `{}`",
+            spec,
+            bad.trim()
+        ));
+    }
+
+    // Provenance as a comment, not as state: it tells a reader where this came from without
+    // creating anything the tool has to keep in step.
+    let mut out = format!(
+        "# adopted from {} — a copy, not a subscription. Edit it freely.\n\n",
+        spec
+    );
+    out.push_str(&body);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+fn cmd_init(force: bool, extra_ids: &[String], from: Option<&str>) -> io::Result<()> {
     let p = bundle_path();
     if p.exists() && !force {
         println!(
@@ -663,9 +747,40 @@ fn cmd_init(force: bool, extra_ids: &[String]) -> io::Result<()> {
         return Ok(());
     }
 
+    // Someone else's list, if asked for — resolved before writing, so a repo that has no list
+    // leaves the existing one alone rather than replacing it with the defaults.
+    let adopted = match from {
+        Some(spec) => match adopt_body(spec) {
+            Ok(body) => Some((spec.to_string(), body)),
+            Err(msg) => {
+                eprintln!("{}", msg);
+                return Ok(());
+            }
+        },
+        None => None,
+    };
+
     ensure_parent(&p)?;
-    fs::write(&p, default_bundle_body(&chosen))?;
-    println!("wrote curated default bundle -> {}", p.display());
+    let base = match &adopted {
+        Some((_, body)) => body.clone(),
+        None => default_bundle_body(&chosen),
+    };
+    fs::write(&p, base)?;
+    // An adopted list is written verbatim, so any extras asked for still have to be appended —
+    // the same append the pane uses, so the two cannot produce different files.
+    if adopted.is_some() {
+        for e in &chosen {
+            let _ = add_extra_to_list(e);
+        }
+    }
+    match &adopted {
+        Some((spec, body)) => {
+            let n = body.lines().filter(|l| is_entry_line(l)).count();
+            println!("adopted {} plugin(s) from {} -> {}", n, spec, p.display());
+            println!("it is your list now — no link back to {}.", spec);
+        }
+        None => println!("wrote curated default bundle -> {}", p.display()),
+    }
     if !chosen.is_empty() {
         println!("with extras:");
         for e in &chosen {
@@ -1846,7 +1961,8 @@ fn print_help() {
     println!("herdr-lazy — be lazy: a curated plugin distro & manager for herdr\n");
     println!("USAGE: herdr-lazy <command>\n");
     println!("  probe             verify the plugin <-> herdr CLI bridge (run this first)");
-    println!("  init [--force] [--extras <id,…>]  write the default bundle (the distro layer)");
+    println!("  init [--force] [--extras <id,…>] [--from <owner/repo[@ref]>]");
+    println!("                    write the default bundle, or adopt someone else's list");
     println!("  extras            list the opt-in extras you can pass to `init --extras`");
     println!("  list              show desired plugins");
     println!("  install [<repo>…] install what is missing, restore drifted pins");
@@ -1869,7 +1985,11 @@ fn main() {
         "probe" => cmd_probe(),
         "startup" => cmd_startup(),
         "auto-sync" => cmd_auto_sync(rest.first().copied()),
-        "init" => cmd_init(rest.contains(&"--force"), &extras_arg(&rest)),
+        "init" => cmd_init(
+            rest.contains(&"--force"),
+            &extras_arg(&rest),
+            from_arg(&rest),
+        ),
         "extras" => cmd_extras(),
         "list" => cmd_list(),
         // `install` is what people look for; `sync` is what the operation is. Both, rather
@@ -2658,6 +2778,38 @@ command = "something.else"
                 "[[{table}]] command `{program}` is a POSIX absolute path that Windows cannot run"
             );
         }
+    }
+
+    #[test]
+    fn from_takes_a_repo_in_either_form() {
+        assert_eq!(from_arg(&["--from", "owner/repo"]), Some("owner/repo"));
+        assert_eq!(from_arg(&["--from=owner/repo@v1"]), Some("owner/repo@v1"));
+        assert_eq!(from_arg(&["init", "--force"]), None);
+        // A flag is not a value: `--from --force` must not adopt a repo called "--force".
+        assert_eq!(from_arg(&["--from", "--force"]), None);
+        assert_eq!(from_arg(&["--from"]), None);
+    }
+
+    /// The guard that stops a fetched HTML error page — or any file that is not a plugin list —
+    /// being written over someone's list.
+    #[test]
+    fn only_owner_repo_lines_count_as_entries() {
+        assert!(looks_like_entry("owner/repo"));
+        assert!(looks_like_entry("owner/repo@v1.2.0"));
+        assert!(looks_like_entry("owner/repo/plugins/sub"));
+        assert!(!looks_like_entry("<!DOCTYPE html>"));
+        assert!(!looks_like_entry("404: Not Found"));
+        assert!(!looks_like_entry("just-a-name"));
+        assert!(!looks_like_entry("/leading"));
+        assert!(!looks_like_entry("trailing/"));
+        assert!(!looks_like_entry(""));
+    }
+
+    #[test]
+    fn comments_and_blanks_are_not_entries() {
+        assert!(is_entry_line("owner/repo"));
+        assert!(!is_entry_line("# a comment"));
+        assert!(!is_entry_line("   "));
     }
 
     /// The floor herdr enforces and the floor the README promises have to be the same number.

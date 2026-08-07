@@ -136,6 +136,7 @@ herdr-lazy sync --prune  # also uninstall anything not in the list
 
 herdr-lazy extras                    # list the opt-in extras
 herdr-lazy init --extras worktrunk   # defaults plus a chosen extra
+herdr-lazy init --from owner/repo    # start from someone else's list instead
 ```
 
 `sync` and `update` take plugin names to work on just those:
@@ -147,7 +148,7 @@ herdr-lazy update smarzban/herdr-file-viewer
 
 | command | what it does |
 |---|---|
-| `init [--force] [--extras <id,…>]` | write the curated default bundle, plus any opt-in extras |
+| `init [--force] [--extras <id,…>] [--from <owner/repo[@ref]>]` | write the curated default bundle, or adopt someone else's list |
 | `extras` | list the opt-in extras (`e` in the pane picks them interactively) |
 | `list` | show the desired plugin set |
 | `install [<repo>…]` | install what is missing, restore drifted pins |
@@ -426,6 +427,24 @@ depends on where you want to be pinged — not a decision a default set should m
 None of this is load-bearing: `init` just writes these lines into `plugins.list`. Edit it,
 or skip `init` and build your own with `add`.
 
+## Starting from someone else's list
+
+```sh
+herdr-lazy init --from owner/repo        # their plugins.list becomes yours
+herdr-lazy init --from owner/repo@v1     # at a ref, if you would rather it not move
+```
+
+It reads `plugins.list` from the root of that repository and writes it as your list, comments
+and all. After that it is your file: there is no upstream, no link back, and nothing to update
+from. A fork, not a subscription — the whole point is that you can now disagree with it.
+
+The lockfile does not come with it. Their list means the same plugins; their lock would mean
+the same commits, which is a much stronger thing to accept from a stranger.
+
+Nothing is installed by this, as with any `init` — you get a list to read first, and `sync`
+when you agree with it. It refuses to overwrite an existing list without `--force`, and it
+refuses anything that does not look like a plugin list rather than writing it over yours.
+
 ## Extras
 
 The default bundle stays out of choices that depend on you — which worktree tool, which
@@ -464,8 +483,6 @@ the rest still needs design.
   fine everywhere else. The manifest is readable before install, so the browser could say so.
 - **`check`** — show what has updates without applying any, the way `update` does but
   read-only. Needs a plan for GitHub API rate limits.
-- **Starter lists** — `init --from owner/repo`, so a curated list can be shared and adopted
-  the way people fork a LazyVim starter.
 - **enable / disable from the pane** — herdr supports both; herdr-lazy only reports the state.
 
 ## Design notes
