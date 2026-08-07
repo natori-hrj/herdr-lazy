@@ -41,6 +41,26 @@ pub(crate) fn changes_since(owner_repo: &str, installed_commit: &str) -> Changes
     parse_commits(&body, installed_commit)
 }
 
+/// Fetch a file from a repository at a ref, as raw text.
+///
+/// `HEAD` is the default rather than `main`: raw.githubusercontent resolves it to whatever the
+/// repository calls its default branch, so nothing here has to guess a branch name.
+/// Overridable so the fetch itself can be exercised, rather than only ever being proven by its
+/// failure path — the same reason `scripts/fetch-or-build.sh` takes a base URL.
+pub(crate) fn raw_file(owner_repo: &str, reference: Option<&str>, path: &str) -> Option<String> {
+    let base = std::env::var("HERDR_LAZY_RAW_BASE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://raw.githubusercontent.com".to_string());
+    fetch(&format!(
+        "{}/{}/{}/{}",
+        base,
+        owner_repo,
+        reference.unwrap_or("HEAD"),
+        path
+    ))
+}
+
 /// Shell out to curl/wget — std has no TLS, the same reason the install script and the
 /// marketplace fetch do.
 fn fetch(url: &str) -> Option<String> {
