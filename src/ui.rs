@@ -1500,9 +1500,16 @@ impl App {
         write!(out, "\x1b[H\x1b[2J")?;
         writeln!(
             out,
-            "\x1b[1m extras\x1b[0m  \x1b[2m{} opt-in picks · space ticks, enter adds to your \
+            "\x1b[1m extras\x1b[0m  \x1b[2m{} opt-in picks{} · space ticks, enter adds to your \
              list\x1b[0m\r",
-            p.count()
+            p.count(),
+            if p.items()
+                .any(|(_, it)| it.extra.source == crate::extras::Source::Local)
+            {
+                " · * is yours"
+            } else {
+                ""
+            }
         )?;
         writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
 
@@ -1525,13 +1532,19 @@ impl App {
                         "[ ]"
                     };
                     let mark = if it.listed { "\x1b[32m✔\x1b[0m" } else { " " };
+                    // One of yours reads differently from one that shipped with the tool.
+                    let id = if it.extra.source == crate::extras::Source::Local {
+                        format!("{}*", truncate(&it.extra.id, 11))
+                    } else {
+                        truncate(&it.extra.id, 12)
+                    };
                     writeln!(
                         out,
                         "{} {} {} {:<12} \x1b[2m{}\x1b[0m\r",
                         pointer,
                         tick,
                         mark,
-                        truncate(it.extra.id, 12),
+                        id,
                         truncate(&it.extra.description, width.saturating_sub(24) as usize)
                     )?;
                 }
@@ -2691,10 +2704,10 @@ mod tests {
     fn enter_applies_the_ticks_or_the_cursor() {
         let mut p = ExtrasPicker::new(&[]).expect("extras are registered");
         assert_eq!(p.targets().len(), 1);
-        let under_cursor = p.targets()[0].extra.id;
+        let under_cursor = p.targets()[0].extra.id.clone();
         p.move_cursor(true);
         p.toggle();
-        let ticked: Vec<&str> = p.targets().iter().map(|it| it.extra.id).collect();
+        let ticked: Vec<String> = p.targets().iter().map(|it| it.extra.id.clone()).collect();
         assert_eq!(ticked.len(), 1);
         assert_ne!(ticked[0], under_cursor, "the tick wins, not the cursor");
         // Untick and the cursor is back in charge — this one is still under it.
@@ -2731,7 +2744,7 @@ mod tests {
             app.draw_extras(&mut buf, width, 24).unwrap();
             let out = String::from_utf8(buf).unwrap();
             for e in crate::extras::all() {
-                assert!(out.contains(e.id), "{} missing at width {}", e.id, width);
+                assert!(out.contains(&e.id), "{} missing at width {}", e.id, width);
                 assert!(out.contains(&e.category), "category missing at {}", width);
             }
             assert!(out.contains("[ ]"), "no tick box at width {}", width);

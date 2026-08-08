@@ -467,6 +467,25 @@ they are two extras you choose between — `--extras` never stacks them, the sam
 default set swaps rather than adds. Each extra's description names any external setup it needs
 (a CLI to install, a service to configure) so opting in is an informed choice.
 
+### Extras of your own
+
+An extra is a `.list` file with two comment lines, which is a format you can write by hand.
+Drop one in `extras/` beside your plugin list and it joins the menu — no pull request, nothing
+to convince anyone of:
+
+```
+# category: mine
+# the three things I install on every machine
+cloudmanic/herdr-plus
+smarzban/herdr-file-viewer
+```
+
+Saved as `extras/mine.list`, that is `herdr-lazy init --extras mine`, and a row marked `*` in
+the pane. It sits beside the list rather than in a config directory for the reason the lockfile
+does: if you keep your list in a dotfiles repo, the things you wrote belong there too. Giving
+one the same name as a bundled extra replaces it, and the listing says so. A file that lists no
+plugins is reported and skipped, never a crash and never a silent disappearance.
+
 Extras are plain `owner/repo` lists under [`extras/`](extras/), embedded at build time, so
 listing one never touches the network. Adding an extra is a small, reviewed pull request —
 drop a file in `extras/` and add a line to the registry. The bar it clears is in

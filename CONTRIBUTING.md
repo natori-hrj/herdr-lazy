@@ -84,6 +84,11 @@ Self-submissions are welcome and held to exactly this list, and so are the maint
 plugins: being written by the author is not a reason to include something here, the same way
 it is not for the default set.
 
+If the grouping you want is a personal one — "the three things I install on every machine" —
+you do not need this repository at all. A `.list` file in `extras/` beside your own plugin list
+joins your menu directly; see the README. The bar above is for what ships to everyone, and it
+would be the wrong thing to lower for a bundle only you use.
+
 ## Reporting a bug
 
 The useful ones tend to include:
