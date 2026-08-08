@@ -741,7 +741,7 @@ fn cmd_init(force: bool, extra_ids: &[String], from: Option<&str>) -> io::Result
         }
     }
     if !unknown.is_empty() {
-        let known: Vec<&str> = extras::all().iter().map(|e| e.id).collect();
+        let known: Vec<String> = extras::all().iter().map(|e| e.id.clone()).collect();
         eprintln!("unknown extra(s): {}", unknown.join(", "));
         eprintln!("available: {} (see `herdr-lazy extras`)", known.join(", "));
         return Ok(());
@@ -809,9 +809,36 @@ fn cmd_extras() -> io::Result<()> {
     for cat in &categories {
         println!("{}:", cat);
         for e in all.iter().filter(|e| &e.category == cat) {
-            println!("  {:<12} {}", e.id, e.description);
+            // Yours are marked. "Reviewed and shipped with the tool" and "a file I wrote last
+            // Tuesday" are different claims, and the menu should not blur them.
+            let mark = if e.source == extras::Source::Local {
+                " (yours)"
+            } else {
+                ""
+            };
+            println!("  {:<12} {}{}", e.id, e.description, mark);
         }
         println!();
+    }
+
+    // Shadowing is allowed — it is your file — but never silent.
+    let (local, problems) = extras::local();
+    for e in &local {
+        if extras::is_bundled(&e.id) {
+            println!(
+                "note: your `{}` replaces the bundled extra of that name.",
+                e.id
+            );
+        }
+    }
+    for p in &problems {
+        eprintln!("skipped {}", p);
+    }
+    if local.is_empty() && problems.is_empty() {
+        println!(
+            "write your own: drop `<id>.list` in {}",
+            extras::local_dir().display()
+        );
     }
     Ok(())
 }
@@ -2589,7 +2616,8 @@ command = "something.else"
 
     fn extra(plugins: &[&str]) -> extras::Extra {
         extras::Extra {
-            id: "worktrunk",
+            id: "worktrunk".to_string(),
+            source: extras::Source::Bundled,
             category: "worktree".to_string(),
             description: "switch worktrees from a picker".to_string(),
             plugins: plugins.iter().map(|p| p.to_string()).collect(),
