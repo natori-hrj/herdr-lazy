@@ -93,7 +93,8 @@ would be the wrong thing to lower for a bundle only you use.
 
 The useful ones tend to include:
 
-- `herdr --version` and `herdr-lazy probe` output (it prints the resolved paths)
+- `herdr-lazy probe` output — it prints the herdr version and the resolved paths, and
+  `probe --raw` adds the full CLI payloads if the problem looks like a parsing one
 - the contents of your `plugins.list`
 - what you expected, and what happened
 

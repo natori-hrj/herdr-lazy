@@ -499,7 +499,7 @@ fn dump_block(out: &str, err: &str) {
 
 /// The make-or-break check: can a plugin drive the herdr CLI, and what does
 /// `plugin list` actually print? Run this first, on a machine with herdr.
-fn cmd_probe() -> io::Result<()> {
+fn cmd_probe(raw: bool) -> io::Result<()> {
     println!("herdr-lazy probe — verifying the plugin <-> herdr CLI bridge\n");
     println!("HERDR_BIN_PATH = {}", herdr_bin());
     println!("config dir     = {}", config_dir().display());
@@ -511,69 +511,113 @@ fn cmd_probe() -> io::Result<()> {
             "`herdr plugin config-dir`, or the legacy default if herdr is unreachable"
         }
     );
-    println!("bundle         = {}", bundle_path().display());
-    println!("lock           = {}", lock_path().display());
+    println!(
+        "bundle         = {} {}",
+        bundle_path().display(),
+        file_note(&bundle_path())
+    );
+    println!(
+        "lock           = {} {}",
+        lock_path().display(),
+        file_note(&lock_path())
+    );
     println!();
 
     // 1. Can we reach the herdr binary at all?
-    match run_herdr(&["--version"]) {
+    let version = match run_herdr(&["--version"]) {
         Ok((ok, out, err)) => {
-            println!("[herdr --version] success={}", ok);
-            if !out.trim().is_empty() {
-                println!("  stdout: {}", out.trim());
-            }
+            println!("[herdr --version] success={} {}", ok, out.trim());
             if !err.trim().is_empty() {
                 println!("  stderr: {}", err.trim());
             }
+            ok
         }
         Err(e) => {
             println!("[herdr --version] could not launch: {}", e);
             println!("\nVERDICT: cannot invoke herdr. Set HERDR_BIN_PATH or run inside herdr.");
             return Ok(());
         }
-    }
-    println!();
+    };
 
     // 2. What does `plugin` actually expose?
     //
-    // This used to only grep the help text for keywords like "install"/"list" and print
-    // booleans. That hid the *flags* — `list --json` and `install --ref REF` both went
-    // unnoticed, and we nearly built a text parser and a whole git-checkout pinning layer
-    // that herdr already provides. Print the help verbatim; let a human read it.
-    match run_herdr(&["plugin", "--help"]) {
+    // The verbatim help used to print here always. It earned that when the CLI surface was
+    // unknown — grepping it for keywords had already hidden `list --json` and `install --ref`
+    // once, and nearly cost a whole hand-rolled pinning layer. The surface is known now, so it
+    // moves behind `--raw`: probe is the command someone runs to file a bug, and burying the
+    // paths under a page of help text makes that report harder to write, not easier.
+    let help = match run_herdr(&["plugin", "--help"]) {
         Ok((ok, out, err)) => {
             println!("[herdr plugin --help] success={}", ok);
-            dump_block(&out, &err);
+            if raw {
+                dump_block(&out, &err);
+            }
+            ok
         }
-        Err(e) => println!("[herdr plugin --help] could not run: {}", e),
-    }
-    println!();
+        Err(e) => {
+            println!("[herdr plugin --help] could not run: {}", e);
+            false
+        }
+    };
 
-    // 3. The list format we parse in `sync`. `--json` is the contract; the human output is
-    //    shown only so a reader can sanity-check that the two agree.
-    match run_herdr(&["plugin", "list", "--json"]) {
+    // 3. The list format `sync` parses. `--json` is the contract.
+    let list = match run_herdr(&["plugin", "list", "--json"]) {
         Ok((ok, out, err)) => {
-            println!("[herdr plugin list --json] success={}", ok);
-            dump_block(&out, &err);
+            println!(
+                "[herdr plugin list --json] success={} {}",
+                ok,
+                plugin_summary(&out)
+            );
+            if raw {
+                dump_block(&out, &err);
+            }
+            ok
         }
-        Err(e) => println!("[herdr plugin list --json] could not run: {}", e),
+        Err(e) => {
+            println!("[herdr plugin list --json] could not run: {}", e);
+            false
+        }
+    };
+
+    if raw {
+        match run_herdr(&["plugin", "list"]) {
+            Ok((ok, out, err)) => {
+                println!("[herdr plugin list] (human, for comparison) success={}", ok);
+                dump_block(&out, &err);
+            }
+            Err(e) => println!("[herdr plugin list] could not run: {}", e),
+        }
     }
+
     println!();
-
-    match run_herdr(&["plugin", "list"]) {
-        Ok((ok, out, err)) => {
-            println!("[herdr plugin list] (human, for comparison) success={}", ok);
-            dump_block(&out, &err);
-        }
-        Err(e) => println!("[herdr plugin list] could not run: {}", e),
+    if version && help && list {
+        println!("VERDICT: the bridge works.");
+    } else {
+        println!("VERDICT: something above failed — the lines marked success=false are the ones to report.");
     }
-
-    println!(
-        "\n>>> NOTE: `plugin list` reports no owner/repo — only plugin_id, name and source.\n\
-         >>> If any plugin above was installed from github, paste its `source` object back:\n\
-         >>> that is the field `sync --prune` must match bundle entries against."
-    );
+    if !raw {
+        println!("(`probe --raw` adds the full payloads, which is what a bug report may want.)");
+    }
     Ok(())
+}
+
+/// `(4 entries)` / `(missing)` — enough to tell a working setup from an empty one at a glance.
+fn file_note(p: &Path) -> String {
+    if !p.exists() {
+        return "(missing)".to_string();
+    }
+    format!("({} entries)", read_lines(p).len())
+}
+
+/// What `plugin list --json` amounts to, instead of the ~140 KB it takes to say it.
+fn plugin_summary(stdout: &str) -> String {
+    match parse_plugin_list(stdout) {
+        Ok(ps) => {
+            let github = ps.iter().filter(|p| p.slug.is_some()).count();
+            format!("({} plugins, {} from github)", ps.len(), github)
+        }
+        Err(e) => format!("(could not be parsed: {})", e),
+    }
 }
 
 /// Parse `--extras a,b` or `--extras=a,b` (repeatable) into a list of extra ids.
@@ -1987,7 +2031,7 @@ fn cmd_remove(spec: &str) -> io::Result<()> {
 fn print_help() {
     println!("herdr-lazy — be lazy: a curated plugin distro & manager for herdr\n");
     println!("USAGE: herdr-lazy <command>\n");
-    println!("  probe             verify the plugin <-> herdr CLI bridge (run this first)");
+    println!("  probe [--raw]     verify the plugin <-> herdr CLI bridge (run this first)");
     println!("  init [--force] [--extras <id,…>] [--from <owner/repo[@ref]>]");
     println!("                    write the default bundle, or adopt someone else's list");
     println!("  extras            list the opt-in extras you can pass to `init --extras`");
@@ -2009,7 +2053,7 @@ fn main() {
     let rest: Vec<&str> = args.iter().skip(2).map(|s| s.as_str()).collect();
 
     let result = match cmd {
-        "probe" => cmd_probe(),
+        "probe" => cmd_probe(rest.contains(&"--raw") || rest.contains(&"--verbose")),
         "startup" => cmd_startup(),
         "auto-sync" => cmd_auto_sync(rest.first().copied()),
         "init" => cmd_init(
@@ -2838,6 +2882,23 @@ command = "something.else"
         assert!(is_entry_line("owner/repo"));
         assert!(!is_entry_line("# a comment"));
         assert!(!is_entry_line("   "));
+    }
+
+    /// probe is the first thing someone runs when filing a bug, so what it says about the
+    /// payload has to be right — the count is the whole reason not to print the payload.
+    #[test]
+    fn probe_summarises_the_plugin_list_instead_of_printing_it() {
+        assert_eq!(plugin_summary(LINKED_LOCAL), "(1 plugins, 0 from github)");
+        assert!(plugin_summary("not json at all").starts_with("(could not be parsed"));
+    }
+
+    #[test]
+    fn probe_says_whether_a_file_is_there_and_how_big() {
+        let p = scratch_list("probe");
+        assert_eq!(file_note(&p), "(missing)");
+        fs::write(&p, "# a comment\nowner/one\nowner/two\n").unwrap();
+        assert_eq!(file_note(&p), "(2 entries)", "comments are not entries");
+        let _ = fs::remove_file(&p);
     }
 
     /// The floor herdr enforces and the floor the README promises have to be the same number.
