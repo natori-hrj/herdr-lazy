@@ -160,7 +160,7 @@ herdr-lazy update smarzban/herdr-file-viewer
 | `remove <owner/repo>` | remove an entry from the bundle |
 | `lock` | write the lockfile from the current bundle |
 | `auto-sync [on\|off]` | install missing plugins automatically when herdr starts |
-| `probe` | dump what the herdr CLI exposes (for debugging) |
+| `probe [--raw]` | check the herdr bridge and show the resolved paths; `--raw` adds the full payloads |
 
 ### Already using herdr?
 
