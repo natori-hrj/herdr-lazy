@@ -439,6 +439,16 @@ herdr-lazy init --from owner/repo        # their plugins.list becomes yours
 herdr-lazy init --from owner/repo@v1     # at a ref, if you would rather it not move
 ```
 
+A real one, if you want somewhere to start:
+
+```sh
+herdr-lazy init --from natori-hrj/herdr-config
+```
+
+That is this project author's own list — the five plugins actually in use, which is also why
+they are the ones in the default set. Publishing yours is a repository with a `plugins.list` at
+the root and nothing else required.
+
 It reads `plugins.list` from the root of that repository and writes it as your list, comments
 and all. After that it is your file: there is no upstream, no link back, and nothing to update
 from. A fork, not a subscription — the whole point is that you can now disagree with it.
