@@ -41,6 +41,12 @@ use std::process::Command;
 /// the gaps nothing else covers. Overlapping plugins are deliberately excluded rather than
 /// stacked — two plugins that both open a file pane is a worse default than one.
 ///
+/// And one that outranks both: somebody has to actually use it. Popularity is evidence of
+/// that, not a substitute for it — `herdr-triage` was kept here on three stars after
+/// `herdr-green` and `herdr-standup` were cut for being unused, which was the same mistake
+/// with a better-looking number attached. It is gone for the same reason they were. The
+/// author's own plugins clear this bar or leave, exactly as anyone else's do.
+///
 /// A third criterion, learned the hard way: it has to actually install. herdr runs plugin
 /// builds with a minimal PATH that excludes `~/.cargo/bin`, so a plugin whose build is a bare
 /// `cargo build --release` fails on machines where Rust is installed and works fine in the
@@ -58,13 +64,20 @@ use std::process::Command;
 /// Edit freely — `herdr-lazy init` writes these into your bundle file, and nothing here is
 /// load-bearing.
 const DEFAULT_BUNDLE: &[&str] = &[
+    // Listed so the tool can be updated by the tool. `u` in the pane, and `update` on the
+    // command line, only act on entries in the list — leaving herdr-lazy out meant the one
+    // plugin you could not update with herdr-lazy was herdr-lazy. `--prune` never removes it
+    // either way; that is handled by identity, not by membership.
+    //
+    // Updating it replaces the binary of the running process. That is fine on Unix, where the
+    // open inode outlives the rename, and it has been done on Windows too (see #2) — but it is
+    // the reason this entry is worth a comment rather than being obvious.
+    "natori-hrj/herdr-lazy",
     // Proven in the ecosystem, and verified to install cleanly.
     "cloudmanic/herdr-plus",                    // projects + quick actions
     "smarzban/herdr-file-viewer",               // git-aware read-only file pane
     "persiyanov/herdr-reviewr",                 // comment on an agent's diff, send it back
     "razajamil/herdr-plugin-workspace-manager", // per-workspace tab/pane layouts; no build step
-    // Gap nothing else covers: keeping a human oriented across several running agents.
-    "natori-hrj/herdr-triage", // which agent needs you most
 ];
 
 fn herdr_bin() -> String {
