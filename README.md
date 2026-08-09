@@ -400,15 +400,20 @@ a file pane is a worse default than one.
 
 | plugin | why |
 |---|---|
+| [natori-hrj/herdr-lazy](https://github.com/natori-hrj/herdr-lazy) | this tool, listed so that `u` can update it like anything else |
 | [cloudmanic/herdr-plus](https://github.com/cloudmanic/herdr-plus) | projects and quick actions; the broadest general-purpose add-on |
 | [smarzban/herdr-file-viewer](https://github.com/smarzban/herdr-file-viewer) | git-aware read-only file pane |
 | [persiyanov/herdr-reviewr](https://github.com/persiyanov/herdr-reviewr) | review an agent's diff line by line and send comments back to it |
 | [razajamil/herdr-plugin-workspace-manager](https://github.com/razajamil/herdr-plugin-workspace-manager) | per-workspace tab/pane layouts, applied automatically |
-| [natori-hrj/herdr-triage](https://github.com/natori-hrj/herdr-triage) | ranks agents by who needs you most |
 
-The last one is by this project's author. It is here because running several agents at once
-creates a problem the ecosystem does not otherwise address — knowing which one to look at —
-not because of who wrote it. If that is not your problem, remove it.
+The first entry is this tool. `update` and the pane's `u` only act on what your list names, so
+leaving it out made herdr-lazy the one plugin herdr-lazy could not update. Removing it from the
+list does not endanger it: `--prune` refuses to uninstall it by identity, not by membership.
+
+There is one more criterion, and it outranks the rest: somebody has to actually use these.
+Popularity is evidence of that, not a substitute — an earlier version of this set kept a plugin
+on three stars that its own author never ran. The author's own plugins clear that bar or leave,
+exactly as anyone else's do.
 
 A third criterion showed up during testing: it has to actually install. herdr runs plugin
 builds with a minimal PATH that excludes `~/.cargo/bin`, so a plugin whose build is a bare
