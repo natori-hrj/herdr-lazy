@@ -726,17 +726,12 @@ fn looks_like_entry(l: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "._-/".contains(c))
 }
 
-/// Fetch someone else's `plugins.list` and return what to write.
+/// Fetch someone else's `plugins.list`: the file as written, and the entries in it.
 ///
-/// A copy, deliberately: nothing records where it came from except a comment, there is no
-/// upstream to track and no update channel. Adopting a list must not make the manager depend
-/// on someone else's opinion — that is the whole difference between a starter and a
-/// subscription.
-///
-/// The lockfile is not adopted with it. Taking someone's list means the same plugins; taking
-/// their lock would mean the same commits, which is a far stronger claim to place in a
-/// stranger's hands. If that is ever wanted it should be asked for separately.
-fn adopt_body(spec: &str) -> Result<String, String> {
+/// Both callers need both halves — `init --from` writes the file verbatim so its comments
+/// survive, while the pane shows one row per entry and lets you take some of them. Validating
+/// once, here, is what stops a fetched HTML error page reaching either of them.
+pub(crate) fn fetch_list(spec: &str) -> Result<(String, Vec<String>), String> {
     let s = Spec::parse(spec);
     if !looks_like_entry(&s.repo) || s.repo.matches('/').count() != 1 {
         return Err(format!(
@@ -752,17 +747,35 @@ fn adopt_body(spec: &str) -> Result<String, String> {
             )
         })?;
 
-    let entries: Vec<&str> = body.lines().filter(|l| is_entry_line(l)).collect();
+    let entries: Vec<String> = body
+        .lines()
+        .filter(|l| is_entry_line(l))
+        .map(|l| l.trim().to_string())
+        .collect();
     if entries.is_empty() {
         return Err(format!("{} has a plugins.list, but it lists nothing", spec));
     }
     if let Some(bad) = entries.iter().find(|l| !looks_like_entry(l)) {
         return Err(format!(
             "{} does not look like a plugin list — found `{}`",
-            spec,
-            bad.trim()
+            spec, bad
         ));
     }
+    Ok((body, entries))
+}
+
+/// Fetch someone else's `plugins.list` and return what to write.
+///
+/// A copy, deliberately: nothing records where it came from except a comment, there is no
+/// upstream to track and no update channel. Adopting a list must not make the manager depend
+/// on someone else's opinion — that is the whole difference between a starter and a
+/// subscription.
+///
+/// The lockfile is not adopted with it. Taking someone's list means the same plugins; taking
+/// their lock would mean the same commits, which is a far stronger claim to place in a
+/// stranger's hands. If that is ever wanted it should be asked for separately.
+fn adopt_body(spec: &str) -> Result<String, String> {
+    let (body, _) = fetch_list(spec)?;
 
     // Provenance as a comment, not as state: it tells a reader where this came from without
     // creating anything the tool has to keep in step.
@@ -777,7 +790,12 @@ fn adopt_body(spec: &str) -> Result<String, String> {
     Ok(out)
 }
 
-fn cmd_init(force: bool, extra_ids: &[String], from: Option<&str>) -> io::Result<()> {
+fn cmd_init(
+    force: bool,
+    extra_ids: &[String],
+    from: Option<&str>,
+    dry_run: bool,
+) -> io::Result<()> {
     let p = bundle_path();
     if p.exists() && !force {
         println!(
@@ -817,11 +835,28 @@ fn cmd_init(force: bool, extra_ids: &[String], from: Option<&str>) -> io::Result
         None => None,
     };
 
-    ensure_parent(&p)?;
     let base = match &adopted {
         Some((_, body)) => body.clone(),
         None => default_bundle_body(&chosen),
     };
+    // Reading a list before it becomes your file is the point; this is the scriptable half.
+    //
+    // An adopted body is written verbatim and gets its extras from a second pass further down,
+    // so they have to be printed here too. `default_bundle_body` already contains them, which
+    // is why this only runs on the adopted path — printing both ways listed pluck twice.
+    if dry_run {
+        print!("{}", base);
+        if adopted.is_some() {
+            for e in &chosen {
+                println!("\n{}", e.header());
+                for pl in &e.plugins {
+                    println!("{}", pl);
+                }
+            }
+        }
+        return Ok(());
+    }
+    ensure_parent(&p)?;
     fs::write(&p, base)?;
     // An adopted list is written verbatim, so any extras asked for still have to be appended —
     // the same append the pane uses, so the two cannot produce different files.
@@ -2004,6 +2039,39 @@ fn add_extra_at(p: &Path, e: &extras::Extra) -> io::Result<Vec<String>> {
     Ok(fresh)
 }
 
+/// Append entries taken from someone else's list, under one comment naming where they came
+/// from. Returns what was added, which is empty when your list already covers all of them.
+///
+/// One comment above the block rather than one per line: the provenance is a fact about the
+/// act of taking them, not about each plugin, and a list is meant to stay readable.
+pub(crate) fn add_adopted_to_list(spec: &str, entries: &[String]) -> io::Result<Vec<String>> {
+    let p = bundle_path();
+    let listed: Vec<String> = read_lines(&p).iter().map(|l| Spec::parse(l).repo).collect();
+    let fresh: Vec<String> = entries
+        .iter()
+        .filter(|e| !listed.contains(&Spec::parse(e).repo))
+        .cloned()
+        .collect();
+    if fresh.is_empty() {
+        return Ok(fresh);
+    }
+    ensure_parent(&p)?;
+    let mut body = fs::read_to_string(&p).unwrap_or_default();
+    if !body.is_empty() {
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push('\n');
+    }
+    body.push_str(&format!("# from {}\n", spec));
+    for e in &fresh {
+        body.push_str(e);
+        body.push('\n');
+    }
+    fs::write(&p, body)?;
+    Ok(fresh)
+}
+
 /// Drop an entry from the list. Does NOT uninstall — that is `sync --prune`.
 pub(crate) fn remove_from_list(spec: &str) -> io::Result<String> {
     let p = bundle_path();
@@ -2045,7 +2113,7 @@ fn print_help() {
     println!("herdr-lazy — be lazy: a curated plugin distro & manager for herdr\n");
     println!("USAGE: herdr-lazy <command>\n");
     println!("  probe [--raw]     verify the plugin <-> herdr CLI bridge (run this first)");
-    println!("  init [--force] [--extras <id,…>] [--from <owner/repo[@ref]>]");
+    println!("  init [--force] [--extras <id,…>] [--from <owner/repo[@ref]>] [--dry-run]");
     println!("                    write the default bundle, or adopt someone else's list");
     println!("  extras            list the opt-in extras you can pass to `init --extras`");
     println!("  list              show desired plugins");
@@ -2073,6 +2141,7 @@ fn main() {
             rest.contains(&"--force"),
             &extras_arg(&rest),
             from_arg(&rest),
+            rest.contains(&"--dry-run"),
         ),
         "extras" => cmd_extras(),
         "list" => cmd_list(),
