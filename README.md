@@ -148,7 +148,7 @@ herdr-lazy update smarzban/herdr-file-viewer
 
 | command | what it does |
 |---|---|
-| `init [--force] [--extras <id,…>] [--from <owner/repo[@ref]>]` | write the curated default bundle, or adopt someone else's list |
+| `init [--force] [--extras <id,…>] [--from <owner/repo[@ref]>] [--dry-run]` | write the curated default bundle, or adopt someone else's list; `--dry-run` prints it instead |
 | `extras` | list the opt-in extras (`e` in the pane picks them interactively) |
 | `list` | show the desired plugin set |
 | `install [<repo>…]` | install what is missing, restore drifted pins |
@@ -449,8 +449,20 @@ That is this project author's own list — the five plugins actually in use, whi
 they are the ones in the default set. Publishing yours is a repository with a `plugins.list` at
 the root and nothing else required.
 
-It reads `plugins.list` from the root of that repository and writes it as your list, comments
-and all. After that it is your file: there is no upstream, no link back, and nothing to update
+Press `f` in the pane to read one before taking it. Each entry becomes a row, marked with what
+your machine already says about it — in your list, installed but unlisted, or new — and space
+ticks the ones you want. Everything you do not already have starts ticked, so enter takes "the
+rest of theirs" without touching a row. Three of someone's five is a flag away from impossible
+and a keystroke away in the pane.
+
+On the command line, `--dry-run` prints what would be written and writes nothing:
+
+```sh
+herdr-lazy init --from owner/repo --dry-run
+```
+
+`init --from` reads `plugins.list` from the root of that repository and writes it as your list,
+comments and all. After that it is your file: there is no upstream, no link back, and nothing to update
 from. A fork, not a subscription — the whole point is that you can now disagree with it.
 
 The lockfile does not come with it. Their list means the same plugins; their lock would mean

@@ -411,6 +411,139 @@ impl ExtrasPicker {
     }
 }
 
+/// What your own list already says about an entry in someone else's.
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum Held {
+    /// Already in your list — ticking it would do nothing.
+    Listed,
+    /// Installed, but your list does not mention it. Taking it is bookkeeping, not a download.
+    Installed,
+    /// New to this machine.
+    Fresh,
+}
+
+struct AdoptRow {
+    entry: String,
+    held: Held,
+    picked: bool,
+}
+
+/// `f` — read someone else's list, and take some of it.
+///
+/// `init --from` is the all-or-nothing version, and a flag cannot express "these three". This
+/// is the same source read as rows you can choose from — which is also the only way to see
+/// what a list contains before it becomes your file.
+struct AdoptPicker {
+    /// What is being typed, until a list has been fetched.
+    spec: String,
+    /// Rows, once one has. Empty while the repository is still being asked for.
+    rows: Vec<AdoptRow>,
+    /// The spec the rows came from, which is what gets written as provenance.
+    from: String,
+    cursor: usize,
+    /// Set when a fetch fails, so the view explains itself rather than looking empty.
+    error: Option<String>,
+}
+
+impl AdoptPicker {
+    fn new() -> AdoptPicker {
+        AdoptPicker {
+            spec: String::new(),
+            rows: Vec::new(),
+            from: String::new(),
+            cursor: 0,
+            error: None,
+        }
+    }
+
+    fn asking(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Fetch and classify. `listed` is your list, `installed` what is on the machine.
+    fn load(&mut self, listed: &[String], installed: &[String]) {
+        let spec = self.spec.trim().to_string();
+        if spec.is_empty() {
+            return;
+        }
+        match crate::fetch_list(&spec) {
+            Ok((_, entries)) => {
+                self.rows = entries
+                    .into_iter()
+                    .map(|entry| {
+                        let repo = crate::Spec::parse(&entry).repo;
+                        let held = if listed.contains(&repo) {
+                            Held::Listed
+                        } else if installed.contains(&repo) {
+                            Held::Installed
+                        } else {
+                            Held::Fresh
+                        };
+                        // Default to taking what you do not already have. Ticking everything
+                        // would offer to re-add entries that are already yours; ticking nothing
+                        // makes the common case — "give me the rest" — a row-by-row chore.
+                        let picked = held != Held::Listed;
+                        AdoptRow {
+                            entry,
+                            held,
+                            picked,
+                        }
+                    })
+                    .collect();
+                self.from = spec;
+                self.cursor = 0;
+                self.error = None;
+            }
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    fn toggle(&mut self) {
+        if let Some(r) = self.rows.get_mut(self.cursor) {
+            r.picked = !r.picked;
+        }
+    }
+
+    fn taken(&self) -> Vec<String> {
+        self.rows
+            .iter()
+            .filter(|r| r.picked)
+            .map(|r| r.entry.clone())
+            .collect()
+    }
+
+    fn move_cursor(&mut self, down: bool) {
+        if down {
+            if self.cursor + 1 < self.rows.len() {
+                self.cursor += 1;
+            }
+        } else {
+            self.cursor = self.cursor.saturating_sub(1);
+        }
+    }
+
+    /// How many lines fit and which is at the top — shared by drawing and clicking.
+    fn window(&self, height: u16) -> (usize, usize) {
+        let visible = (height as usize).saturating_sub(5).max(1);
+        let start = if self.cursor >= visible {
+            self.cursor - visible + 1
+        } else {
+            0
+        };
+        (visible, start)
+    }
+
+    fn row_at(&self, screen_row: u16, height: u16) -> Option<usize> {
+        let (visible, start) = self.window(height);
+        let y = screen_row as usize;
+        if y < LIST_TOP {
+            return None;
+        }
+        let idx = start + (y - LIST_TOP);
+        (y - LIST_TOP < visible && idx < self.rows.len()).then_some(idx)
+    }
+}
+
 /// `Default` so tests can build one from just the rows they care about; this struct grows a
 /// field per view, and every fixture should not have to know about all of them.
 #[derive(Default)]
@@ -420,6 +553,8 @@ struct App {
     browser: Option<crate::browse::Browser>,
     /// Present while the extras picker is open, for the same reason.
     extras: Option<ExtrasPicker>,
+    /// Present while reading someone else's list.
+    adopt: Option<AdoptPicker>,
     /// `?` — the full keymap. The footer only has room for the common half.
     help: bool,
     /// Open details for the row at this index: what the plugin does and how to reach it.
@@ -462,6 +597,7 @@ impl App {
                 rows: rows_with_updates(&desired, &installed, &market),
                 browser: None,
                 extras: None,
+                adopt: None,
                 help: false,
                 detail_of: None,
                 detail_cursor: 0,
@@ -476,6 +612,7 @@ impl App {
                 rows: Vec::new(),
                 browser: None,
                 extras: None,
+                adopt: None,
                 help: false,
                 detail_of: None,
                 detail_cursor: 0,
@@ -493,10 +630,12 @@ impl App {
         let (cursor, flash) = (self.cursor, self.flash.take());
         let (browser, help) = (self.browser.take(), self.help);
         let extras = self.extras.take();
+        let adopt = self.adopt.take();
         let changes = self.detail_changes.take();
         *self = App::load();
         self.browser = browser;
         self.extras = extras;
+        self.adopt = adopt;
         self.help = help;
         self.detail_changes = changes;
         self.cursor = cursor.min(self.rows.len().saturating_sub(1));
@@ -849,6 +988,22 @@ impl App {
             return Ok(());
         }
 
+        if let Some(a) = self.adopt.as_mut() {
+            match m.kind {
+                MouseEventKind::ScrollDown => a.move_cursor(true),
+                MouseEventKind::ScrollUp => a.move_cursor(false),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(i) = a.row_at(m.row, height) {
+                        a.cursor = i;
+                        a.toggle();
+                        self.flash = None;
+                    }
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
         // The picker is drawn over the list, so it must consume the mouse too — otherwise a
         // click lands on a row nobody can see, and the tick it leaves behind is still there
         // when the picker closes.
@@ -1073,6 +1228,74 @@ impl App {
         });
     }
 
+    /// `f` — open the view that reads someone else's list.
+    fn open_adopt(&mut self) {
+        self.adopt = Some(AdoptPicker::new());
+        self.flash = None;
+    }
+
+    /// Enter, at the prompt — fetch the list and show what it holds.
+    fn load_adopt(&mut self) {
+        let listed: Vec<String> = crate::desired_plugins()
+            .iter()
+            .map(|l| crate::Spec::parse(l).repo)
+            .collect();
+        let installed: Vec<String> = self.rows.iter().filter_map(|r| r.slug.clone()).collect();
+        if let Some(a) = self.adopt.as_mut() {
+            a.load(&listed, &installed);
+        }
+    }
+
+    /// Enter, on the rows — take the ticked entries into your list.
+    ///
+    /// Adds only. Nothing is installed here and nothing is removed: the rows come back ticked
+    /// in the list behind, so `i` installs exactly what was taken, which is the same two-step
+    /// the marketplace browser uses.
+    fn apply_adopt(&mut self) {
+        let Some(a) = self.adopt.as_ref() else { return };
+        let (from, taken) = (a.from.clone(), a.taken());
+        if taken.is_empty() {
+            self.flash = Some("nothing ticked".to_string());
+            return;
+        }
+        let added = match crate::add_adopted_to_list(&from, &taken) {
+            Ok(v) => v,
+            Err(e) => {
+                self.flash = Some(format!("could not write the list: {}", e));
+                return;
+            }
+        };
+        self.adopt = None;
+        self.refresh();
+        let arrived: Vec<usize> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                added.iter().any(|name| {
+                    r.listed_as.as_deref() == Some(name.as_str())
+                        || r.slug.as_deref() == Some(name.as_str())
+                })
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if let Some(&first) = arrived.first() {
+            self.cursor = first;
+        }
+        for i in arrived {
+            self.rows[i].picked = true;
+        }
+        self.flash = Some(if added.is_empty() {
+            format!("your list already has everything ticked from {}", from)
+        } else {
+            format!(
+                "took {} from {} — press i to install",
+                added.join(", "),
+                from
+            )
+        });
+    }
+
     /// `d` — stop managing an entry. Never uninstalls; that is `x`.
     fn drop_selected(&mut self) {
         let Some(row) = self.selected() else { return };
@@ -1102,6 +1325,9 @@ impl App {
         }
         if self.extras.is_some() {
             return self.draw_extras(out, width, height);
+        }
+        if self.adopt.is_some() {
+            return self.draw_adopt(out, width, height);
         }
         self.draw_list(out, width, height)
     }
@@ -1386,6 +1612,10 @@ impl App {
                     "e",
                     "extras — opt-in picks, ticked with space and added with enter",
                 ),
+                (
+                    "f",
+                    "read someone else's list — tick what you want, enter takes it",
+                ),
             ],
         )?;
         section(
@@ -1553,6 +1783,84 @@ impl App {
 
         let footer = match &self.flash {
             Some(msg) => format!("\x1b[36m{}\x1b[0m", msg),
+            None => "\x1b[1m[space]\x1b[0m tick  \x1b[1m[enter]\x1b[0m add to your list  \
+                     \x1b[1m[↑↓]\x1b[0m move  \x1b[1m[esc]\x1b[0m back"
+                .to_string(),
+        };
+        write!(
+            out,
+            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
+            height.saturating_sub(1),
+            rule,
+            footer
+        )?;
+        out.flush()
+    }
+
+    fn draw_adopt(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        let a = self.adopt.as_ref().expect("checked by caller");
+        let rule = "─".repeat((width as usize).clamp(20, 200));
+
+        write!(out, "\x1b[H\x1b[2J")?;
+        if a.asking() {
+            writeln!(
+                out,
+                "\x1b[1m start from someone else's list\x1b[0m  \x1b[2mowner/repo, or \
+                 owner/repo@ref\x1b[0m\r"
+            )?;
+            writeln!(out, " from: \x1b[1m{}\x1b[0m\x1b[7m \x1b[0m\r", a.spec)?;
+            writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
+            if let Some(e) = &a.error {
+                writeln!(out, " \x1b[31m{}\x1b[0m\r", e)?;
+            } else {
+                writeln!(
+                    out,
+                    " \x1b[2mit reads plugins.list from the root of that repository\x1b[0m\r"
+                )?;
+            }
+        } else {
+            let taking = a.rows.iter().filter(|r| r.picked).count();
+            writeln!(
+                out,
+                "\x1b[1m {}\x1b[0m  \x1b[2m{} entries · taking {} · space ticks, enter adds to \
+                 your list\x1b[0m\r",
+                a.from,
+                a.rows.len(),
+                taking
+            )?;
+            writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
+
+            let (visible, start) = a.window(height);
+            for (i, r) in a.rows.iter().enumerate().skip(start).take(visible) {
+                let pointer = if i == a.cursor {
+                    "\x1b[7m>\x1b[0m"
+                } else {
+                    " "
+                };
+                let tick = if r.picked { "\x1b[1m[x]\x1b[0m" } else { "[ ]" };
+                // What your machine already says about it, so "taking" means something.
+                let (mark, note) = match r.held {
+                    Held::Listed => ("\x1b[32m✔\x1b[0m", "already in your list"),
+                    Held::Installed => ("\x1b[33m·\x1b[0m", "installed, not in your list"),
+                    Held::Fresh => (" ", ""),
+                };
+                writeln!(
+                    out,
+                    "{} {} {} {:<44} \x1b[2m{}\x1b[0m\r",
+                    pointer,
+                    tick,
+                    mark,
+                    truncate(&r.entry, 44),
+                    note
+                )?;
+            }
+        }
+
+        let footer = match &self.flash {
+            Some(msg) => format!("\x1b[36m{}\x1b[0m", msg),
+            None if a.asking() => {
+                "\x1b[1m[enter]\x1b[0m read it  \x1b[1m[esc]\x1b[0m back".to_string()
+            }
             None => "\x1b[1m[space]\x1b[0m tick  \x1b[1m[enter]\x1b[0m add to your list  \
                      \x1b[1m[↑↓]\x1b[0m move  \x1b[1m[esc]\x1b[0m back"
                 .to_string(),
@@ -1941,6 +2249,68 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             continue;
         }
 
+        // Reading someone else's list: a text field while the repository is being typed, a
+        // menu once there are rows. Printable keys belong to the field in the first half, so
+        // the two halves cannot share a keymap.
+        if app.adopt.is_some() {
+            let asking = app.adopt.as_ref().is_some_and(|a| a.asking());
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') if !asking => {
+                    app.adopt = None;
+                    app.flash = None;
+                }
+                KeyCode::Esc => {
+                    app.adopt = None;
+                    app.flash = None;
+                }
+                KeyCode::Enter if asking => app.load_adopt(),
+                KeyCode::Enter => app.apply_adopt(),
+                KeyCode::Char('j') | KeyCode::Char('m')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    if asking {
+                        app.load_adopt()
+                    } else {
+                        app.apply_adopt()
+                    }
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Ok(())
+                }
+                KeyCode::Backspace if asking => {
+                    app.flash = None;
+                    if let Some(a) = app.adopt.as_mut() {
+                        a.spec.pop();
+                    }
+                }
+                // A repository name is typed, so nothing here may bind a plain letter — the
+                // same rule the marketplace browser needed after `a` and `o` ate search terms.
+                KeyCode::Char(c) if asking && !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.flash = None;
+                    if let Some(a) = app.adopt.as_mut() {
+                        a.spec.push(c);
+                    }
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(a) = app.adopt.as_mut() {
+                        a.toggle()
+                    }
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if let Some(a) = app.adopt.as_mut() {
+                        a.move_cursor(true)
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    if let Some(a) = app.adopt.as_mut() {
+                        a.move_cursor(false)
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
         // The picker is a menu, not a text field, so plain letters can stay commands here —
         // but it is still modal: nothing below may act on the list hidden behind it.
         if app.extras.is_some() {
@@ -2112,6 +2482,7 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             KeyCode::Char('d') => app.drop_selected(),
             KeyCode::Char('/') => app.open_browser(false),
             KeyCode::Char('e') => app.open_extras(),
+            KeyCode::Char('f') => app.open_adopt(),
             KeyCode::Char('?') => app.help = true,
 
             // Keys lazy.nvim has that this does not. Rather than doing nothing — which reads
@@ -2749,6 +3120,92 @@ mod tests {
             }
             assert!(out.contains("[ ]"), "no tick box at width {}", width);
         }
+    }
+
+    fn adopt_with(entries: &[&str], listed: &[&str], installed: &[&str]) -> AdoptPicker {
+        let mut a = AdoptPicker::new();
+        let listed: Vec<String> = listed.iter().map(|s| s.to_string()).collect();
+        let installed: Vec<String> = installed.iter().map(|s| s.to_string()).collect();
+        a.from = "someone/herd".to_string();
+        a.rows = entries
+            .iter()
+            .map(|e| {
+                let repo = crate::Spec::parse(e).repo;
+                let held = if listed.contains(&repo) {
+                    Held::Listed
+                } else if installed.contains(&repo) {
+                    Held::Installed
+                } else {
+                    Held::Fresh
+                };
+                AdoptRow {
+                    entry: e.to_string(),
+                    held,
+                    picked: held != Held::Listed,
+                }
+            })
+            .collect();
+        a
+    }
+
+    /// Enter straight away should take what you do not have, and nothing you already do —
+    /// which is what the ticks say before anyone touches them.
+    #[test]
+    fn what_you_already_have_starts_unticked() {
+        let a = adopt_with(
+            &["a/have", "b/installed", "c/new"],
+            &["a/have"],
+            &["b/installed"],
+        );
+        assert_eq!(
+            a.taken(),
+            vec!["b/installed".to_string(), "c/new".to_string()]
+        );
+        assert_eq!(a.rows[0].held, Held::Listed);
+        assert_eq!(a.rows[1].held, Held::Installed);
+        assert_eq!(a.rows[2].held, Held::Fresh);
+    }
+
+    /// Partial adoption is the whole point: three of someone's five.
+    #[test]
+    fn ticking_decides_what_is_taken() {
+        let mut a = adopt_with(&["a/one", "b/two", "c/three"], &[], &[]);
+        assert_eq!(a.taken().len(), 3);
+        a.cursor = 1;
+        a.toggle();
+        assert_eq!(a.taken(), vec!["a/one".to_string(), "c/three".to_string()]);
+    }
+
+    /// A pin is part of the entry and has to survive being taken, or adopting a list silently
+    /// unpins it.
+    #[test]
+    fn a_pinned_entry_is_taken_with_its_pin() {
+        let a = adopt_with(&["a/one@v1.2.0"], &[], &[]);
+        assert_eq!(a.taken(), vec!["a/one@v1.2.0".to_string()]);
+        assert_eq!(
+            a.rows[0].held,
+            Held::Fresh,
+            "the pin is not part of identity"
+        );
+    }
+
+    /// The same repo pinned differently is still the same plugin, and must not be offered as
+    /// something you do not have.
+    #[test]
+    fn a_pin_does_not_hide_that_you_already_have_it() {
+        let a = adopt_with(&["a/one@v2"], &["a/one"], &[]);
+        assert_eq!(a.rows[0].held, Held::Listed);
+        assert!(a.taken().is_empty());
+    }
+
+    #[test]
+    fn the_cursor_stops_at_both_ends() {
+        let mut a = adopt_with(&["a/one", "b/two"], &[], &[]);
+        a.move_cursor(false);
+        assert_eq!(a.cursor, 0);
+        a.move_cursor(true);
+        a.move_cursor(true);
+        assert_eq!(a.cursor, 1);
     }
 
     /// An extra you already have says so, so "add" on it is not a mystery no-op.
