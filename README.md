@@ -295,7 +295,8 @@ builds with a minimal PATH that excludes `~/.cargo/bin`, so a plugin whose build
 `cargo build --release` fails even on machines where Rust works perfectly in your own shell —
 the failure then reads as a broken toolchain, which it is not. The check only fires on that
 shape and stays quiet on anything it cannot read confidently: sending you away from a plugin
-that works would be worse than saying nothing. It never blocks the add.
+that works would be worse than saying nothing. It never blocks the add, and it says nothing on
+Windows, where herdr resolves cargo without trouble.
 
 The index is cached for six hours (`ctrl+r` refreshes) and works offline from that cache,
 saying how old it is. Two caveats worth stating plainly: the index endpoint is **not a

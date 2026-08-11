@@ -2072,7 +2072,15 @@ pub(crate) fn build_check(repo: &str) -> BuildCheck {
 }
 
 /// The reading half of `build_check`, split out so it can be tested against real manifests.
+///
+/// Never warns on Windows. The minimal build PATH is a thing observed on Unix; on Windows herdr
+/// found and ran `cargo` without trouble (#2), and this repository's own Windows build is a
+/// bare `cargo build --release` that installs. Warning there would be a false alarm about a
+/// plugin that works — the failure this check exists to prevent.
 fn classify_build(toml: &str) -> BuildCheck {
+    if cfg!(target_os = "windows") {
+        return BuildCheck::Fine;
+    }
     // A `[[build]]` entry is judged only once it is complete: `platforms` may be written either
     // side of `command`, and deciding at the `command` line would misread a Windows-only cargo
     // build as one that runs here.
@@ -3068,10 +3076,23 @@ command = "something.else"
 
     /// The failure this project designs around: a bare `cargo build` cannot run under herdr's
     /// build PATH, which excludes `~/.cargo/bin`.
+    ///
+    /// Unix only. See `classify_build` — on Windows herdr resolves cargo fine, so there is
+    /// nothing to warn about and this whole check stands down.
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn a_bare_cargo_build_is_the_thing_that_cannot_install() {
         let toml = "id = \"x\"\n\n[[build]]\ncommand = [\"cargo\", \"build\", \"--release\"]\n";
         assert_eq!(classify_build(toml), BuildCheck::NeedsCargoOnPath);
+    }
+
+    /// The warning is about a Unix PATH, so on Windows it must never fire — including on this
+    /// repository's own manifest, whose Windows build is exactly a bare `cargo build`.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_is_never_warned_about_cargo() {
+        let toml = "[[build]]\ncommand = [\"cargo\", \"build\", \"--release\"]\n";
+        assert_eq!(classify_build(toml), BuildCheck::Fine);
     }
 
     /// This project's own manifest must read as fine: the Unix build goes through a script that
@@ -3106,6 +3127,7 @@ command = "something.else"
     /// A cargo build gated to another platform does not fail *here*, and `platforms` may be
     /// written on either side of `command` — so the entry is judged only once it is complete.
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn a_cargo_build_for_another_platform_is_not_a_warning_here() {
         let other = if cfg!(target_os = "windows") {
             "linux"
@@ -3138,6 +3160,7 @@ command = "something.else"
     /// Live check against real manifests in the marketplace — run manually, not in CI.
     #[test]
     #[ignore]
+    #[cfg(not(target_os = "windows"))]
     fn live_manifests_classify_as_expected() {
         for (repo, want) in [
             ("yuk1ty/herdr-spreader", BuildCheck::NeedsCargoOnPath),
