@@ -290,6 +290,13 @@ that matches nothing lands in `other` rather than disappearing.
 Enter adds to your list rather than installing outright: one keystroke on a fuzzy match
 should not run a stranger's build script. The list is where intent is recorded.
 
+Adding one also reads its manifest and says so if it cannot install here. herdr runs plugin
+builds with a minimal PATH that excludes `~/.cargo/bin`, so a plugin whose build is a bare
+`cargo build --release` fails even on machines where Rust works perfectly in your own shell —
+the failure then reads as a broken toolchain, which it is not. The check only fires on that
+shape and stays quiet on anything it cannot read confidently: sending you away from a plugin
+that works would be worse than saying nothing. It never blocks the add.
+
 The index is cached for six hours (`ctrl+r` refreshes) and works offline from that cache,
 saying how old it is. Two caveats worth stating plainly: the index endpoint is **not a
 documented API** — it is what the marketplace page itself fetches, and it may change without

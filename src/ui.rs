@@ -1093,10 +1093,22 @@ impl App {
             .and_then(|i| self.rows.get(i))
             .map(|r| r.installed.is_some())
             .unwrap_or(false);
-        self.flash = Some(if already_installed {
-            format!("added {} to your list — it is already installed", name)
+        // One request, on an explicit action, for the one install failure that can be predicted
+        // — and only when installing is the next step. Adding is never blocked by it: the
+        // manifest may be unreadable, and a warning is not a veto.
+        let warning = if already_installed {
+            crate::BuildCheck::Fine
         } else {
-            format!("added {} — press i to install it", name)
+            crate::build_check(&name)
+        };
+        self.flash = Some(match (already_installed, warning) {
+            (true, _) => format!("added {} to your list — it is already installed", name),
+            (false, crate::BuildCheck::NeedsCargoOnPath) => format!(
+                "added {} — WARNING: its build is a bare `cargo build`, which herdr's build \
+                 PATH cannot run. Installing it will fail.",
+                name
+            ),
+            (false, _) => format!("added {} — press i to install it", name),
         });
     }
 
