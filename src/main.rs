@@ -2039,6 +2039,97 @@ fn add_extra_at(p: &Path, e: &extras::Extra) -> io::Result<Vec<String>> {
     Ok(fresh)
 }
 
+/// What a plugin's manifest says about whether it can be installed here.
+#[derive(PartialEq, Debug)]
+pub(crate) enum BuildCheck {
+    /// A build step this machine's herdr cannot run: a bare `cargo`, which is not on the PATH
+    /// herdr builds with.
+    NeedsCargoOnPath,
+    /// No build step at all, or one whose program is not `cargo`. Says nothing about whether
+    /// the build succeeds — only that the known trap is not present.
+    Fine,
+    /// The manifest could not be read. Says nothing at all.
+    Unknown,
+}
+
+/// Read `herdr-plugin.toml` from a repository and look for the one install failure this project
+/// can predict.
+///
+/// herdr runs plugin builds with a minimal PATH that excludes `~/.cargo/bin`, so a build of
+/// `["cargo", "build", "--release"]` fails on machines where Rust works perfectly in the user's
+/// own shell. It is why `scripts/fetch-or-build.sh` exists and why `herdr-spreader` is not in
+/// the default set.
+///
+/// Deliberately narrow. Telling someone a working plugin cannot install would send them away
+/// from something that works, which is worse than saying nothing — so anything this cannot read
+/// confidently, including a build routed through a shell or a script that may find cargo
+/// elsewhere, is `Fine`.
+pub(crate) fn build_check(repo: &str) -> BuildCheck {
+    match github::raw_file(repo, None, "herdr-plugin.toml") {
+        Some(toml) => classify_build(&toml),
+        None => BuildCheck::Unknown,
+    }
+}
+
+/// The reading half of `build_check`, split out so it can be tested against real manifests.
+///
+/// Never warns on Windows. The minimal build PATH is a thing observed on Unix; on Windows herdr
+/// found and ran `cargo` without trouble (#2), and this repository's own Windows build is a
+/// bare `cargo build --release` that installs. Warning there would be a false alarm about a
+/// plugin that works — the failure this check exists to prevent.
+fn classify_build(toml: &str) -> BuildCheck {
+    if cfg!(target_os = "windows") {
+        return BuildCheck::Fine;
+    }
+    // A `[[build]]` entry is judged only once it is complete: `platforms` may be written either
+    // side of `command`, and deciding at the `command` line would misread a Windows-only cargo
+    // build as one that runs here.
+    #[derive(Default)]
+    struct Entry {
+        program: String,
+        platforms: Option<String>,
+    }
+    let verdict = |e: &Entry| {
+        let runs_here = match &e.platforms {
+            Some(p) => p.contains(current_platform()),
+            None => true, // no `platforms` means every platform
+        };
+        runs_here && (e.program == "cargo" || e.program.ends_with("/cargo"))
+    };
+
+    let mut current: Option<Entry> = None;
+    for raw in toml.lines() {
+        let line = raw.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            if let Some(e) = current.take() {
+                if verdict(&e) {
+                    return BuildCheck::NeedsCargoOnPath;
+                }
+            }
+            if line.starts_with("[[build]]") {
+                current = Some(Entry::default());
+            }
+            continue;
+        }
+        let Some(e) = current.as_mut() else { continue };
+        if line.starts_with("platforms") {
+            e.platforms = Some(line.to_string());
+        } else if line.starts_with("command") {
+            // First quoted string after `command =` is the program.
+            e.program = line.split('"').nth(1).unwrap_or_default().to_string();
+        }
+    }
+    if let Some(e) = current {
+        if verdict(&e) {
+            return BuildCheck::NeedsCargoOnPath;
+        }
+    }
+    BuildCheck::Fine
+}
+
 /// Append entries taken from someone else's list, under one comment naming where they came
 /// from. Returns what was added, which is empty when your list already covers all of them.
 ///
@@ -2981,6 +3072,105 @@ command = "something.else"
         fs::write(&p, "# a comment\nowner/one\nowner/two\n").unwrap();
         assert_eq!(file_note(&p), "(2 entries)", "comments are not entries");
         let _ = fs::remove_file(&p);
+    }
+
+    /// The failure this project designs around: a bare `cargo build` cannot run under herdr's
+    /// build PATH, which excludes `~/.cargo/bin`.
+    ///
+    /// Unix only. See `classify_build` — on Windows herdr resolves cargo fine, so there is
+    /// nothing to warn about and this whole check stands down.
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn a_bare_cargo_build_is_the_thing_that_cannot_install() {
+        let toml = "id = \"x\"\n\n[[build]]\ncommand = [\"cargo\", \"build\", \"--release\"]\n";
+        assert_eq!(classify_build(toml), BuildCheck::NeedsCargoOnPath);
+    }
+
+    /// The warning is about a Unix PATH, so on Windows it must never fire — including on this
+    /// repository's own manifest, whose Windows build is exactly a bare `cargo build`.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_is_never_warned_about_cargo() {
+        let toml = "[[build]]\ncommand = [\"cargo\", \"build\", \"--release\"]\n";
+        assert_eq!(classify_build(toml), BuildCheck::Fine);
+    }
+
+    /// This project's own manifest must read as fine: the Unix build goes through a script that
+    /// looks for cargo in the places the PATH does not have, which is the whole point of it.
+    #[test]
+    fn a_build_routed_through_a_script_is_not_flagged() {
+        assert_eq!(
+            classify_build(include_str!("../herdr-plugin.toml")),
+            BuildCheck::Fine
+        );
+    }
+
+    #[test]
+    fn a_plugin_with_no_build_step_is_fine() {
+        assert_eq!(
+            classify_build("id = \"x\"\nname = \"x\"\n"),
+            BuildCheck::Fine
+        );
+    }
+
+    /// Being wrong in the cautious direction is worse than silence here — it would send someone
+    /// away from a plugin that works. Anything unreadable stays quiet.
+    #[test]
+    fn an_unreadable_build_is_not_a_warning() {
+        // Routed through a shell, which may well find cargo itself.
+        let via_sh = "[[build]]\ncommand = [\"/bin/sh\", \"-c\", \"cargo build --release\"]\n";
+        assert_eq!(classify_build(via_sh), BuildCheck::Fine);
+        assert_eq!(classify_build(""), BuildCheck::Fine);
+        assert_eq!(classify_build("not toml at all"), BuildCheck::Fine);
+    }
+
+    /// A cargo build gated to another platform does not fail *here*, and `platforms` may be
+    /// written on either side of `command` — so the entry is judged only once it is complete.
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn a_cargo_build_for_another_platform_is_not_a_warning_here() {
+        let other = if cfg!(target_os = "windows") {
+            "linux"
+        } else {
+            "windows"
+        };
+        let before = format!(
+            "[[build]]\nplatforms = [\"{}\"]\ncommand = [\"cargo\", \"build\"]\n",
+            other
+        );
+        let after = format!(
+            "[[build]]\ncommand = [\"cargo\", \"build\"]\nplatforms = [\"{}\"]\n",
+            other
+        );
+        assert_eq!(classify_build(&before), BuildCheck::Fine);
+        assert_eq!(
+            classify_build(&after),
+            BuildCheck::Fine,
+            "the platform line after the command must still count"
+        );
+
+        // And the same entry gated to this platform is still caught.
+        let here = format!(
+            "[[build]]\ncommand = [\"cargo\", \"build\"]\nplatforms = [\"{}\"]\n",
+            current_platform()
+        );
+        assert_eq!(classify_build(&here), BuildCheck::NeedsCargoOnPath);
+    }
+
+    /// Live check against real manifests in the marketplace — run manually, not in CI.
+    #[test]
+    #[ignore]
+    #[cfg(not(target_os = "windows"))]
+    fn live_manifests_classify_as_expected() {
+        for (repo, want) in [
+            ("yuk1ty/herdr-spreader", BuildCheck::NeedsCargoOnPath),
+            ("cloudmanic/herdr-plus", BuildCheck::Fine),
+            ("smarzban/herdr-file-viewer", BuildCheck::Fine),
+            ("razajamil/herdr-plugin-workspace-manager", BuildCheck::Fine),
+            ("persiyanov/herdr-reviewr", BuildCheck::Fine),
+        ] {
+            assert_eq!(build_check(repo), want, "{}", repo);
+        }
     }
 
     /// The floor herdr enforces and the floor the README promises have to be the same number.
