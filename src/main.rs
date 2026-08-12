@@ -935,6 +935,70 @@ fn cmd_extras() -> io::Result<()> {
     Ok(())
 }
 
+/// The repository a list entry lives in. `owner/repo/plugins/wm` is hosted by `owner/repo`,
+/// and asking about the subdirectory would report a perfectly healthy plugin as missing.
+fn repo_root(repo: &str) -> String {
+    repo.split('/').take(2).collect::<Vec<_>>().join("/")
+}
+
+/// `doctor` — check that every entry in the list still resolves.
+///
+/// A repository that no longer exists is the one thing about a decaying herd that needs no
+/// judgement: copy the list to a new machine, `sync`, and the install fails. The list has
+/// stopped being reproducible, and nothing else says so until the day it matters.
+///
+/// Facts only. Nothing is removed from the list and nothing is uninstalled — a plugin already
+/// installed keeps working, and the entry may be worth keeping while a replacement is chosen.
+fn cmd_doctor() -> io::Result<()> {
+    let desired = desired_plugins();
+    if desired.is_empty() {
+        println!(
+            "no plugin list at {} — nothing to check.",
+            bundle_path().display()
+        );
+        return Ok(());
+    }
+
+    let mut gone = Vec::new();
+    let mut unknown = Vec::new();
+    let mut ok = 0;
+    for line in &desired {
+        let repo = Spec::parse(line).repo;
+        match github::repo_exists(&repo_root(&repo)) {
+            Some(true) => ok += 1,
+            // "not found", not "deleted": a repository made private looks exactly the same from
+            // outside, and reporting a conclusion nobody verified would be worse than useless.
+            Some(false) => gone.push(repo),
+            None => unknown.push(repo),
+        }
+    }
+
+    println!(
+        "{} plugin(s) · {} resolve · {} not found{}",
+        desired.len(),
+        ok,
+        gone.len(),
+        if unknown.is_empty() {
+            String::new()
+        } else {
+            format!(" · {} could not be checked", unknown.len())
+        }
+    );
+    for r in &gone {
+        println!("  {} — repository not found", r);
+    }
+    for r in &unknown {
+        println!("  {} — could not be checked (no network?)", r);
+    }
+    if !gone.is_empty() {
+        println!(
+            "\nAn entry that cannot be fetched will fail on a machine that does not have it \
+             installed.\nIt may have been renamed and left no redirect, or made private."
+        );
+    }
+    Ok(())
+}
+
 fn cmd_list() -> io::Result<()> {
     let desired = desired_plugins();
     if desired.is_empty() {
@@ -2207,6 +2271,7 @@ fn print_help() {
     println!("  init [--force] [--extras <id,…>] [--from <owner/repo[@ref]>] [--dry-run]");
     println!("                    write the default bundle, or adopt someone else's list");
     println!("  extras            list the opt-in extras you can pass to `init --extras`");
+    println!("  doctor            check that every entry in your list still resolves");
     println!("  list              show desired plugins");
     println!("  install [<repo>…] install what is missing, restore drifted pins");
     println!("  sync [--prune]    the same, plus --prune to remove what is not listed");
@@ -2235,6 +2300,7 @@ fn main() {
             rest.contains(&"--dry-run"),
         ),
         "extras" => cmd_extras(),
+        "doctor" => cmd_doctor(),
         "list" => cmd_list(),
         // `install` is what people look for; `sync` is what the operation is. Both, rather
         // than choosing and leaving the other as a dead end.
@@ -3171,6 +3237,28 @@ command = "something.else"
         ] {
             assert_eq!(build_check(repo), want, "{}", repo);
         }
+    }
+
+    /// A subdirectory entry is hosted by its parent repository. Asking about the subdirectory
+    /// would report a healthy plugin as missing, which is the one thing `doctor` must not do.
+    #[test]
+    fn doctor_asks_about_the_repository_an_entry_lives_in() {
+        assert_eq!(repo_root("owner/repo"), "owner/repo");
+        assert_eq!(repo_root("owner/repo/plugins/wm"), "owner/repo");
+        assert_eq!(repo_root("owner"), "owner");
+    }
+
+    /// A dead network must never look like a deleted repository. Run manually: it needs one.
+    #[test]
+    #[ignore]
+    fn live_repo_existence_tells_the_three_cases_apart() {
+        assert_eq!(github::repo_exists("cloudmanic/herdr-plus"), Some(true));
+        assert_eq!(
+            github::repo_exists("natori-hrj/definitely-not-a-real-repo-xyz"),
+            Some(false)
+        );
+        // A transferred repository redirects, and `plugin install` follows the same redirect.
+        assert_eq!(github::repo_exists("ogulcancelik/herdr"), Some(true));
     }
 
     /// The floor herdr enforces and the floor the README promises have to be the same number.

@@ -61,6 +61,59 @@ pub(crate) fn raw_file(owner_repo: &str, reference: Option<&str>, path: &str) ->
     ))
 }
 
+/// Whether a repository still answers.
+///
+/// The plain repository URL, not the API: unauthenticated API calls are capped at 60 an hour,
+/// which a list of any size would eat, and only the status code is wanted here. A renamed or
+/// transferred repository redirects and so resolves — which is right, since `plugin install`
+/// follows the same redirect.
+///
+/// `None` means the question could not be asked (no network, no curl or wget), which is not the
+/// same as an answer and must never be reported as one.
+pub(crate) fn repo_exists(owner_repo: &str) -> Option<bool> {
+    let base = std::env::var("HERDR_LAZY_REPO_BASE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://github.com".to_string());
+    let url = format!("{}/{}", base, owner_repo);
+
+    // `-o /dev/null -w %{http_code}` rather than `-f`, so a 404 is an answer and a dead network
+    // is a failure — telling the two apart is the whole point.
+    if let Ok(out) = Command::new("curl")
+        .args([
+            "-sIL",
+            "--max-time",
+            "15",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "-H",
+            "User-Agent: herdr-lazy",
+            &url,
+        ])
+        .output()
+    {
+        if out.status.success() {
+            let code = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if let Ok(n) = code.parse::<u16>() {
+                if n > 0 {
+                    return Some(n < 400);
+                }
+            }
+        }
+    }
+    // wget exits 8 on a server error response, which is an answer of "not found".
+    match Command::new("wget")
+        .args(["-q", "--spider", "--timeout=15", &url])
+        .status()
+    {
+        Ok(s) if s.success() => Some(true),
+        Ok(s) if s.code() == Some(8) => Some(false),
+        _ => None,
+    }
+}
+
 /// Shell out to curl/wget — std has no TLS, the same reason the install script and the
 /// marketplace fetch do.
 fn fetch(url: &str) -> Option<String> {
