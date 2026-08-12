@@ -160,6 +160,7 @@ herdr-lazy update smarzban/herdr-file-viewer
 | `remove <owner/repo>` | remove an entry from the bundle |
 | `lock` | write the lockfile from the current bundle |
 | `auto-sync [on\|off]` | install missing plugins automatically when herdr starts |
+| `doctor` | check that every entry in your list still resolves |
 | `probe [--raw]` | check the herdr bridge and show the resolved paths; `--raw` adds the full payloads |
 
 ### Already using herdr?
@@ -333,6 +334,30 @@ scp other-machine:~/.config/herdr/plugins/config/herdr-lazy/plugins.lock .
 cp plugins.lock "$(herdr plugin config-dir herdr-lazy)/"
 herdr-lazy restore
 ```
+
+## When an entry stops resolving
+
+```sh
+herdr-lazy doctor
+```
+
+A repository that no longer exists is the one way a list quietly stops being reproducible: copy
+it to a new machine, `sync`, and the install fails. `doctor` asks whether each entry still
+resolves and reports the ones that do not.
+
+```
+9 plugin(s) · 8 resolve · 1 not found
+  someone/herdr-thing — repository not found
+```
+
+It reports facts and does nothing else — no entry is removed and nothing is uninstalled. A
+plugin you already have keeps working, and the entry is worth keeping while you decide what
+replaces it.
+
+"Not found" is what was observed, not a conclusion: a repository made private looks exactly like
+a deleted one from outside. A renamed or transferred one redirects and is not reported, because
+`herdr plugin install` follows the same redirect. When the network is unavailable it says so,
+rather than reporting everything as gone.
 
 ## Keeping in sync automatically
 
