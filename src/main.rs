@@ -30,6 +30,7 @@ mod registry;
 mod ui;
 
 use std::env;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -167,6 +168,79 @@ fn run_herdr(args: &[&str]) -> io::Result<(bool, String, String)> {
     ))
 }
 
+/// The three numeric components herdr uses for its compatibility floor.
+///
+/// This is intentionally smaller than semver. `min_herdr_version` and `herdr --version` use
+/// simple `major.minor.patch` versions, and adding a dependency for that comparison would buy
+/// more rules than the input has. A preview suffix is ignored after the numeric patch, so the
+/// version printed by a development build such as `0.7.5-preview...` remains usable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct HerdrVersion {
+    major: u64,
+    minor: u64,
+    patch: u64,
+}
+
+impl HerdrVersion {
+    /// Parse either a bare version (`0.7.4`) or the output of `herdr --version` (`herdr 0.7.4`).
+    /// Anything without three numeric components is deliberately rejected rather than guessed.
+    pub(crate) fn parse(input: &str) -> Option<Self> {
+        for raw in input.split_whitespace() {
+            let token = raw.trim_matches(|c| matches!(c, '"' | '\'' | ',' | ';'));
+            let token = token.strip_prefix('v').unwrap_or(token);
+            let mut parts = token.splitn(3, '.');
+            let Some(major_part) = parts.next() else {
+                continue;
+            };
+            let Some(major) = numeric_component(major_part) else {
+                continue;
+            };
+            let Some(minor_part) = parts.next() else {
+                continue;
+            };
+            let Some(minor) = numeric_component(minor_part) else {
+                continue;
+            };
+            let Some(patch_part) = parts.next() else {
+                continue;
+            };
+            // Development versions append a preview identifier after the numeric patch, e.g.
+            // `0.7.5-preview...`; it does not change the three-part compatibility comparison.
+            let patch_number = patch_part
+                .split_once('-')
+                .map(|(number, _)| number)
+                .unwrap_or(patch_part);
+            let Some(patch) = numeric_component(patch_number) else {
+                continue;
+            };
+            return Some(Self {
+                major,
+                minor,
+                patch,
+            });
+        }
+        None
+    }
+}
+
+impl fmt::Display for HerdrVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+fn numeric_component(part: &str) -> Option<u64> {
+    (!part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+        .then(|| part.parse().ok())
+        .flatten()
+}
+
+/// Read the running herdr version once for a view refresh.
+pub(crate) fn current_herdr_version() -> Option<HerdrVersion> {
+    let (ok, out, _) = run_herdr(&["--version"]).ok()?;
+    ok.then(|| HerdrVersion::parse(&out)).flatten()
+}
+
 /// Read a simple list file: one entry per line, `#` comments and blanks ignored.
 fn read_lines(p: &Path) -> Vec<String> {
     match fs::read_to_string(p) {
@@ -273,6 +347,8 @@ pub(crate) struct Installed {
     pub(crate) name: String,
     pub(crate) enabled: bool,
     pub(crate) source_kind: String,
+    /// The minimum herdr version declared by the plugin manifest.
+    pub(crate) min_herdr_version: Option<HerdrVersion>,
     /// `owner/repo` rebuilt from `source.owner` + `source.repo`. herdr stores them as two
     /// separate fields, never as a joined slug, so this has to be assembled.
     pub(crate) slug: Option<String>,
@@ -426,6 +502,9 @@ fn parse_plugin_list(stdout: &str) -> Result<Vec<Installed>, String> {
                     .and_then(|k| k.as_str())
                     .unwrap_or("unknown")
                     .to_string(),
+                min_herdr_version: p
+                    .str_field("min_herdr_version")
+                    .and_then(HerdrVersion::parse),
                 description: p.str_field("description").unwrap_or_default().to_string(),
                 actions: p
                     .get("actions")
@@ -2415,6 +2494,47 @@ mod tests {
             Some("10e93033263549600e75119c5617dac48137d011")
         );
         assert_eq!(ps[0].source_kind, "github");
+    }
+
+    #[test]
+    fn parses_herdr_version_floors_and_version_output() {
+        let minimum = HerdrVersion::parse("0.7.0").expect("three numeric components");
+        assert_eq!(
+            HerdrVersion::parse("herdr 0.7.4"),
+            Some(HerdrVersion {
+                major: 0,
+                minor: 7,
+                patch: 4,
+            })
+        );
+        assert_eq!(
+            HerdrVersion::parse("herdr 0.7.5-preview.2026-07-21"),
+            Some(HerdrVersion {
+                major: 0,
+                minor: 7,
+                patch: 5,
+            })
+        );
+        assert!(minimum < HerdrVersion::parse("0.8.0").unwrap());
+        assert_eq!(HerdrVersion::parse("herdr unavailable"), None);
+        assert_eq!(HerdrVersion::parse("0.7"), None);
+        assert_eq!(HerdrVersion::parse("0x.7.4"), None);
+        assert_eq!(HerdrVersion::parse("0.7.4oops"), None);
+        assert_eq!(HerdrVersion::parse("0.7.4.1"), None);
+        assert_eq!(minimum.to_string(), "0.7.0");
+    }
+
+    #[test]
+    fn parses_the_plugin_herdr_floor() {
+        let ps = parse_plugin_list(LINKED_LOCAL).expect("real payload should parse");
+        assert_eq!(
+            ps[0].min_herdr_version,
+            Some(HerdrVersion {
+                major: 0,
+                minor: 7,
+                patch: 0,
+            })
+        );
     }
 
     #[test]

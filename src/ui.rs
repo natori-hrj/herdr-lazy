@@ -17,7 +17,10 @@ use std::io::{self, Write};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
 
-use crate::{installed_plugins, pin_state, Installed, Match, PinState, Spec};
+use crate::{
+    current_herdr_version, installed_plugins, pin_state, HerdrVersion, Installed, Match, PinState,
+    Spec,
+};
 
 /// What the list says about one plugin.
 #[derive(Debug, Clone, PartialEq)]
@@ -100,6 +103,8 @@ struct Row {
     label: String,
     commit: Option<String>,
     status: Status,
+    /// The installed plugin requires a newer herdr than the one running this pane.
+    herdr_warning: Option<HerdrVersionWarning>,
     /// The exact line in plugins.list, when this row came from there — what `d` removes.
     listed_as: Option<String>,
     /// `owner/repo`, when known — what `a` adds. `None` for a local link, which has no repo
@@ -119,7 +124,29 @@ struct Row {
     detail: Option<PluginDetail>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HerdrVersionWarning {
+    required: HerdrVersion,
+    running: HerdrVersion,
+}
+
 impl Row {
+    fn marker(&self) -> &'static str {
+        if self.herdr_warning.is_some() {
+            "⚠"
+        } else {
+            self.status.marker()
+        }
+    }
+
+    fn colour(&self) -> &'static str {
+        if self.herdr_warning.is_some() {
+            "\x1b[33m"
+        } else {
+            self.status.colour()
+        }
+    }
+
     /// What the trailing column shows: a status note when there is one, otherwise the
     /// plugin's own description.
     ///
@@ -129,6 +156,18 @@ impl Row {
     /// it is for. When the row is healthy the description fills the space that used to be
     /// blank, which is where "the name alone doesn't tell me what it does" came from.
     fn trailing_text(&self) -> String {
+        if let Some(warning) = self.herdr_warning {
+            let version = format!(
+                "needs herdr {}, running {}",
+                warning.required, warning.running
+            );
+            let note = self.status.note();
+            return if note.is_empty() {
+                version
+            } else {
+                format!("{} · {}", version, note)
+            };
+        }
         if self.maybe_stale && self.status.note().is_empty() {
             return "updates available — press l to see what changed".to_string();
         }
@@ -176,11 +215,31 @@ fn rows(desired: &[Spec], installed: &[Installed]) -> Vec<Row> {
 /// `market` is whatever is already cached; browsing has usually populated it, and when it is
 /// empty the column simply does not appear. Checking for updates should never be the reason
 /// the pane makes a network call.
+#[cfg(test)]
 fn rows_with_updates(
     desired: &[Spec],
     installed: &[Installed],
     market: &[crate::registry::Entry],
 ) -> Vec<Row> {
+    rows_with_herdr_version(desired, installed, market, None)
+}
+
+/// Build the view with the running herdr version available for compatibility warnings.
+///
+/// The version is supplied by the caller instead of being read here so building rows stays a
+/// pure operation and the UI shells out to `herdr --version` only once per refresh.
+fn rows_with_herdr_version(
+    desired: &[Spec],
+    installed: &[Installed],
+    market: &[crate::registry::Entry],
+    running_herdr: Option<HerdrVersion>,
+) -> Vec<Row> {
+    let version_warning = |p: &Installed| -> Option<HerdrVersionWarning> {
+        let (Some(required), Some(running)) = (p.min_herdr_version, running_herdr) else {
+            return None;
+        };
+        (required > running).then_some(HerdrVersionWarning { required, running })
+    };
     let stale = |p: &Installed, spec: Option<&Spec>| -> bool {
         // A pinned entry is meant to sit still; calling it out of date is noise.
         if spec.map(|s| s.reference.is_some()).unwrap_or(false) {
@@ -221,6 +280,7 @@ fn rows_with_updates(
             label: spec.display(),
             commit,
             status,
+            herdr_warning: hit.and_then(|(p, _)| version_warning(p)),
             listed_as: Some(spec.display()),
             slug: Some(spec.repo.clone()),
             installed: hit.map(|(p, _)| (p.plugin_id.clone(), p.source_kind.clone())),
@@ -245,6 +305,7 @@ fn rows_with_updates(
             } else {
                 Status::Extra
             },
+            herdr_warning: version_warning(p),
             listed_as: None,
             slug: p.slug.clone(),
             installed: Some((p.plugin_id.clone(), p.source_kind.clone())),
@@ -589,12 +650,15 @@ impl App {
             .iter()
             .map(|l| Spec::parse(l))
             .collect();
+        // The compatibility check is local, but the version comes from herdr itself. Read it
+        // once for the whole refresh rather than once per installed plugin.
+        let herdr_version = current_herdr_version();
         // Cached only: `false` never fetches. If nothing is cached the update column is
         // simply absent, which is better than making every pane open hit the network.
         let market = crate::registry::cached_entries();
         match installed_plugins() {
             Ok(installed) => App {
-                rows: rows_with_updates(&desired, &installed, &market),
+                rows: rows_with_herdr_version(&desired, &installed, &market, herdr_version),
                 browser: None,
                 extras: None,
                 adopt: None,
@@ -1895,10 +1959,19 @@ impl App {
         write!(out, "\x1b[H\x1b[2J")?;
 
         let counts = |s: fn(&Status) -> bool| self.rows.iter().filter(|r| s(&r.status)).count();
-        let ok = counts(|s| *s == Status::Ok);
+        let ok = self
+            .rows
+            .iter()
+            .filter(|r| r.status == Status::Ok && r.herdr_warning.is_none())
+            .count();
         let todo = counts(|s| matches!(s, Status::Missing | Status::Drifted { .. }));
         let extra = counts(|s| *s == Status::Extra);
         let stale = self.rows.iter().filter(|r| r.maybe_stale).count();
+        let herdr_too_old = self
+            .rows
+            .iter()
+            .filter(|r| r.herdr_warning.is_some())
+            .count();
         // Say how old the update information is once it is old enough to mislead. Without
         // this, "nothing has updates" is indistinguishable from "I last looked two days ago",
         // and the only cure — pressing `/` — is not something anyone would think to try.
@@ -1917,12 +1990,20 @@ impl App {
         };
         writeln!(
             out,
-            "\x1b[1m herdr-lazy\x1b[0m  \x1b[2m{} ok · {} to sync · {} unlisted{}\x1b[0m{}{}\r",
+            "\x1b[1m herdr-lazy\x1b[0m  \x1b[2m{} ok · {} to sync · {} unlisted{}{}\x1b[0m{}{}\r",
             ok,
             todo,
             extra,
             if stale > 0 {
                 format!(" · \x1b[33m{} may have updates\x1b[0m\x1b[2m", stale)
+            } else {
+                String::new()
+            },
+            if herdr_too_old > 0 {
+                format!(
+                    " · \x1b[33m{} need newer herdr\x1b[0m\x1b[2m",
+                    herdr_too_old
+                )
             } else {
                 String::new()
             },
@@ -1983,8 +2064,8 @@ impl App {
                 "{} {}{}{}\x1b[0m {:<44} \x1b[2m{:<12}\x1b[0m{} {}\x1b[0m\r",
                 pointer,
                 box_,
-                row.status.colour(),
-                row.status.marker(),
+                row.colour(),
+                row.marker(),
                 truncate(&row.label, 44),
                 commit,
                 up,
@@ -2552,6 +2633,10 @@ mod tests {
     const SHA: &str = "f32b0825f12543c1d03e54fb10d1741c40d66cdc";
     const OTHER: &str = "a8f86ec4103bc367b52e547b492483f3b792a952";
 
+    fn version(s: &str) -> HerdrVersion {
+        HerdrVersion::parse(s).expect("test version should parse")
+    }
+
     #[test]
     fn bundle_entries_report_their_state() {
         let desired: Vec<Spec> = ["o/installed", "o/absent", &format!("o/pinned@{}", OTHER)]
@@ -2598,6 +2683,42 @@ mod tests {
         let desired = vec![Spec::parse("o/repo")];
         let installed = vec![github("o", "repo", SHA, false)];
         assert_eq!(rows(&desired, &installed)[0].status, Status::Disabled);
+    }
+
+    #[test]
+    fn an_old_herdr_is_reported_without_erasing_the_row_state() {
+        let desired = vec![Spec::parse("o/repo")];
+        let mut p = github("o", "repo", SHA, true);
+        p.min_herdr_version = Some(version("0.8.0"));
+
+        let r = rows_with_herdr_version(&desired, &[p], &[], Some(version("0.7.4")));
+        assert_eq!(r[0].status, Status::Ok);
+        assert_eq!(r[0].marker(), "⚠");
+        assert_eq!(r[0].colour(), "\x1b[33m");
+        assert_eq!(r[0].trailing_text(), "needs herdr 0.8.0, running 0.7.4");
+    }
+
+    #[test]
+    fn a_satisfied_or_unparseable_herdr_version_is_silent() {
+        let desired = vec![Spec::parse("o/repo")];
+        for running in [Some(version("0.8.0")), Some(version("0.9.0")), None] {
+            let mut p = github("o", "repo", SHA, true);
+            p.min_herdr_version = Some(version("0.8.0"));
+            let r = rows_with_herdr_version(&desired, &[p], &[], running);
+            assert!(r[0].herdr_warning.is_none());
+            assert_eq!(r[0].marker(), "✔");
+        }
+    }
+
+    #[test]
+    fn an_unlisted_plugin_keeps_its_list_note_with_a_version_warning() {
+        let mut p = github("someone", "extra", SHA, true);
+        p.min_herdr_version = Some(version("0.8.0"));
+        let r = rows_with_herdr_version(&[], &[p], &[], Some(version("0.7.4")));
+
+        assert_eq!(r[0].status, Status::Extra);
+        assert!(r[0].trailing_text().contains("needs herdr 0.8.0"));
+        assert!(r[0].trailing_text().contains("not in your list"));
     }
 
     #[test]
