@@ -32,9 +32,10 @@ mod ui;
 use std::env;
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Curated "batteries-included" default set — the distro layer.
 ///
@@ -149,6 +150,291 @@ fn lock_path() -> PathBuf {
 /// tested without touching the environment the real path reads from.
 fn lock_beside(list: &Path) -> PathBuf {
     list.with_file_name("plugins.lock")
+}
+
+/// Keep a short, file-based history of lockfile contents next to the active lock.
+///
+/// Three generations are enough to undo a recent bad sync without turning the config
+/// directory into an unbounded archive. The suffix is deliberately part of the filename so
+/// the snapshots remain easy to inspect and copy by hand.
+const MAX_PREVIOUS_LOCKFILES: usize = 3;
+static LOCK_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn lock_file_name(lock: &Path) -> String {
+    lock.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "plugins.lock".to_string())
+}
+
+fn lock_history_beside(lock: &Path, generation: usize) -> PathBuf {
+    assert!((1..=MAX_PREVIOUS_LOCKFILES).contains(&generation));
+    lock.with_file_name(format!("{}.{}", lock_file_name(lock), generation))
+}
+
+fn previous_lock_path() -> PathBuf {
+    lock_history_beside(&lock_path(), 1)
+}
+
+fn remove_file_if_present(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+fn optional_file_contents(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn restore_file_contents(path: &Path, contents: &Option<Vec<u8>>) -> io::Result<()> {
+    match contents {
+        Some(bytes) => write_bytes_atomically(path, bytes),
+        None => remove_file_if_present(path),
+    }
+}
+
+fn restore_lock_history(lock: &Path, previous: &[Option<Vec<u8>>]) -> io::Result<()> {
+    for (index, contents) in previous.iter().enumerate() {
+        restore_file_contents(&lock_history_beside(lock, index + 1), contents)?;
+    }
+    Ok(())
+}
+
+/// Shift existing snapshots back one slot, then copy the active lock into `.1`.
+///
+/// Copying rather than renaming keeps the active lock in place until the new contents have
+/// been written. If a history operation fails, the caller can still leave the current lock
+/// untouched instead of losing the only known-good state.
+fn rotate_lock_history(lock: &Path) -> io::Result<Vec<Option<Vec<u8>>>> {
+    let previous: Vec<Option<Vec<u8>>> = (1..=MAX_PREVIOUS_LOCKFILES)
+        .map(|generation| optional_file_contents(&lock_history_beside(lock, generation)))
+        .collect::<io::Result<_>>()?;
+
+    let result = (|| {
+        for generation in (2..=MAX_PREVIOUS_LOCKFILES).rev() {
+            let source = lock_history_beside(lock, generation - 1);
+            let destination = lock_history_beside(lock, generation);
+            match copy_file_atomically(&source, &destination) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    // Do not leave an old, out-of-order snapshot in a slot whose source vanished.
+                    remove_file_if_present(&destination)?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        copy_file_atomically(lock, &lock_history_beside(lock, 1))
+    })();
+
+    match result {
+        Ok(()) => Ok(previous),
+        Err(error) => {
+            // The active lock was never touched. Restore all snapshot slots as well, so a
+            // failed rotation is a no-op from the user's point of view.
+            if let Err(rollback) = restore_lock_history(lock, &previous) {
+                return Err(io::Error::new(
+                    rollback.kind(),
+                    format!(
+                        "lock history rotation failed: {}; rollback failed: {}",
+                        error, rollback
+                    ),
+                ));
+            }
+            Err(error)
+        }
+    }
+}
+
+fn lock_temp_path(path: &Path) -> PathBuf {
+    let id = LOCK_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!(
+        ".{}.tmp-{}-{}",
+        lock_file_name(path),
+        std::process::id(),
+        id
+    ))
+}
+
+#[cfg(not(windows))]
+fn replace_lock(path: &Path, temporary: &Path) -> io::Result<()> {
+    // The temporary file is in the same directory, so rename is an atomic replacement on Unix.
+    fs::rename(temporary, path)
+}
+
+#[cfg(windows)]
+fn replace_lock(path: &Path, temporary: &Path) -> io::Result<()> {
+    // Windows' rename cannot replace an existing file. ReplaceFileW performs that replacement in
+    // one OS operation and gives us a backup path to recover if it reports a moved replacement.
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::null_mut;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+        fn ReplaceFileW(
+            replaced: *const u16,
+            replacement: *const u16,
+            backup: *const u16,
+            flags: u32,
+            exclude: *mut std::ffi::c_void,
+            reserved: *mut std::ffi::c_void,
+        ) -> i32;
+    }
+
+    let wide = |p: &Path| {
+        p.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0u16))
+            .collect::<Vec<_>>()
+    };
+    let replaced = wide(path);
+    let replacement = wide(temporary);
+    let backup = lock_temp_path(path);
+    let backup_wide = wide(&backup);
+    let ok = unsafe {
+        ReplaceFileW(
+            replaced.as_ptr(),
+            replacement.as_ptr(),
+            backup_wide.as_ptr(),
+            0,
+            null_mut(),
+            null_mut(),
+        )
+    };
+    if ok != 0 {
+        let _ = remove_file_if_present(&backup);
+        return Ok(());
+    }
+
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::NotFound {
+        // There was no active lock yet. MoveFileExW handles that first-write case and also
+        // replaces the destination if another process created it between the two calls.
+        const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+        const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+        let ok = unsafe {
+            MoveFileExW(
+                replacement.as_ptr(),
+                replaced.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ok != 0 {
+            return Ok(());
+        }
+        return Err(io::Error::last_os_error());
+    }
+
+    // ReplaceFileW documents that error 1177 can move the replaced file to the backup path
+    // before returning. Recover it immediately, and retain the backup if recovery itself fails
+    // so a later manual recovery is still possible.
+    if !path.exists() && backup.exists() {
+        if let Err(recovery) = fs::rename(&backup, path) {
+            return Err(io::Error::new(
+                recovery.kind(),
+                format!(
+                    "lock replacement failed: {}; active lock recovery failed: {}",
+                    error, recovery
+                ),
+            ));
+        }
+    } else {
+        let _ = remove_file_if_present(&backup);
+    }
+    Err(error)
+}
+
+fn copy_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
+    let temporary = lock_temp_path(destination);
+    if let Err(error) = fs::copy(source, &temporary) {
+        let _ = remove_file_if_present(&temporary);
+        return Err(error);
+    }
+    let result = replace_lock(destination, &temporary);
+    if result.is_err() {
+        let _ = remove_file_if_present(&temporary);
+    }
+    result
+}
+
+fn write_bytes_atomically(path: &Path, body: &[u8]) -> io::Result<()> {
+    let temporary = loop {
+        let candidate = lock_temp_path(path);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                if let Err(e) = file.write_all(body) {
+                    drop(file);
+                    let _ = remove_file_if_present(&candidate);
+                    return Err(e);
+                }
+                drop(file);
+                break candidate;
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+
+    if let Ok(metadata) = fs::metadata(path) {
+        if let Err(e) = fs::set_permissions(&temporary, metadata.permissions()) {
+            let _ = remove_file_if_present(&temporary);
+            return Err(e);
+        }
+    }
+    let result = replace_lock(path, &temporary);
+    if result.is_err() {
+        let _ = remove_file_if_present(&temporary);
+    }
+    result
+}
+
+fn write_lock_atomically(path: &Path, body: &str) -> io::Result<()> {
+    write_bytes_atomically(path, body.as_bytes())
+}
+
+/// Write a lock and rotate its history only when the contents actually change.
+///
+/// The boolean says whether a new active file was written. A no-op sync therefore preserves
+/// both the current file and every historical snapshot.
+fn write_lock_contents(path: &Path, body: &str) -> io::Result<bool> {
+    let current = match fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    if current.as_deref() == Some(body.as_bytes()) {
+        return Ok(false);
+    }
+
+    let previous = if current.is_some() {
+        Some(rotate_lock_history(path)?)
+    } else {
+        None
+    };
+    if let Err(error) = write_lock_atomically(path, body) {
+        if let Some(previous) = previous {
+            if let Err(rollback) = restore_lock_history(path, &previous) {
+                return Err(io::Error::new(
+                    rollback.kind(),
+                    format!(
+                        "lock write failed: {}; history rollback failed: {}",
+                        error, rollback
+                    ),
+                ));
+            }
+        }
+        return Err(error);
+    }
+    Ok(true)
 }
 
 fn ensure_parent(p: &Path) -> io::Result<()> {
@@ -1100,30 +1386,61 @@ fn cmd_list() -> io::Result<()> {
 /// `targets` restricts the work to named `owner/repo` entries; empty means everything. The
 /// lock is only rewritten on a full run — a targeted sync is a partial view of the world, and
 /// writing the lock from it would drop every entry it did not look at.
-/// Read the lockfile as a set of specs.
-pub(crate) fn lock_specs() -> Vec<Spec> {
-    read_lines(&lock_path())
-        .iter()
-        .map(|l| Spec::parse(l))
-        .collect()
+/// Read a lockfile as a set of specs, preserving I/O errors for callers that need to explain
+/// whether the file is missing or inaccessible.
+fn lock_specs_from(path: &Path) -> io::Result<Vec<Spec>> {
+    let body = fs::read_to_string(path)?;
+    Ok(body
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(Spec::parse)
+        .collect())
 }
 
-/// Put the machine back into the state the lockfile records.
+/// Put the machine back into the state a lockfile records.
 ///
 /// `sync` converges to the *list*, which may float; `restore` converges to the *lock*, which
 /// does not. That is the difference between "the plugins I asked for" and "the exact commits
 /// that were installed when this lock was written" — and it is what makes a lock copied from
 /// another machine actually usable, rather than something you paste into the list by hand.
 ///
-/// Deliberately does not rewrite the lock: it is the input here, not the output.
-pub(crate) fn cmd_restore(targets: &[&str]) -> io::Result<()> {
-    let all = lock_specs();
-    if all.is_empty() {
+fn print_missing_lock(path: &Path, previous: bool) {
+    if previous {
+        println!(
+            "no previous lockfile at {} — run `herdr-lazy sync` after creating a lockfile first.",
+            path.display()
+        );
+    } else {
         println!(
             "no lockfile at {} — run `herdr-lazy sync` first, or copy one from another machine.",
-            lock_path().display()
+            path.display()
         );
-        return Ok(());
+    }
+}
+
+/// Deliberately does not rewrite the lock: it is the input here, not the output. The optional
+/// installed snapshot exists only so the restore path can be tested without launching herdr.
+fn restore_from_lock(
+    path: &Path,
+    targets: &[&str],
+    previous: bool,
+    installed: Option<Vec<Installed>>,
+) -> io::Result<()> {
+    let all = match lock_specs_from(path) {
+        Ok(all) if !all.is_empty() => all,
+        Ok(_) => {
+            print_missing_lock(path, previous);
+            return Ok(());
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            print_missing_lock(path, previous);
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+    if previous {
+        println!("restoring from previous lockfile -> {}", path.display());
     }
     let unpinned = all.iter().filter(|s| s.reference.is_none()).count();
     if unpinned > 0 {
@@ -1134,7 +1451,25 @@ pub(crate) fn cmd_restore(targets: &[&str]) -> io::Result<()> {
             all.len()
         );
     }
-    converge(&all, targets, false, false)
+    match installed {
+        Some(installed) => converge_with_installed(&all, targets, false, false, installed),
+        None => converge(&all, targets, false, false),
+    }
+}
+
+pub(crate) fn cmd_restore(targets: &[&str]) -> io::Result<()> {
+    let path = lock_path();
+    restore_from_lock(&path, targets, false, None)
+}
+
+/// Converge to the newest saved lockfile without changing the active lock.
+///
+/// The active lock remains the source of truth for an ordinary `restore`; this variant is an
+/// escape hatch for undoing a recent sync. Keeping the active file untouched also means the
+/// user can inspect the result and choose whether to make the rollback permanent.
+fn cmd_restore_previous(targets: &[&str]) -> io::Result<()> {
+    let path = previous_lock_path();
+    restore_from_lock(&path, targets, true, None)
 }
 
 pub(crate) fn cmd_sync(prune: bool, targets: &[&str]) -> io::Result<()> {
@@ -1475,6 +1810,23 @@ fn cmd_auto_sync(arg: Option<&str>) -> io::Result<()> {
 }
 
 fn converge(all: &[Spec], targets: &[&str], prune: bool, write_the_lock: bool) -> io::Result<()> {
+    let installed = match installed_plugins() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{}", e);
+            return Ok(());
+        }
+    };
+    converge_with_installed(all, targets, prune, write_the_lock, installed)
+}
+
+fn converge_with_installed(
+    all: &[Spec],
+    targets: &[&str],
+    prune: bool,
+    write_the_lock: bool,
+    installed: Vec<Installed>,
+) -> io::Result<()> {
     let all: Vec<Spec> = all.to_vec();
     let desired: Vec<Spec> = if targets.is_empty() {
         all.clone()
@@ -1493,14 +1845,6 @@ fn converge(all: &[Spec], targets: &[&str], prune: bool, write_the_lock: bool) -
         println!("nothing to do.");
         return Ok(());
     }
-
-    let installed = match installed_plugins() {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("{}", e);
-            return Ok(());
-        }
-    };
 
     let mut present = 0;
     let mut added = 0;
@@ -2092,8 +2436,11 @@ fn write_lock(desired: &[Spec], installed: &[Installed]) -> io::Result<()> {
         body.push_str(l);
         body.push('\n');
     }
-    fs::write(&p, body)?;
-    println!("wrote lock -> {}", p.display());
+    if write_lock_contents(&p, &body)? {
+        println!("wrote lock -> {}", p.display());
+    } else {
+        println!("lock unchanged -> {}", p.display());
+    }
     if unresolved > 0 {
         println!(
             "note: {}/{} entries have no resolved commit (not installed, or a local link) \
@@ -2355,7 +2702,8 @@ fn print_help() {
     println!("  install [<repo>…] install what is missing, restore drifted pins");
     println!("  sync [--prune]    the same, plus --prune to remove what is not listed");
     println!("  update [<repo>…]  re-resolve unpinned entries to their latest commit");
-    println!("  restore [<repo>…] put plugins back to the commits in the lockfile");
+    println!("  restore [--previous] [<repo>…] put plugins back to a lockfile");
+    println!("                    --previous uses the newest saved lockfile");
     println!("  ui                open the manage pane (also `manage`)");
     println!("  add <owner/repo>  add a plugin to the bundle");
     println!("  remove <owner/repo>  remove a plugin from the bundle");
@@ -2393,12 +2741,17 @@ fn main() {
         }
         "ui" | "manage" => ui::run(),
         "restore" => {
+            let previous = rest.contains(&"--previous");
             let targets: Vec<&str> = rest
                 .iter()
                 .copied()
                 .filter(|a| !a.starts_with("--"))
                 .collect();
-            cmd_restore(&targets)
+            if previous {
+                cmd_restore_previous(&targets)
+            } else {
+                cmd_restore(&targets)
+            }
         }
         "update" => {
             let targets: Vec<&str> = rest
@@ -2843,6 +3196,125 @@ command = "something.else"
             lock_beside(Path::new("plugins.list")),
             Path::new("plugins.lock")
         );
+    }
+
+    #[test]
+    fn lock_history_uses_numeric_suffixes_next_to_the_active_lock() {
+        let lock = Path::new("/home/me/dotfiles/herdr/plugins.lock");
+        assert_eq!(
+            lock_history_beside(lock, 1),
+            Path::new("/home/me/dotfiles/herdr/plugins.lock.1")
+        );
+        assert_eq!(
+            lock_history_beside(lock, MAX_PREVIOUS_LOCKFILES),
+            Path::new("/home/me/dotfiles/herdr/plugins.lock.3")
+        );
+    }
+
+    fn scratch_lock(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("herdr-lazy-lock-{}-{}", std::process::id(), name));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir.join("plugins.lock")
+    }
+
+    fn clean_scratch_lock(lock: &Path) {
+        if let Some(dir) = lock.parent() {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn changed_locks_rotate_and_drop_the_oldest_snapshot() {
+        let lock = scratch_lock("rotation");
+        for body in ["one\n", "two\n", "three\n", "four\n", "five\n"] {
+            assert!(write_lock_contents(&lock, body).unwrap());
+        }
+
+        assert_eq!(fs::read_to_string(&lock).unwrap(), "five\n");
+        assert_eq!(
+            fs::read_to_string(lock_history_beside(&lock, 1)).unwrap(),
+            "four\n"
+        );
+        assert_eq!(
+            fs::read_to_string(lock_history_beside(&lock, 2)).unwrap(),
+            "three\n"
+        );
+        assert_eq!(
+            fs::read_to_string(lock_history_beside(&lock, 3)).unwrap(),
+            "two\n"
+        );
+        assert!(!lock.with_file_name("plugins.lock.4").exists());
+        clean_scratch_lock(&lock);
+    }
+
+    #[test]
+    fn identical_locks_do_not_consume_history_slots() {
+        let lock = scratch_lock("unchanged");
+        assert!(write_lock_contents(&lock, "one\n").unwrap());
+        assert!(!write_lock_contents(&lock, "one\n").unwrap());
+        assert!(!lock_history_beside(&lock, 1).exists());
+
+        assert!(write_lock_contents(&lock, "two\n").unwrap());
+        assert!(!write_lock_contents(&lock, "two\n").unwrap());
+        assert_eq!(
+            fs::read_to_string(lock_history_beside(&lock, 1)).unwrap(),
+            "one\n"
+        );
+        clean_scratch_lock(&lock);
+    }
+
+    #[test]
+    fn previous_lock_specs_are_read_without_touching_the_active_lock() {
+        let lock = scratch_lock("read-previous");
+        fs::write(&lock, "owner/current@1111111\n").unwrap();
+        fs::write(
+            lock_history_beside(&lock, 1),
+            "# previous\nowner/old@2222222\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            lock_specs_from(&lock_history_beside(&lock, 1)).unwrap(),
+            vec![Spec::parse("owner/old@2222222")]
+        );
+        assert_eq!(
+            lock_specs_from(&lock).unwrap(),
+            vec![Spec::parse("owner/current@1111111")]
+        );
+        clean_scratch_lock(&lock);
+    }
+
+    #[test]
+    fn restoring_previous_uses_the_snapshot_without_rewriting_the_active_lock() {
+        let lock = scratch_lock("restore-previous");
+        let previous = lock_history_beside(&lock, 1);
+        let active_body = "owner/current@1111111\n";
+        fs::write(&lock, active_body).unwrap();
+        fs::write(
+            &previous,
+            "owner/repo@10e93033263549600e75119c5617dac48137d011\n",
+        )
+        .unwrap();
+
+        restore_from_lock(
+            &previous,
+            &[],
+            true,
+            Some(vec![from_github("owner", "repo")]),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(&lock).unwrap(), active_body);
+        clean_scratch_lock(&lock);
+    }
+
+    #[test]
+    fn a_missing_lockfile_returns_not_found() {
+        let lock = scratch_lock("missing");
+        let error = lock_specs_from(&lock).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        clean_scratch_lock(&lock);
     }
 
     #[test]
