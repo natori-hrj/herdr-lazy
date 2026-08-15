@@ -154,7 +154,7 @@ herdr-lazy update smarzban/herdr-file-viewer
 | `install [<repo>…]` | install what is missing, restore drifted pins |
 | `sync [<repo>…] [--prune]` | the same, plus `--prune` to uninstall what is not listed |
 | `update [<repo>…]` | re-resolve unpinned entries to their latest commit |
-| `restore [<repo>…]` | put plugins back to the commits in the lockfile |
+| `restore [--previous] [<repo>…]` | put plugins back to the commits in the active lockfile, or the newest saved lockfile with `--previous` |
 | `ui` / `manage` | open the manage pane (`/` inside it searches the marketplace) |
 | `add <owner/repo>` | add an entry to the bundle |
 | `remove <owner/repo>` | remove an entry from the bundle |
@@ -175,7 +175,8 @@ Both files live in the directory herdr assigns the plugin — `herdr plugin conf
 herdr-lazy` prints it:
 
 - `plugins.list` — the set you declare, edited by hand or via `add`/`remove`
-- `plugins.lock` — the commits actually installed, rewritten on every `sync`
+- `plugins.lock` — the commits actually installed, written when the lock is refreshed
+- `plugins.lock.1` through `.3` — the latest previous lockfile contents, kept when a lock-writing command changes it (`install`, `sync`, `update`, `lock`, or auto-sync)
 
 Run from a shell, herdr-lazy asks herdr for that path rather than guessing, so the CLI and
 the manage pane always read the same files.
@@ -413,7 +414,11 @@ herdr-lazy restore     # the exact commits from plugins.lock
 ```
 
 `restore` reproduces the lock commit-for-commit; `sync` installs the latest each entry
-resolves to. Commit both files after a change and the next machine is one command behind.
+resolves to. If a sync introduced a bad update, `herdr-lazy restore --previous` converges to
+the newest saved lockfile without changing the active `plugins.lock`; inspect the result first,
+then copy the snapshot over the active lock if you want to make the rollback permanent. Commit
+the active lock and its snapshots after a change if you want the history available on another
+machine.
 
 ### Nix
 
