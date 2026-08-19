@@ -116,6 +116,8 @@ struct Row {
     /// herdr's id for the installed plugin, and how it was installed. Present only when the
     /// row corresponds to something actually installed — which is exactly when `x` applies.
     installed: Option<(String, String)>,
+    /// Whether herdr currently runs the installed plugin. `None` means the row is not installed.
+    enabled: Option<bool>,
     /// Ticked for a bulk operation. Kept on the row rather than as a set of indices so it
     /// survives the list being rebuilt in a different order.
     picked: bool,
@@ -161,17 +163,17 @@ impl Row {
                 "needs herdr {}, running {}",
                 warning.required, warning.running
             );
-            let note = self.status.note();
+            let note = self.status_note();
             return if note.is_empty() {
                 version
             } else {
                 format!("{} · {}", version, note)
             };
         }
-        if self.maybe_stale && self.status.note().is_empty() {
+        if self.maybe_stale && self.status_note().is_empty() {
             return "updates available — press l to see what changed".to_string();
         }
-        let note = self.status.note();
+        let note = self.status_note();
         if !note.is_empty() {
             return note;
         }
@@ -179,6 +181,20 @@ impl Row {
             .as_ref()
             .map(|d| d.description.clone())
             .unwrap_or_default()
+    }
+
+    fn status_note(&self) -> String {
+        let note = self.status.note();
+        if self.enabled != Some(false) || self.status == Status::Disabled {
+            return note;
+        }
+
+        let disabled = "installed but disabled — herdr will not run it";
+        if note.is_empty() {
+            disabled.to_string()
+        } else {
+            format!("{} · {}", note, disabled)
+        }
     }
 }
 
@@ -284,6 +300,7 @@ fn rows_with_herdr_version(
             listed_as: Some(spec.display()),
             slug: Some(spec.repo.clone()),
             installed: hit.map(|(p, _)| (p.plugin_id.clone(), p.source_kind.clone())),
+            enabled: hit.map(|(p, _)| p.enabled),
             maybe_stale: hit.map(|(p, _)| stale(p, Some(spec))).unwrap_or(false),
             picked: false,
             detail: hit.map(|(p, _)| detail_of(p)),
@@ -309,6 +326,7 @@ fn rows_with_herdr_version(
             listed_as: None,
             slug: p.slug.clone(),
             installed: Some((p.plugin_id.clone(), p.source_kind.clone())),
+            enabled: Some(p.enabled),
             maybe_stale: stale(p, None),
             picked: false,
             detail: Some(detail_of(p)),
@@ -964,6 +982,46 @@ impl App {
             format!("uninstalled {}", done)
         } else {
             format!("uninstalled {} · {}", done, refused.join(" · "))
+        });
+        self.clear_picks();
+        self.refresh();
+    }
+
+    /// Enable or disable every selected installed plugin. The command changes herdr's local
+    /// plugin state only; it never rewrites the bundle or lockfile.
+    fn set_enabled_targets(&mut self, enabled: bool) {
+        let mut ids = Vec::new();
+        for i in self.targets() {
+            let Some(row) = self.rows.get(i) else {
+                continue;
+            };
+            let Some((id, _)) = row.installed.as_ref() else {
+                continue;
+            };
+            if row.enabled == Some(enabled) || ids.iter().any(|seen| seen == id) {
+                continue;
+            }
+            ids.push(id.clone());
+        }
+        let action = if enabled { "enable" } else { "disable" };
+        if ids.is_empty() {
+            let gerund = if enabled { "enabling" } else { "disabling" };
+            self.flash = Some(format!("nothing selected needs {}", gerund));
+            return;
+        }
+
+        let mut done = 0;
+        let mut errors = Vec::new();
+        for id in ids {
+            match crate::set_plugin_enabled(&id, enabled) {
+                Ok(()) => done += 1,
+                Err(msg) => errors.push(msg),
+            }
+        }
+        self.flash = Some(if errors.is_empty() {
+            format!("{}d {}", action, done)
+        } else {
+            format!("{}d {} · {}", action, done, errors.join(" · "))
         });
         self.clear_picks();
         self.refresh();
@@ -1672,6 +1730,11 @@ impl App {
                 ),
                 ("x / X", "uninstall — X removes everything not in your list"),
                 ("r / R", "restore to the commits recorded in the lockfile"),
+                ("E", "enable selected installed plugin(s)"),
+                (
+                    "D",
+                    "disable selected installed plugin(s) — herdr-lazy is protected",
+                ),
             ],
         )?;
         section(
@@ -2087,6 +2150,8 @@ impl App {
             ("u", "update"),
             ("x", "uninstall"),
             ("r", "restore"),
+            ("E", "enable"),
+            ("D", "disable"),
             ("a", "adopt"),
             ("d", "drop"),
             ("/", "search"),
@@ -2565,6 +2630,8 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                 })?;
                 app.refresh();
             }
+            KeyCode::Char('E') => app.set_enabled_targets(true),
+            KeyCode::Char('D') => app.set_enabled_targets(false),
             KeyCode::Char('a') => app.adopt_targets(),
             KeyCode::Char('A') => {
                 app.flash = Some(match crate::toggle_auto_sync() {
@@ -2682,7 +2749,24 @@ mod tests {
     fn a_disabled_plugin_is_not_reported_as_ok() {
         let desired = vec![Spec::parse("o/repo")];
         let installed = vec![github("o", "repo", SHA, false)];
-        assert_eq!(rows(&desired, &installed)[0].status, Status::Disabled);
+        let row = &rows(&desired, &installed)[0];
+        assert_eq!(row.status, Status::Disabled);
+        assert_eq!(row.enabled, Some(false));
+        assert_eq!(
+            row.trailing_text(),
+            "installed but disabled — herdr will not run it"
+        );
+    }
+
+    #[test]
+    fn a_disabled_extra_still_explains_why_it_is_not_running() {
+        let installed = vec![github("o", "extra", SHA, false)];
+        let row = &rows(&[], &installed)[0];
+        assert_eq!(row.status, Status::Extra);
+        assert_eq!(row.enabled, Some(false));
+        assert!(row
+            .trailing_text()
+            .contains("installed but disabled — herdr will not run it"));
     }
 
     #[test]
@@ -2846,7 +2930,7 @@ mod tests {
         for c in ['i', 'u', 'x', 'r', 'a', 'd', '/', '?'] {
             assert_eq!(plain(c), Action::Command(c), "{} should be a command", c);
         }
-        for c in ['I', 'U', 'X', 'R'] {
+        for c in ['I', 'U', 'X', 'R', 'E', 'D'] {
             assert_eq!(
                 classify(&KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT)),
                 Action::Command(c),

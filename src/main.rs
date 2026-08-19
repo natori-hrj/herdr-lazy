@@ -2263,6 +2263,42 @@ pub(crate) fn uninstall_plugin(plugin_id: &str, source_kind: &str) -> String {
     }
 }
 
+/// Enable or disable one installed plugin through herdr.
+///
+/// This deliberately does not touch the bundle or lockfile: enabled state belongs to herdr's
+/// installed-plugin registry, and the manage pane should change only that state. The running
+/// plugin is protected from being disabled through its own pane, just like uninstalling it.
+pub(crate) fn set_plugin_enabled(plugin_id: &str, enabled: bool) -> Result<(), String> {
+    set_plugin_enabled_with(plugin_id, enabled, run_herdr)
+}
+
+fn set_plugin_enabled_with<F>(plugin_id: &str, enabled: bool, run: F) -> Result<(), String>
+where
+    F: FnOnce(&[&str]) -> io::Result<(bool, String, String)>,
+{
+    if !enabled && plugin_id == PLUGIN_ID {
+        return Err(format!(
+            "{} is herdr-lazy itself — cannot disable it from this pane; run `herdr plugin disable {}` from a shell instead",
+            plugin_id, plugin_id
+        ));
+    }
+
+    let command = if enabled { "enable" } else { "disable" };
+    match run(&["plugin", command, plugin_id]) {
+        Ok((true, _, _)) => Ok(()),
+        Ok((false, out, err)) => {
+            let msg = if err.trim().is_empty() { out } else { err };
+            let msg = msg.trim();
+            if msg.is_empty() {
+                Err(format!("could not {} {}", command, plugin_id))
+            } else {
+                Err(format!("could not {} {}: {}", command, plugin_id, msg))
+            }
+        }
+        Err(e) => Err(format!("could not run herdr: {}", e)),
+    }
+}
+
 /// Re-resolve unpinned bundle entries to their latest commit.
 ///
 /// herdr has no `plugin update`; re-running `plugin install` is the update path — it reports
@@ -3730,6 +3766,51 @@ command = "something.else"
         fs::write(&p, "# a comment\nowner/one\nowner/two\n").unwrap();
         assert_eq!(file_note(&p), "(2 entries)", "comments are not entries");
         let _ = fs::remove_file(&p);
+    }
+
+    #[test]
+    fn the_manage_pane_cannot_disable_herdr_lazy_itself() {
+        let error = set_plugin_enabled(PLUGIN_ID, false).expect_err("self-disable must be refused");
+        assert!(error.contains("cannot disable it from this pane"));
+        assert!(error.contains("herdr plugin disable herdr-lazy"));
+    }
+
+    #[test]
+    fn enabling_and_disabling_use_native_herdr_commands() {
+        let mut seen = Vec::new();
+        assert_eq!(
+            set_plugin_enabled_with("example", true, |args| {
+                seen = args.iter().map(|arg| arg.to_string()).collect();
+                Ok((true, String::new(), String::new()))
+            }),
+            Ok(())
+        );
+        assert_eq!(seen, ["plugin", "enable", "example"]);
+
+        let mut seen = Vec::new();
+        assert_eq!(
+            set_plugin_enabled_with("example", false, |args| {
+                seen = args.iter().map(|arg| arg.to_string()).collect();
+                Ok((true, String::new(), String::new()))
+            }),
+            Ok(())
+        );
+        assert_eq!(seen, ["plugin", "disable", "example"]);
+    }
+
+    #[test]
+    fn plugin_state_errors_preserve_herdr_output() {
+        let error = set_plugin_enabled_with("example", false, |_| {
+            Ok((false, String::new(), "plugin is missing\n".to_string()))
+        })
+        .expect_err("a failed herdr command must be reported");
+        assert_eq!(error, "could not disable example: plugin is missing");
+
+        let error = set_plugin_enabled_with("example", true, |_| {
+            Ok((false, "cannot enable it\n".to_string(), String::new()))
+        })
+        .expect_err("a stdout error must also be reported");
+        assert_eq!(error, "could not enable example: cannot enable it");
     }
 
     /// The failure this project designs around: a bare `cargo build` cannot run under herdr's
