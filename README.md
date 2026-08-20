@@ -259,6 +259,14 @@ would teach you to ignore the marker.
 This costs no network access. It reads the marketplace index that browsing already cached;
 with nothing cached, the column is simply absent.
 
+## Inspecting plugin logs
+
+Select an installed plugin and press `L` in the manage pane. This asks herdr for its latest
+100 command logs without reading plugin-owned files. The native response stays visible for
+diagnosis; `j`/`k` (or the arrows and mouse wheel) scroll it, `r` reloads it, and `esc` returns
+to the list. Plugins with no logs show an explicit empty state, and herdr errors stay in the
+pane so the next troubleshooting step is visible.
+
 ## Acting on several at once
 
 Space ticks the row under the cursor; press it again to untick. A click does the same. Then

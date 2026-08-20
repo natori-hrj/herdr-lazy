@@ -218,6 +218,192 @@ fn detail_of(p: &Installed) -> PluginDetail {
     }
 }
 
+/// The result of `herdr plugin log list` while the log overlay is open.
+///
+/// Herdr currently returns a JSON response. Keeping it as text is deliberate: this view is a
+/// diagnostic surface, so it should not discard fields when herdr adds one, and an unexpected
+/// response should remain visible instead of becoming a second parse error. The renderer strips
+/// terminal controls and wraps long lines only at draw time.
+#[derive(Debug, Clone, Default)]
+struct LogView {
+    plugin_id: String,
+    output: Option<String>,
+    error: Option<String>,
+    scroll: usize,
+}
+
+impl LogView {
+    fn from_result(plugin_id: String, result: Result<String, String>) -> Self {
+        let mut view = Self {
+            plugin_id,
+            ..Default::default()
+        };
+        view.set_result(result);
+        view
+    }
+
+    fn set_result(&mut self, result: Result<String, String>) {
+        self.scroll = 0;
+        match result {
+            Ok(output) => {
+                let output = sanitize_log_output(&output);
+                let empty = output.trim().is_empty() || native_log_response_is_empty(&output);
+                self.output = (!empty).then(|| truncate_log_output(&output));
+                self.error = None;
+            }
+            Err(error) => {
+                self.output = None;
+                self.error = Some(truncate_log_output(&sanitize_log_output(&error)));
+            }
+        }
+    }
+
+    fn display_lines(&self, width: usize) -> Vec<String> {
+        self.error
+            .as_deref()
+            .or(self.output.as_deref())
+            .map(|text| wrap_log_lines(text, width))
+            .unwrap_or_default()
+    }
+
+    fn scroll_by(&mut self, amount: isize, visible: usize, width: usize) {
+        let total = self.display_lines(width).len();
+        let max = total.saturating_sub(visible.max(1));
+        if amount < 0 {
+            self.scroll = self.scroll.saturating_sub(amount.unsigned_abs());
+        } else {
+            self.scroll = self.scroll.saturating_add(amount as usize).min(max);
+        }
+    }
+
+    fn scroll_to(&mut self, end: bool, visible: usize, width: usize) {
+        let total = self.display_lines(width).len();
+        let max = total.saturating_sub(visible.max(1));
+        self.scroll = if end { max } else { 0 };
+    }
+}
+
+/// Remove terminal controls before plugin output is written into the manage pane.
+///
+/// Plugin commands are user code, so their logs must not be allowed to move the cursor or
+/// rewrite the surrounding TUI. CSI and OSC escape sequences are skipped; other controls are
+/// replaced with a visible marker so malformed output stays inspectable.
+fn sanitize_log_output(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            match c {
+                '\n' => output.push('\n'),
+                '\r' => {}
+                '\t' => output.push_str("    "),
+                c if c.is_control() => output.push('�'),
+                c => output.push(c),
+            }
+            continue;
+        }
+
+        match chars.next() {
+            Some('[') => {
+                // CSI sequences end at a byte in the final 0x40..=0x7e range.
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                // OSC sequences end at BEL or the two-byte ST sequence (ESC followed by `\\`).
+                while let Some(next) = chars.next() {
+                    if next == '\x07' {
+                        break;
+                    }
+                    if next == '\x1b' && chars.next() == Some('\\') {
+                        break;
+                    }
+                }
+            }
+            Some(_) | None => {}
+        }
+    }
+    output
+}
+
+const MAX_LOG_OUTPUT_BYTES: usize = 256 * 1024;
+const MAX_LOG_DISPLAY_LINES: usize = 10_000;
+const LOG_TRUNCATION_MARKER: &str = "[… log output truncated …]";
+
+fn truncate_log_output(input: &str) -> String {
+    if input.len() <= MAX_LOG_OUTPUT_BYTES {
+        return input.to_string();
+    }
+
+    let end = input
+        .char_indices()
+        .take_while(|(index, character)| index + character.len_utf8() <= MAX_LOG_OUTPUT_BYTES)
+        .map(|(index, character)| index + character.len_utf8())
+        .last()
+        .unwrap_or(0);
+    let mut output = input[..end].to_string();
+    output.push('\n');
+    output.push_str(LOG_TRUNCATION_MARKER);
+    output
+}
+
+fn native_log_response_is_empty(output: &str) -> bool {
+    let Ok(value) = crate::json::parse(output.trim()) else {
+        return false;
+    };
+    let logs = value
+        .path(&["result", "logs"])
+        .or_else(|| value.path(&["logs"]));
+    logs.and_then(|value| value.as_array())
+        .is_some_and(|logs| logs.is_empty())
+}
+
+fn wrap_log_lines(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut truncated = false;
+    for line in text.lines() {
+        let chars: Vec<char> = line.chars().collect();
+        if chars.is_empty() {
+            if lines.len() >= MAX_LOG_DISPLAY_LINES {
+                truncated = true;
+                break;
+            }
+            lines.push(String::new());
+            continue;
+        }
+        for chunk in chars.chunks(width) {
+            if lines.len() >= MAX_LOG_DISPLAY_LINES {
+                truncated = true;
+                break;
+            }
+            lines.push(chunk.iter().collect());
+        }
+        if truncated {
+            break;
+        }
+    }
+    if truncated {
+        if lines.len() == MAX_LOG_DISPLAY_LINES {
+            lines.pop();
+        }
+        lines.push(LOG_TRUNCATION_MARKER.to_string());
+    }
+    lines
+}
+
+fn log_visible_lines(height: u16, has_error: bool) -> usize {
+    let visible = (height as usize).saturating_sub(5).max(1);
+    if has_error {
+        visible.saturating_sub(1).max(1)
+    } else {
+        visible
+    }
+}
+
 /// Build the view: every bundle entry, then anything installed that the bundle does not name.
 /// The view without update information — what the tests use, since they are checking status
 /// and selection rather than what the marketplace happens to say today.
@@ -644,6 +830,9 @@ struct App {
     /// row so reopening the same plugin does not re-hit the network, and a stale result for a
     /// different plugin never shows.
     detail_changes: Option<(usize, crate::github::Changes)>,
+    /// Recent command logs for the selected plugin. This is a modal overlay so the list/detail
+    /// cursor remains where the user left it when they go back.
+    log_view: Option<LogView>,
     /// Set while waiting for the letter to bind an action to.
     awaiting_bind: bool,
     /// `(action_id, key)` chosen but not yet written, while the user confirms.
@@ -684,6 +873,7 @@ impl App {
                 detail_of: None,
                 detail_cursor: 0,
                 detail_changes: None,
+                log_view: None,
                 awaiting_bind: false,
                 pending_bind: None,
                 cursor: 0,
@@ -699,6 +889,7 @@ impl App {
                 detail_of: None,
                 detail_cursor: 0,
                 detail_changes: None,
+                log_view: None,
                 awaiting_bind: false,
                 pending_bind: None,
                 cursor: 0,
@@ -714,18 +905,64 @@ impl App {
         let extras = self.extras.take();
         let adopt = self.adopt.take();
         let changes = self.detail_changes.take();
+        let logs = self.log_view.take();
         *self = App::load();
         self.browser = browser;
         self.extras = extras;
         self.adopt = adopt;
         self.help = help;
         self.detail_changes = changes;
+        self.log_view = logs;
         self.cursor = cursor.min(self.rows.len().saturating_sub(1));
         self.flash = flash;
     }
 
     fn selected(&self) -> Option<&Row> {
         self.rows.get(self.cursor)
+    }
+
+    fn open_logs(&mut self) {
+        self.open_logs_for(self.cursor);
+    }
+
+    fn open_logs_for(&mut self, idx: usize) {
+        let Some(plugin_id) = self
+            .rows
+            .get(idx)
+            .and_then(|row| row.installed.as_ref())
+            .map(|(plugin_id, _)| plugin_id.clone())
+        else {
+            self.flash = Some("logs are only available for an installed plugin".to_string());
+            return;
+        };
+
+        self.flash = None;
+        self.log_view = Some(LogView::from_result(
+            plugin_id.clone(),
+            crate::plugin_logs(&plugin_id),
+        ));
+    }
+
+    fn reload_logs(&mut self) {
+        let Some(plugin_id) = self.log_view.as_ref().map(|view| view.plugin_id.clone()) else {
+            return;
+        };
+        let result = crate::plugin_logs(&plugin_id);
+        if let Some(view) = self.log_view.as_mut() {
+            view.set_result(result);
+        }
+    }
+
+    fn scroll_logs(&mut self, amount: isize, visible: usize, width: usize) {
+        if let Some(view) = self.log_view.as_mut() {
+            view.scroll_by(amount, visible, width);
+        }
+    }
+
+    fn seek_logs(&mut self, end: bool, visible: usize, width: usize) {
+        if let Some(view) = self.log_view.as_mut() {
+            view.scroll_to(end, visible, width);
+        }
     }
 
     /// How many rows fit, and which one is at the top. Used by both drawing and clicking.
@@ -1451,6 +1688,9 @@ impl App {
         if self.pending_bind.is_some() {
             return self.draw_bind_confirm(out, width, height);
         }
+        if self.log_view.is_some() {
+            return self.draw_logs(out, width, height);
+        }
         if self.detail_of.is_some() {
             return self.draw_detail(out, width, height);
         }
@@ -1516,6 +1756,63 @@ impl App {
         out.flush()
     }
 
+    /// Show the native herdr log response without leaving the manage pane.
+    fn draw_logs(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        let view = self.log_view.as_ref().expect("checked by caller");
+        let rule = "─".repeat((width as usize).clamp(20, 200));
+        let content_width = (width as usize).saturating_sub(2).max(1);
+        let visible = log_visible_lines(height, view.error.is_some());
+        let lines = view.display_lines(content_width);
+        let max_scroll = lines.len().saturating_sub(visible);
+        let start = view.scroll.min(max_scroll);
+
+        write!(out, "\x1b[H\x1b[2J")?;
+        writeln!(
+            out,
+            "\x1b[1m logs\x1b[0m  \x1b[2m{} · latest {} records\x1b[0m\r",
+            sanitize_log_output(&view.plugin_id),
+            crate::PLUGIN_LOG_LIMIT
+        )?;
+        writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
+
+        if view.error.is_some() {
+            writeln!(out, " \x1b[31mcould not read plugin logs:\x1b[0m\r")?;
+            for line in lines.iter().skip(start).take(visible) {
+                writeln!(out, "   {}\r", line)?;
+            }
+        } else if lines.is_empty() {
+            writeln!(out, " \x1b[2mno command logs recorded yet\x1b[0m\r")?;
+        } else {
+            for line in lines.iter().skip(start).take(visible) {
+                writeln!(out, " {}\r", line)?;
+            }
+        }
+
+        let position = if lines.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\x1b[2mshowing {}–{} of {} lines\x1b[0m  ",
+                start + 1,
+                (start + visible).min(lines.len()),
+                lines.len()
+            )
+        };
+        let footer = format!(
+            "{}\x1b[1m[j/k]\x1b[0m scroll  \x1b[1m[r]\x1b[0m reload  \
+             \x1b[1m[esc/q]\x1b[0m back",
+            position
+        );
+        write!(
+            out,
+            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
+            height.saturating_sub(1),
+            rule,
+            footer
+        )?;
+        out.flush()
+    }
+
     /// What this plugin does, and how to actually use it.
     ///
     /// A distro that installs seven plugins in one go leaves the user holding seven things
@@ -1537,11 +1834,17 @@ impl App {
                 out,
                 " \x1b[2mnot installed yet — press i to install, then look again\x1b[0m\r"
             )?;
+            let footer = self
+                .flash
+                .as_deref()
+                .map(|message| format!("\x1b[36m{}\x1b[0m", message))
+                .unwrap_or_else(|| "\x1b[2many key goes back\x1b[0m".to_string());
             write!(
                 out,
-                "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m\x1b[2many key goes back\x1b[0m\r",
+                "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
                 height.saturating_sub(1),
-                rule
+                rule,
+                footer
             )?;
             return out.flush();
         };
@@ -1667,7 +1970,8 @@ impl App {
             match &self.flash {
                 Some(m) => format!("\x1b[36m{}\x1b[0m", m),
                 None => "\x1b[1m[enter]\x1b[0m run  \x1b[1m[b]\x1b[0m bind to a key  \
-                         \x1b[1m[j/k]\x1b[0m move  \x1b[1m[esc]\x1b[0m back"
+                         \x1b[1m[L]\x1b[0m logs  \x1b[1m[j/k]\x1b[0m move  \
+                         \x1b[1m[esc]\x1b[0m back"
                     .to_string(),
             }
         };
@@ -1692,7 +1996,7 @@ impl App {
         // The one rule the whole keymap follows, stated before any of the keys.
         writeln!(
             out,
-            "\x1b[1m keys\x1b[0m   \x1b[2mlowercase acts on the selected row ·              UPPERCASE on your whole list\x1b[0m\r"
+            "\x1b[1m keys\x1b[0m   \x1b[2mlowercase acts on the selected row ·              UPPERCASE means bulk or special actions\x1b[0m\r"
         )?;
         writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
 
@@ -1735,6 +2039,10 @@ impl App {
                     "D",
                     "disable selected installed plugin(s) — herdr-lazy is protected",
                 ),
+                (
+                    "L",
+                    "show the selected installed plugin's recent command logs",
+                ),
             ],
         )?;
         section(
@@ -1768,6 +2076,10 @@ impl App {
                 (
                     "↑",
                     "beside a commit: the repo moved since you installed; open with l",
+                ),
+                (
+                    "L",
+                    "open the selected plugin's logs; j/k scroll and r reloads",
                 ),
                 ("j / k", "down / up  (arrows and the wheel work too)"),
                 ("g / G", "first / last row"),
@@ -2152,6 +2464,7 @@ impl App {
             ("r", "restore"),
             ("E", "enable"),
             ("D", "disable"),
+            ("L", "logs"),
             ("a", "adopt"),
             ("d", "drop"),
             ("/", "search"),
@@ -2311,7 +2624,22 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
         let key = match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
             Event::Mouse(m) => {
-                app.handle_mouse(m, height)?;
+                if app.log_view.is_some() {
+                    use crossterm::event::MouseEventKind;
+                    let visible = app
+                        .log_view
+                        .as_ref()
+                        .map(|view| log_visible_lines(height, view.error.is_some()))
+                        .unwrap_or(1);
+                    let width = (width as usize).saturating_sub(2).max(1);
+                    match m.kind {
+                        MouseEventKind::ScrollDown => app.scroll_logs(1, visible, width),
+                        MouseEventKind::ScrollUp => app.scroll_logs(-1, visible, width),
+                        _ => {}
+                    }
+                } else {
+                    app.handle_mouse(m, height)?;
+                }
                 continue;
             }
             Event::Resize(..) => continue,
@@ -2342,6 +2670,40 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                     app.pending_bind = None;
                     app.flash = Some("not bound".to_string());
                 }
+            }
+            continue;
+        }
+
+        if app.log_view.is_some() {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                if key.code == KeyCode::Char('c') {
+                    return Ok(());
+                }
+                continue;
+            }
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                continue;
+            }
+
+            let visible = app
+                .log_view
+                .as_ref()
+                .map(|view| log_visible_lines(height, view.error.is_some()))
+                .unwrap_or(1);
+            let width = (width as usize).saturating_sub(2).max(1);
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    app.log_view = None;
+                    app.flash = None;
+                }
+                KeyCode::Char('j') | KeyCode::Down => app.scroll_logs(1, visible, width),
+                KeyCode::Char('k') | KeyCode::Up => app.scroll_logs(-1, visible, width),
+                KeyCode::PageDown => app.scroll_logs(visible as isize, visible, width),
+                KeyCode::PageUp => app.scroll_logs(-(visible as isize), visible, width),
+                KeyCode::Char('g') | KeyCode::Home => app.seek_logs(false, visible, width),
+                KeyCode::Char('G') | KeyCode::End => app.seek_logs(true, visible, width),
+                KeyCode::Char('r') => app.reload_logs(),
+                _ => {}
             }
             continue;
         }
@@ -2402,6 +2764,7 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                     app.detail_cursor = app.detail_cursor.saturating_sub(1)
                 }
                 KeyCode::Enter => app.run_detail_action(),
+                KeyCode::Char('L') => app.open_logs_for(idx),
                 _ => {}
             }
             continue;
@@ -2658,10 +3021,7 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             KeyCode::Char('C') | KeyCode::Char('c') => {
                 app.flash = Some("no check yet — [U] updates and reports what moved".to_string())
             }
-            KeyCode::Char('L') => {
-                app.flash =
-                    Some("no log here — `herdr plugin log list` shows plugin output".to_string())
-            }
+            KeyCode::Char('L') => app.open_logs(),
             _ => {}
         }
     }
@@ -2930,7 +3290,7 @@ mod tests {
         for c in ['i', 'u', 'x', 'r', 'a', 'd', '/', '?'] {
             assert_eq!(plain(c), Action::Command(c), "{} should be a command", c);
         }
-        for c in ['I', 'U', 'X', 'R', 'E', 'D'] {
+        for c in ['I', 'U', 'X', 'R', 'E', 'D', 'L'] {
             assert_eq!(
                 classify(&KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT)),
                 Action::Command(c),
@@ -2941,6 +3301,149 @@ mod tests {
         // `s` no longer does anything: it used to install, and silently re-binding a key that
         // people may have learned is worse than leaving it inert.
         assert_eq!(plain('s'), Action::Command('s'));
+    }
+
+    #[test]
+    fn log_output_is_sanitized_and_wrapped() {
+        let view = LogView::from_result(
+            "example".to_string(),
+            Ok("\x1b[31mabcdef\x1b[0m\nnext\tline".to_string()),
+        );
+
+        assert_eq!(
+            view.display_lines(4),
+            ["abcd", "ef", "next", "    ", "line"]
+        );
+    }
+
+    #[test]
+    fn log_view_handles_empty_and_failed_results() {
+        let empty = LogView::from_result("empty".to_string(), Ok("\n  \n".to_string()));
+        assert!(empty.output.is_none(), "whitespace-only output is empty");
+        assert!(empty.error.is_none());
+        assert!(empty.display_lines(80).is_empty());
+
+        let native_empty = LogView::from_result(
+            "empty".to_string(),
+            Ok("{\"result\":{\"logs\":[]}}".to_string()),
+        );
+        assert!(
+            native_empty.output.is_none(),
+            "an empty native log array is an empty view"
+        );
+
+        let failed = LogView::from_result(
+            "broken".to_string(),
+            Err("\x1b[31mserver unavailable\x1b[0m".to_string()),
+        );
+        assert!(failed.output.is_none());
+        assert_eq!(failed.display_lines(80), ["server unavailable"]);
+    }
+
+    #[test]
+    fn log_output_is_bounded_for_huge_records_and_many_lines() {
+        let huge =
+            LogView::from_result("huge".to_string(), Ok("x".repeat(MAX_LOG_OUTPUT_BYTES + 1)));
+        let stored = huge
+            .output
+            .as_deref()
+            .expect("huge output is retained in bounded form");
+        assert!(stored.len() <= MAX_LOG_OUTPUT_BYTES + 1 + LOG_TRUNCATION_MARKER.len());
+        assert!(stored.ends_with(LOG_TRUNCATION_MARKER));
+
+        let many_lines = (0..MAX_LOG_DISPLAY_LINES + 1)
+            .map(|_| "one line")
+            .collect::<Vec<_>>()
+            .join("\n");
+        let many = LogView::from_result("many".to_string(), Ok(many_lines));
+        let lines = many.display_lines(80);
+        assert_eq!(lines.len(), MAX_LOG_DISPLAY_LINES);
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some(LOG_TRUNCATION_MARKER)
+        );
+    }
+
+    #[test]
+    fn log_view_keeps_raw_plugin_id_for_reload_and_sanitizes_title() {
+        let raw_id = "\x1b[31mexample\x1b[0m".to_string();
+        let view = LogView::from_result(raw_id.clone(), Ok("log".to_string()));
+        assert_eq!(view.plugin_id, raw_id);
+
+        let app = App {
+            log_view: Some(view),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        app.draw_logs(&mut buf, 80, 24).unwrap();
+        let rendered = String::from_utf8(buf).unwrap();
+        assert!(rendered.contains("example"));
+        assert!(!rendered.contains(&raw_id));
+    }
+
+    #[test]
+    fn log_view_scroll_is_bounded_and_resets_on_reload() {
+        let output = (0..10)
+            .map(|n| format!("log-{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut view = LogView::from_result("example".to_string(), Ok(output));
+
+        view.scroll_by(100, 3, 80);
+        assert_eq!(view.scroll, 7, "scroll cannot pass the last visible page");
+        view.scroll_by(-100, 3, 80);
+        assert_eq!(view.scroll, 0, "scroll cannot pass the first line");
+        view.scroll_to(true, 3, 80);
+        assert_eq!(view.scroll, 7);
+
+        view.set_result(Ok("fresh".to_string()));
+        assert_eq!(view.scroll, 0, "reloading starts at the newest response");
+        assert_eq!(view.display_lines(80), ["fresh"]);
+    }
+
+    #[test]
+    fn log_overlay_draws_native_output_and_empty_state() {
+        let app = App {
+            log_view: Some(LogView::from_result(
+                "example".to_string(),
+                Ok("{\"result\":{\"logs\":[{\"status\":\"failed\"}]}}".to_string()),
+            )),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        app.draw_logs(&mut buf, 80, 24).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("example"));
+        assert!(out.contains("{\"result\":{\"logs\":[{\"status\":\"failed\"}]}}"));
+        assert!(out.contains("[r]"));
+
+        let empty = App {
+            log_view: Some(LogView::from_result(
+                "empty".to_string(),
+                Ok("{\"result\":{\"logs\":[]}}".to_string()),
+            )),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        empty.draw_logs(&mut buf, 80, 24).unwrap();
+        assert!(String::from_utf8(buf)
+            .unwrap()
+            .contains("no command logs recorded yet"));
+    }
+
+    #[test]
+    fn logs_cannot_open_for_a_missing_plugin() {
+        let mut app = App {
+            rows: rows(&[Spec::parse("owner/missing")], &[]),
+            ..Default::default()
+        };
+
+        app.open_logs();
+        assert!(app.log_view.is_none());
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("logs are only available for an installed plugin")
+        );
     }
 
     #[test]

@@ -2299,6 +2299,50 @@ where
     }
 }
 
+/// Read recent command logs through herdr's public plugin log interface.
+///
+/// The response is intentionally returned unchanged. Herdr owns the log schema, and the manage
+/// pane is a viewer rather than a second log parser; keeping the native response intact means
+/// new fields remain visible and malformed responses can still be shown for diagnosis.
+pub(crate) const PLUGIN_LOG_LIMIT: &str = "100";
+
+pub(crate) fn plugin_logs(plugin_id: &str) -> Result<String, String> {
+    plugin_logs_with(plugin_id, run_herdr)
+}
+
+fn plugin_logs_with<F>(plugin_id: &str, run: F) -> Result<String, String>
+where
+    F: FnOnce(&[&str]) -> io::Result<(bool, String, String)>,
+{
+    match run(&[
+        "plugin",
+        "log",
+        "list",
+        "--plugin",
+        plugin_id,
+        "--limit",
+        PLUGIN_LOG_LIMIT,
+    ]) {
+        Ok((true, out, _)) => Ok(out),
+        Ok((false, out, err)) => {
+            let stdout = out.trim();
+            let stderr = err.trim();
+            let msg = match (stderr.is_empty(), stdout.is_empty()) {
+                (true, true) => String::new(),
+                (true, false) => stdout.to_string(),
+                (false, true) => stderr.to_string(),
+                (false, false) => format!("stderr:\n{stderr}\nstdout:\n{stdout}"),
+            };
+            if msg.is_empty() {
+                Err(format!("could not read logs for {}", plugin_id))
+            } else {
+                Err(format!("could not read logs for {}: {}", plugin_id, msg))
+            }
+        }
+        Err(e) => Err(format!("could not run herdr: {}", e)),
+    }
+}
+
 /// Re-resolve unpinned bundle entries to their latest commit.
 ///
 /// herdr has no `plugin update`; re-running `plugin install` is the update path — it reports
@@ -3811,6 +3855,78 @@ command = "something.else"
         })
         .expect_err("a stdout error must also be reported");
         assert_eq!(error, "could not enable example: cannot enable it");
+    }
+
+    #[test]
+    fn plugin_logs_use_herdrs_native_list_command_and_preserve_output() {
+        let mut seen = Vec::new();
+        let output = plugin_logs_with("example.plugin", |args| {
+            seen = args.iter().map(|arg| arg.to_string()).collect();
+            Ok((
+                true,
+                "{\"result\":{\"logs\":[]}}\n".to_string(),
+                String::new(),
+            ))
+        })
+        .expect("a successful log query returns its native response");
+
+        assert_eq!(
+            seen,
+            [
+                "plugin",
+                "log",
+                "list",
+                "--plugin",
+                "example.plugin",
+                "--limit",
+                PLUGIN_LOG_LIMIT,
+            ]
+        );
+        assert_eq!(output, "{\"result\":{\"logs\":[]}}\n");
+    }
+
+    #[test]
+    fn plugin_log_errors_preserve_herdr_output() {
+        let error = plugin_logs_with("example", |_| {
+            Ok((
+                false,
+                String::new(),
+                "plugin is not installed\n".to_string(),
+            ))
+        })
+        .expect_err("a failed herdr command must be reported");
+        assert_eq!(
+            error,
+            "could not read logs for example: plugin is not installed"
+        );
+
+        let error = plugin_logs_with("example", |_| {
+            Ok((false, "could not reach server\n".to_string(), String::new()))
+        })
+        .expect_err("stdout errors must also be reported");
+        assert_eq!(
+            error,
+            "could not read logs for example: could not reach server"
+        );
+
+        let error = plugin_logs_with("example", |_| {
+            Ok((
+                false,
+                "response details\n".to_string(),
+                "request failed\n".to_string(),
+            ))
+        })
+        .expect_err("both herdr streams must be reported");
+        assert_eq!(
+            error,
+            "could not read logs for example: stderr:\nrequest failed\nstdout:\nresponse details"
+        );
+
+        let error = plugin_logs_with("example", |_| {
+            Err(io::Error::new(io::ErrorKind::NotFound, "herdr missing"))
+        })
+        .expect_err("an unavailable herdr binary must be reported");
+        assert_eq!(error, "could not run herdr: herdr missing");
     }
 
     /// The failure this project designs around: a bare `cargo build` cannot run under herdr's
