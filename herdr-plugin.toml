@@ -1,6 +1,6 @@
 id = "herdr-lazy"
 name = "herdr-lazy"
-version = "0.32.0"
+version = "0.33.0"
 # 0.7.5, not 0.7.0, because of the `[[startup]]` hook below: it does not exist before 0.7.5,
 # and the first-run setup depends on it entirely. Claiming 0.7.0 meant herdr-lazy installed
 # happily on an older herdr and then quietly never set the machine up — and it could not even
