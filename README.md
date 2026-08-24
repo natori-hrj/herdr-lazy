@@ -70,8 +70,9 @@ reports are very welcome — see the open issues.
 
 **The first herdr start after installing sets up the route into the manager** (a `[[startup]]`
 hook): it writes the curated list and binds `prefix+shift+l` to the manage pane, but does not
-install third-party plugins automatically. Review the list, then run `herdr-lazy sync` or press
-`i` in the manage pane when you are ready. It prints everything it did.
+install third-party plugins automatically. It tells you how many recommended plugins are waiting,
+then one explicit `herdr-lazy sync` or `I` (install all) action installs them. Review the list
+first if you want to; the manage pane is there for exactly that. It prints everything it did.
 
 That happens only on a machine that has plainly never been set up — no plugin list, and
 nothing installed but herdr-lazy itself. If you already have plugins, or already have a list,

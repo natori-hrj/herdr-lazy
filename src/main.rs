@@ -65,6 +65,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///
 /// Edit freely — `herdr-lazy init` writes these into your bundle file, and nothing here is
 /// load-bearing.
+const SELF_REPO: &str = "natori-hrj/herdr-lazy";
+
 const DEFAULT_BUNDLE: &[&str] = &[
     // Listed so the tool can be updated by the tool. `u` in the pane, and `update` on the
     // command line, only act on entries in the list — leaving herdr-lazy out meant the one
@@ -74,7 +76,7 @@ const DEFAULT_BUNDLE: &[&str] = &[
     // Updating it replaces the binary of the running process. That is fine on Unix, where the
     // open inode outlives the rename, and it has been done on Windows too (see #2) — but it is
     // the reason this entry is worth a comment rather than being obvious.
-    "natori-hrj/herdr-lazy",
+    SELF_REPO,
     // Proven in the ecosystem, and verified to install cleanly.
     "cloudmanic/herdr-plus",                    // projects + quick actions
     "smarzban/herdr-file-viewer",               // git-aware read-only file pane
@@ -1605,6 +1607,29 @@ fn write_first_run_list(path: &Path) -> io::Result<()> {
     write_bytes_atomically(path, default_bundle_body(&[]).as_bytes())
 }
 
+fn pending_default_plugin_count() -> usize {
+    DEFAULT_BUNDLE
+        .iter()
+        .filter(|repo| **repo != SELF_REPO)
+        .count()
+}
+
+fn first_run_install_hint() -> String {
+    let count = pending_default_plugin_count();
+    let noun = if count == 1 { "plugin" } else { "plugins" };
+    format!(
+        "  ready — {} recommended {} are waiting.\n  nothing was installed automatically.",
+        count, noun
+    )
+}
+
+fn first_run_next_step(manage_step: &str) -> String {
+    format!(
+        "  next — run `herdr-lazy sync`, or {} and press `I` to install them all.",
+        manage_step
+    )
+}
+
 /// Set a fresh machine up on the first herdr start after installing: write the list and bind a
 /// key to the manage pane, but do not install the third-party plugins it names.
 ///
@@ -1651,39 +1676,39 @@ fn bootstrap_if_first_run() -> BootstrapResult {
         return BootstrapResult::Failed;
     }
     println!("  wrote {}", p.display());
-
-    println!("  no plugins were installed automatically.");
-    println!(
-        "  review the list, then run `herdr-lazy sync` or press i in the manage pane to install."
-    );
+    println!("{}", first_run_install_hint());
 
     // The action id is read back from herdr rather than hardcoded — see `platform_variant`.
     let action = installed
         .iter()
         .find(|p| is_self(p))
         .and_then(|me| platform_variant(me.actions.iter().map(|(id, _)| id.as_str()), "manage"));
-    match action {
+    let has_manage_action = action.is_some();
+    let manage_step = match action {
         Some(id) => match bind_action(PLUGIN_ID, &BindTarget::Action(id), BOOTSTRAP_KEY) {
-            Ok(msg) => println!("  {}", msg),
+            Ok(msg) => {
+                println!("  {}", msg);
+                format!("press {} to open the manage pane", BOOTSTRAP_KEY)
+            }
             // A refusal here is the safe outcome, not a failure: the key was already taken, or
             // there is no config.toml to write. Say what to press instead of dying quietly.
             Err(msg) => {
                 println!("  did not bind {}: {}", BOOTSTRAP_KEY, msg);
-                println!("  open the pane with: {}", manage_pane_command(&installed));
+                format!("open the pane with: {}", manage_pane_command(&installed))
             }
         },
-        None => println!(
-            "  no manage action registered for this platform — open the pane with: {}",
-            manage_pane_command(&installed)
-        ),
+        None => format!("open the pane with: {}", manage_pane_command(&installed)),
+    };
+    if !has_manage_action {
+        println!(
+            "  no manage action registered for this platform — {}",
+            manage_step
+        );
     }
 
     let _ = ensure_parent(&marker);
     let _ = fs::write(&marker, DONE_MARKER);
-    println!(
-        "  done — review the list, then press {} to manage your plugins.",
-        BOOTSTRAP_KEY
-    );
+    println!("{}", first_run_next_step(&manage_step));
     BootstrapResult::Completed
 }
 
@@ -3551,6 +3576,19 @@ command = "something.else"
         assert!(path.is_dir(), "a failed write must not replace the target");
 
         fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn first_run_install_hint_is_actionable_without_promising_auto_install() {
+        let hint = first_run_install_hint();
+        assert!(hint.contains(&format!(
+            "{} recommended plugins are waiting",
+            pending_default_plugin_count()
+        )));
+        assert!(hint.contains("nothing was installed automatically"));
+        let next = first_run_next_step("press prefix+shift+l to open the manage pane");
+        assert!(next.contains("herdr-lazy sync"));
+        assert!(next.contains("press `I` to install them all"));
     }
 
     /// Verbatim shape of a plugin that supports Windows: herdr lists every declared entry,
