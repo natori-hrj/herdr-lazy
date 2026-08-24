@@ -1510,22 +1510,25 @@ fn pending_work(all: &[Spec], installed: &[Installed]) -> Vec<Spec> {
         .collect()
 }
 
-/// herdr's `[[startup]]` hook: converge the machine to the list when herdr starts, but only
-/// when there is a gap, and only for gaps that can be closed without a network round trip
-/// per plugin or a surprising rebuild.
+/// herdr's `[[startup]]` hook: converge an already configured machine to the list when herdr
+/// starts, but only when there is a gap, and only for gaps that can be closed without a network
+/// round trip per plugin or a surprising rebuild.
 ///
 /// The constraint that shapes this: startup runs on every server start and live handoff, for
 /// a human who did not ask for it right then. So it must be silent when nothing is wrong (the
 /// common case), and it must not turn a routine `herdr` launch into a minutes-long install of
-/// everything in a fresh list. It installs what is missing — that is the "I opened herdr on a
-/// new machine and my plugins appeared" story — but it never prunes and never updates, because
-/// those change a working setup rather than complete an incomplete one.
+/// everything in a fresh list. First-run setup writes the list but deliberately leaves plugin
+/// installation to an explicit user action; this hook only auto-syncs a setup that already
+/// existed before the current startup. It never prunes and never updates, because those change
+/// a working setup rather than complete an incomplete one.
 ///
 /// Opt-in: does nothing unless `auto_sync` is enabled, because a plugin that installs other
-/// software when herdr starts is not something to turn on by surprise.
+/// software when herdr starts is not something to turn on by surprise. The first-run bootstrap
+/// is excluded even when the marker is present: enabling auto-sync must not turn first launch
+/// into an unattended third-party install.
 fn cmd_startup() -> io::Result<()> {
-    bootstrap_if_first_run();
-    if !auto_sync_enabled() {
+    let bootstrap = bootstrap_if_first_run();
+    if !should_run_auto_sync(bootstrap, auto_sync_enabled()) {
         return Ok(()); // silent: the hook fires for everyone, most have not opted in
     }
     let all: Vec<Spec> = desired_plugins().iter().map(|l| Spec::parse(l)).collect();
@@ -1545,8 +1548,8 @@ fn cmd_startup() -> io::Result<()> {
 /// Only what is absent. A drifted pin is a deliberate-looking state that `sync` repairs on
 /// request; silently rewriting it at every launch would be a surprise.
 ///
-/// Shared by startup auto-sync and the first-run bootstrap so the two cannot converge a
-/// machine differently.
+/// Shared by startup auto-sync only. First-run setup deliberately does not call this: it writes
+/// a list for the user to review before any third-party build command runs.
 fn install_missing(all: &[Spec], installed: &[Installed]) -> usize {
     let pending = pending_work(all, installed);
     let missing: Vec<&Spec> = pending
@@ -1590,51 +1593,69 @@ fn install_missing(all: &[Spec], installed: &[Installed]) -> usize {
 /// nothing is shadowed. `l` for lazy; the README has documented this key since the beginning.
 const BOOTSTRAP_KEY: &str = "prefix+shift+l";
 
-/// Set a fresh machine up on the first herdr start after installing: write the list, install
-/// what it names, and bind a key to the manage pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootstrapResult {
+    NotNeeded,
+    Completed,
+    Failed,
+}
+
+fn write_first_run_list(path: &Path) -> io::Result<()> {
+    ensure_parent(path)?;
+    write_bytes_atomically(path, default_bundle_body(&[]).as_bytes())
+}
+
+/// Set a fresh machine up on the first herdr start after installing: write the list and bind a
+/// key to the manage pane, but do not install the third-party plugins it names.
 ///
 /// Without this, installing a plugin that calls itself a batteries-included distro leaves you
 /// with an empty list and no way to open the pane — herdr has no command palette, and a
 /// manifest cannot declare a keybinding, so nothing tells you the tool is there. Installing
-/// herdr-lazy is the consent; this is what it consented to.
+/// herdr-lazy is enough to create the list and the route into the manager. It is not consent to
+/// execute every third-party plugin in the curated list.
 ///
 /// The opinion stays opt-in for everyone else, because this fires only on a machine that has
 /// plainly never been set up: see `is_first_run`. It also never runs twice, and it never takes
 /// a key that is already spoken for.
-fn bootstrap_if_first_run() {
+///
+/// Returns how the first-run setup ended. The caller uses this to keep the same startup from
+/// entering the separate auto-sync path after either a successful or failed attempt.
+fn bootstrap_if_first_run() -> BootstrapResult {
     if env::var("HERDR_LAZY_NO_BOOTSTRAP").is_ok_and(|v| !v.is_empty()) {
-        return;
+        return BootstrapResult::NotNeeded;
     }
     let marker = config_dir().join("bootstrapped");
     if marker.exists() {
-        return;
+        return BootstrapResult::NotNeeded;
     }
     // A list means this machine has been set up, whatever else is true. Record the decision so
     // the check below — which costs a round trip to herdr — never runs again.
     if bundle_path().exists() {
         let _ = ensure_parent(&marker);
         let _ = fs::write(&marker, DECLINED_MARKER);
-        return;
+        return BootstrapResult::NotNeeded;
     }
     let Ok(installed) = installed_plugins() else {
-        return; // herdr not answering yet; try again next start
+        return BootstrapResult::NotNeeded; // herdr not answering yet; try again next start
     };
     if !is_first_run(&installed) {
         let _ = ensure_parent(&marker);
         let _ = fs::write(&marker, DECLINED_MARKER);
-        return;
+        return BootstrapResult::NotNeeded;
     }
 
     println!("herdr-lazy: first run — setting up.");
     let p = bundle_path();
-    if ensure_parent(&p).is_err() || fs::write(&p, default_bundle_body(&[])).is_err() {
+    if write_first_run_list(&p).is_err() {
         println!("  could not write {} — stopping here.", p.display());
-        return;
+        return BootstrapResult::Failed;
     }
     println!("  wrote {}", p.display());
 
-    let all: Vec<Spec> = desired_plugins().iter().map(|l| Spec::parse(l)).collect();
-    install_missing(&all, &installed);
+    println!("  no plugins were installed automatically.");
+    println!(
+        "  review the list, then run `herdr-lazy sync` or press i in the manage pane to install."
+    );
 
     // The action id is read back from herdr rather than hardcoded — see `platform_variant`.
     let action = installed
@@ -1659,7 +1680,11 @@ fn bootstrap_if_first_run() {
 
     let _ = ensure_parent(&marker);
     let _ = fs::write(&marker, DONE_MARKER);
-    println!("  done — press {} to manage your plugins.", BOOTSTRAP_KEY);
+    println!(
+        "  done — review the list, then press {} to manage your plugins.",
+        BOOTSTRAP_KEY
+    );
+    BootstrapResult::Completed
 }
 
 /// What herdr calls the platform we are running on, for comparing against a manifest's
@@ -1759,6 +1784,10 @@ fn is_first_run(installed: &[Installed]) -> bool {
 /// config file, and inventing one for a single boolean is not worth it. Presence = on.
 pub(crate) fn auto_sync_enabled() -> bool {
     config_dir().join("auto-sync").exists()
+}
+
+fn should_run_auto_sync(bootstrap: BootstrapResult, enabled: bool) -> bool {
+    enabled && matches!(bootstrap, BootstrapResult::NotNeeded)
 }
 
 /// Flip startup auto-sync, returning the new state and a line to show the user.
@@ -3498,6 +3527,30 @@ command = "something.else"
             !is_first_run(&[me, from_github("cloudmanic", "herdr-plus")]),
             "a hand-built setup must be left alone"
         );
+    }
+
+    #[test]
+    fn first_run_does_not_start_auto_sync_on_the_same_startup() {
+        assert!(!should_run_auto_sync(BootstrapResult::Completed, true));
+        assert!(!should_run_auto_sync(BootstrapResult::Completed, false));
+        assert!(!should_run_auto_sync(BootstrapResult::Failed, true));
+        assert!(should_run_auto_sync(BootstrapResult::NotNeeded, true));
+        assert!(!should_run_auto_sync(BootstrapResult::NotNeeded, false));
+    }
+
+    #[test]
+    fn failed_first_run_list_write_is_atomic_and_reported() {
+        let path = env::temp_dir().join(format!(
+            "herdr-lazy-bootstrap-failure-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+
+        assert!(write_first_run_list(&path).is_err());
+        assert!(path.is_dir(), "a failed write must not replace the target");
+
+        fs::remove_dir_all(path).unwrap();
     }
 
     /// Verbatim shape of a plugin that supports Windows: herdr lists every declared entry,

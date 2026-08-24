@@ -40,9 +40,9 @@ lockfile records.
   name, description or topic, and add one to your list without leaving the terminal.
 - **A curated default set.** `init` writes a starting bundle so a fresh herdr is useful
   immediately, and `e` in the pane opens the opt-in extras on top of it.
-- **A first run that leaves you working.** On a machine with nothing set up, the first herdr
-  start after installing writes the list, installs it, and binds a key to the pane — rather
-  than handing you an empty manager with no door.
+- **A first run that leaves you in control.** On a machine with nothing set up, the first herdr
+  start after installing writes the list and binds a key to the pane, but does not install the
+  third-party entries without an explicit `sync` or `i` action.
 
 herdr-lazy is itself a herdr plugin: it drives the herdr CLI (via `HERDR_BIN_PATH`) to
 manage the *other* plugins.
@@ -68,9 +68,10 @@ verified on Windows 11 with herdr 0.7.5-preview in Windows Terminal (ConPTY), bu
 keymap and a real `sync --prune` have not been exercised there. If you run Linux or Windows,
 reports are very welcome — see the open issues.
 
-**The first herdr start after installing sets the machine up** (a `[[startup]]` hook): it
-writes the curated list, installs what the list names, and binds `prefix+shift+l` to the
-manage pane. It prints everything it did. Press the key and you are in.
+**The first herdr start after installing sets up the route into the manager** (a `[[startup]]`
+hook): it writes the curated list and binds `prefix+shift+l` to the manage pane, but does not
+install third-party plugins automatically. Review the list, then run `herdr-lazy sync` or press
+`i` in the manage pane when you are ready. It prints everything it did.
 
 That happens only on a machine that has plainly never been set up — no plugin list, and
 nothing installed but herdr-lazy itself. If you already have plugins, or already have a list,
@@ -378,8 +379,8 @@ while it is active.
 It is off by default, and deliberately narrow:
 
 - **Off unless you turn it on** — a plugin that installs other software at startup should not
-  do so by surprise. The one exception is the first run on a fresh machine, which is what
-  installing a distro asks for; every start after that is silent until you turn this on.
+  do so by surprise. The first run is not an exception: it writes the list and waits for an
+  explicit install action. Every later start is silent until you turn this on.
 - **Installs only** — it never prunes and never moves a pinned commit. Startup completes a
   setup that is missing things; it does not change one that is working. Use `sync` for that.
 - **Silent when there is nothing to do** — which is almost always, so a normal `herdr` launch
