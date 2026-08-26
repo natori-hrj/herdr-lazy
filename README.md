@@ -132,6 +132,7 @@ herdr-lazy() {
 ```sh
 herdr-lazy init          # write the curated default list
 herdr-lazy list          # show what the list asks for
+herdr-lazy check         # inspect local state and update hints without changing plugins
 herdr-lazy sync          # install what is missing
 herdr-lazy update        # move unpinned entries to their latest commit
 herdr-lazy sync --prune  # also uninstall anything not in the list
@@ -163,6 +164,7 @@ herdr-lazy update smarzban/herdr-file-viewer
 | `lock` | write the lockfile from the current bundle |
 | `auto-sync [on\|off]` | install missing plugins automatically when herdr starts |
 | `doctor` | check that every entry in your list still resolves |
+| `check` | report missing, drifted, disabled, and possibly stale plugins without changing plugin state |
 | `probe [--raw]` | check the herdr bridge and show the resolved paths; `--raw` adds the full payloads |
 
 ### Already using herdr?
@@ -172,6 +174,20 @@ already have, marks the ones your list does not mention, and `a` adopts the high
 into it. Working through that list turns a setup you built by hand into a declared one
 without touching the plugins themselves — after which it can be pinned, locked, and
 reproduced on another machine.
+
+### Check before changing anything
+
+`check` reads your list and herdr's installed snapshot, then explicitly refreshes the
+marketplace index so it can report missing entries, drifted pins, disabled plugins, and
+repositories that may have moved since installation. It does not install, update, enable,
+disable, uninstall, edit `plugins.list`, or rewrite `plugins.lock`.
+The explicit refresh may update herdr-lazy's marketplace cache, which is separate from those
+files and from plugin state.
+
+The marketplace check is intentionally honest about uncertainty. If refreshing it fails or
+only stale cache data is available, update status is shown as unknown rather than current.
+`doctor` checks whether repositories resolve; `check` checks whether your local setup needs
+attention.
 
 Both files live in the directory herdr assigns the plugin — `herdr plugin config-dir
 herdr-lazy` prints it:
@@ -575,8 +591,6 @@ the rest still needs design.
 - **Warn before installing what cannot install.** herdr runs plugin builds with a minimal
   PATH, so a plugin whose build is a bare `cargo build` fails on machines where Rust works
   fine everywhere else. The manifest is readable before install, so the browser could say so.
-- **`check`** — show what has updates without applying any, the way `update` does but
-  read-only. Needs a plan for GitHub API rate limits.
 - **enable / disable from the pane** — herdr supports both; herdr-lazy only reports the state.
 
 ## Design notes

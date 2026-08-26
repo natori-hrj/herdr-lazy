@@ -625,6 +625,43 @@ impl Spec {
     }
 }
 
+/// Read specs without the legacy migration performed by `desired_plugins`.
+///
+/// This is deliberately fallible: a read-only check must not turn an unreadable list into an
+/// apparently empty one.
+fn read_specs(path: &Path) -> io::Result<Vec<Spec>> {
+    let body = fs::read_to_string(path)?;
+    Ok(body
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| Spec::parse(&line))
+        .collect())
+}
+
+/// Read the configured list, falling back to the pre-config-dir location without migrating it.
+///
+/// Mutating commands use `desired_plugins`, which copies that legacy file on purpose. `check`
+/// must preserve the legacy file and the current location byte-for-byte.
+fn read_check_specs(current: &Path, legacy: Option<&Path>) -> io::Result<(Vec<Spec>, PathBuf)> {
+    match read_specs(current) {
+        Ok(specs) => Ok((specs, current.to_path_buf())),
+        Err(current_error) if current_error.kind() == io::ErrorKind::NotFound => {
+            let Some(legacy) = legacy else {
+                return Err(current_error);
+            };
+            match read_specs(legacy) {
+                Ok(specs) => Ok((specs, legacy.to_path_buf())),
+                Err(legacy_error) if legacy_error.kind() == io::ErrorKind::NotFound => {
+                    Err(current_error)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// One entry from `herdr plugin list --json`.
 ///
 /// `Default` exists for tests: this grows a field whenever herdr exposes something new, and
@@ -1486,10 +1523,17 @@ pub(crate) fn cmd_sync(prune: bool, targets: &[&str]) -> io::Result<()> {
     converge(&all, targets, prune, true)
 }
 
-/// Install whatever in `all` is missing or has drifted from its pin.
-///
-/// `write_lock` is false for `restore`, whose input IS the lock — rewriting it there would let
-/// a partial restore quietly redefine the thing being restored to.
+fn matched_installed<'a>(
+    spec: &Spec,
+    installed: &'a [Installed],
+) -> Option<(&'a Installed, Match)> {
+    installed
+        .iter()
+        .map(|p| (p, p.matches(spec)))
+        .filter(|(_, m)| *m != Match::None)
+        .max_by_key(|(_, m)| (*m == Match::Strong) as u8)
+}
+
 /// What `sync` would have to do, without doing any of it.
 ///
 /// Returns the bundle entries that are missing or drifted — the ones a converge would act on.
@@ -1498,18 +1542,282 @@ pub(crate) fn cmd_sync(prune: bool, targets: &[&str]) -> io::Result<()> {
 fn pending_work(all: &[Spec], installed: &[Installed]) -> Vec<Spec> {
     all.iter()
         .filter(|spec| {
-            let hit = installed
-                .iter()
-                .map(|p| (p, p.matches(spec)))
-                .filter(|(_, m)| *m != Match::None)
-                .max_by_key(|(_, m)| (*m == Match::Strong) as u8);
-            match hit {
+            match matched_installed(spec, installed) {
                 None => true, // not installed
                 Some((p, _)) => matches!(pin_state(spec, p), PinState::Drifted { .. }),
             }
         })
         .cloned()
         .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UpdateStatus {
+    NotApplicable,
+    Current,
+    MaybeAvailable,
+    Unknown(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CheckItem {
+    spec: Spec,
+    missing: bool,
+    drifted: Option<String>,
+    pin_unverifiable: bool,
+    disabled: bool,
+    weak_match: bool,
+    update: UpdateStatus,
+}
+
+impl CheckItem {
+    fn uncertain(&self) -> bool {
+        self.weak_match || self.pin_unverifiable || matches!(self.update, UpdateStatus::Unknown(_))
+    }
+
+    fn healthy(&self) -> bool {
+        !self.missing
+            && self.drifted.is_none()
+            && !self.pin_unverifiable
+            && !self.disabled
+            && !self.weak_match
+            && matches!(
+                self.update,
+                UpdateStatus::Current | UpdateStatus::NotApplicable
+            )
+    }
+}
+
+fn update_status(
+    spec: &Spec,
+    installed: &Installed,
+    match_kind: Match,
+    market: &[registry::Entry],
+    market_confident: bool,
+) -> UpdateStatus {
+    // A pin deliberately opts out of tracking the marketplace's moving default branch.
+    if spec.reference.is_some() || match_kind == Match::Weak {
+        return UpdateStatus::NotApplicable;
+    }
+    if !market_confident {
+        return UpdateStatus::Unknown("marketplace data is stale or unavailable".to_string());
+    }
+
+    // A strong match is enough to use the bundle's repository as a fallback for source shapes
+    // that do not expose a joined slug (for example, a clone URL).
+    let repo = installed
+        .slug
+        .as_deref()
+        .map(str::to_string)
+        .unwrap_or_else(|| repo_root(&spec.repo));
+    let Some(entry) = market
+        .iter()
+        .find(|entry| entry.full_name.eq_ignore_ascii_case(&repo))
+    else {
+        return UpdateStatus::Unknown("repository is not in the marketplace".to_string());
+    };
+    let Some(installed_at) = installed.installed_unix_ms else {
+        return UpdateStatus::Unknown("install time is unavailable".to_string());
+    };
+
+    match registry::push_status(&entry.pushed_at, installed_at) {
+        Some(true) => UpdateStatus::MaybeAvailable,
+        Some(false) => UpdateStatus::Current,
+        None => UpdateStatus::Unknown("marketplace push date is invalid".to_string()),
+    }
+}
+
+fn check_items(
+    desired: &[Spec],
+    installed: &[Installed],
+    market: &[registry::Entry],
+    market_confident: bool,
+) -> Vec<CheckItem> {
+    desired
+        .iter()
+        .map(|spec| {
+            let Some((plugin, match_kind)) = matched_installed(spec, installed) else {
+                return CheckItem {
+                    spec: spec.clone(),
+                    missing: true,
+                    drifted: None,
+                    pin_unverifiable: false,
+                    disabled: false,
+                    weak_match: false,
+                    update: UpdateStatus::NotApplicable,
+                };
+            };
+
+            // A weak name-only match is not enough evidence to call a pin drifted. Keep that
+            // identity uncertainty visible instead of producing a false repair recommendation.
+            let pin = if match_kind == Match::Weak {
+                if spec.reference.is_some() {
+                    PinState::Unverifiable
+                } else {
+                    PinState::Satisfied
+                }
+            } else {
+                pin_state(spec, plugin)
+            };
+            let (drifted, pin_unverifiable) = match pin {
+                PinState::Drifted { have } => (Some(have), false),
+                PinState::Unverifiable => (None, true),
+                PinState::Satisfied => (None, false),
+            };
+
+            CheckItem {
+                spec: spec.clone(),
+                missing: false,
+                drifted,
+                pin_unverifiable,
+                disabled: !plugin.enabled,
+                weak_match: match_kind == Match::Weak,
+                update: update_status(spec, plugin, match_kind, market, market_confident),
+            }
+        })
+        .collect()
+}
+
+fn print_check_item(item: &CheckItem) {
+    let mut findings = Vec::new();
+    if item.missing {
+        findings.push("not installed".to_string());
+    } else {
+        if item.weak_match {
+            findings.push(
+                "installed match is by name only; repository identity is uncertain".to_string(),
+            );
+        }
+        if let Some(have) = &item.drifted {
+            findings.push(format!("pin drifted (installed at {})", short(have)));
+        }
+        if item.pin_unverifiable {
+            findings
+                .push("pin is not verifiable locally (tag/branch or missing commit)".to_string());
+        }
+        if item.disabled {
+            findings.push("installed but disabled".to_string());
+        }
+        match &item.update {
+            UpdateStatus::MaybeAvailable => {
+                findings.push("may have updates; run herdr-lazy update".to_string());
+            }
+            UpdateStatus::Unknown(reason) => {
+                findings.push(format!("update status unknown: {}", reason));
+            }
+            UpdateStatus::NotApplicable | UpdateStatus::Current => {}
+        }
+        if findings.is_empty() {
+            findings.push(if item.spec.reference.is_some() {
+                "installed and pin is satisfied".to_string()
+            } else {
+                "installed and current".to_string()
+            });
+        }
+    }
+
+    let marker = if item.missing || item.drifted.is_some() || item.disabled {
+        "!"
+    } else if matches!(item.update, UpdateStatus::MaybeAvailable) {
+        "↑"
+    } else if item.uncertain() {
+        "?"
+    } else {
+        "✓"
+    };
+    let detail = findings.join("; ");
+    println!("  {} {} — {}", marker, item.spec.display(), detail);
+}
+
+fn print_check_report(items: &[CheckItem], market_note: &str, market_confident: bool) {
+    let healthy = items.iter().filter(|item| item.healthy()).count();
+    let missing = items.iter().filter(|item| item.missing).count();
+    let drifted = items.iter().filter(|item| item.drifted.is_some()).count();
+    let disabled = items.iter().filter(|item| item.disabled).count();
+    let maybe_updates = items
+        .iter()
+        .filter(|item| matches!(item.update, UpdateStatus::MaybeAvailable))
+        .count();
+    let uncertain = items.iter().filter(|item| item.uncertain()).count();
+
+    let mut summary = format!("{} plugin(s) · {} healthy", items.len(), healthy);
+    for (count, label) in [
+        (missing, "missing"),
+        (drifted, "drifted"),
+        (disabled, "disabled"),
+        (maybe_updates, "may have updates"),
+        (uncertain, "uncertain"),
+    ] {
+        if count > 0 {
+            summary.push_str(&format!(" · {} {}", count, label));
+        }
+    }
+    println!("{}", summary);
+    if market_confident {
+        println!("update information: {}", market_note);
+    } else {
+        println!("update information: uncertain — {}", market_note);
+    }
+    for item in items {
+        print_check_item(item);
+    }
+    println!("read-only: no plugin state, plugins.list, or plugins.lock was changed.");
+}
+
+/// Inspect the declared bundle and installed state without applying any changes.
+///
+/// Marketplace data is refreshed only because the user explicitly asked to run this command.
+/// A failed refresh never becomes a false current result: all update statuses remain uncertain.
+fn cmd_check() -> io::Result<()> {
+    // Do not call desired_plugins here: its legacy migration is intentionally useful for
+    // mutating commands, but a read-only check must not create or copy a list file.
+    let configured_list_path = bundle_path();
+    let legacy_list_path = (!env::var("HERDR_LAZY_LIST").is_ok_and(|value| !value.is_empty()))
+        .then(|| legacy_config_dir().join("plugins.list"));
+    let (desired, list_path) =
+        match read_check_specs(&configured_list_path, legacy_list_path.as_deref()) {
+            Ok((specs, path)) if specs.is_empty() => {
+                println!("no plugin list at {} — nothing to check.", path.display());
+                return Ok(());
+            }
+            Ok((specs, path)) => (specs, path),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                println!(
+                    "no plugin list at {} — nothing to check.",
+                    configured_list_path.display()
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                println!("check: plugin list is unknown — {}", e);
+                return Ok(());
+            }
+        };
+    if list_path != configured_list_path {
+        println!(
+            "check: using legacy plugin list at {} (not copied)",
+            list_path.display()
+        );
+    }
+
+    let installed = match installed_plugins() {
+        Ok(v) => v,
+        Err(e) => {
+            println!("check: installed plugin state is unknown — {}", e);
+            return Ok(());
+        }
+    };
+
+    let (market, market_note, market_confident) = match registry::load(true) {
+        Ok((entries, note)) => {
+            let confident = note == "just refreshed";
+            (entries, note, confident)
+        }
+        Err(e) => (Vec::new(), format!("unavailable — {}", e), false),
+    };
+    let items = check_items(&desired, &installed, &market, market_confident);
+    print_check_report(&items, &market_note, market_confident);
+    Ok(())
 }
 
 /// herdr's `[[startup]]` hook: converge an already configured machine to the list when herdr
@@ -2832,6 +3140,7 @@ fn print_help() {
     println!("                    write the default bundle, or adopt someone else's list");
     println!("  extras            list the opt-in extras you can pass to `init --extras`");
     println!("  doctor            check that every entry in your list still resolves");
+    println!("  check             report plugin state without changing anything");
     println!("  list              show desired plugins");
     println!("  install [<repo>…] install what is missing, restore drifted pins");
     println!("  sync [--prune]    the same, plus --prune to remove what is not listed");
@@ -2862,6 +3171,7 @@ fn main() {
         ),
         "extras" => cmd_extras(),
         "doctor" => cmd_doctor(),
+        "check" => cmd_check(),
         "list" => cmd_list(),
         // `install` is what people look for; `sync` is what the operation is. Both, rather
         // than choosing and leaving the other as a dead end.
@@ -2961,6 +3271,20 @@ mod tests {
             slug: Some(format!("{}/{}", owner, repo)),
             resolved_commit: Some("10e93033263549600e75119c5617dac48137d011".to_string()),
             source_values: vec![owner.to_string(), repo.to_string(), "github".to_string()],
+            ..Default::default()
+        }
+    }
+
+    fn installed_at(owner: &str, repo: &str, ms: u64) -> Installed {
+        let mut p = from_github(owner, repo);
+        p.installed_unix_ms = Some(ms);
+        p
+    }
+
+    fn market_entry(name: &str, pushed_at: &str) -> registry::Entry {
+        registry::Entry {
+            full_name: name.to_string(),
+            pushed_at: pushed_at.to_string(),
             ..Default::default()
         }
     }
@@ -3128,6 +3452,106 @@ mod tests {
             !repos.iter().any(|r| r == "owner/pinned-ok"),
             "an entry sitting on its pin is not pending"
         );
+    }
+
+    #[test]
+    fn check_reports_local_findings_and_update_hints_together() {
+        const DAY_MS: u64 = 86_400_000;
+        const INSTALLED_COMMIT: &str = "10e93033263549600e75119c5617dac48137d011";
+        let desired = vec![
+            Spec::parse("owner/missing"),
+            Spec::parse("owner/drifted@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+            Spec::parse("owner/disabled"),
+            Spec::parse("owner/moved"),
+            Spec::parse("owner/current"),
+            Spec::parse("owner/review@v1"),
+        ];
+        let mut disabled = installed_at("owner", "disabled", 20_000 * DAY_MS);
+        disabled.enabled = false;
+        let installed = vec![
+            installed_at("owner", "drifted", 20_000 * DAY_MS),
+            disabled,
+            installed_at("owner", "moved", 20_000 * DAY_MS),
+            installed_at("owner", "current", 20_010 * DAY_MS),
+            installed_at("owner", "review", 20_000 * DAY_MS),
+        ];
+        let market = vec![
+            market_entry("owner/disabled", "1970-01-01T00:00:00Z"),
+            market_entry("owner/moved", "2024-10-05T00:00:00Z"),
+            market_entry("owner/current", "1970-01-01T00:00:00Z"),
+            market_entry("owner/review", "2024-10-05T00:00:00Z"),
+        ];
+
+        let items = check_items(&desired, &installed, &market, true);
+        let item = |repo: &str| {
+            items
+                .iter()
+                .find(|item| item.spec.repo == repo)
+                .unwrap_or_else(|| panic!("missing check item for {}", repo))
+        };
+
+        assert!(item("owner/missing").missing);
+        assert_eq!(
+            item("owner/drifted").drifted.as_deref(),
+            Some(INSTALLED_COMMIT)
+        );
+        assert!(item("owner/disabled").disabled);
+        assert_eq!(item("owner/moved").update, UpdateStatus::MaybeAvailable);
+        assert_eq!(item("owner/current").update, UpdateStatus::Current);
+        assert!(item("owner/review").pin_unverifiable);
+        assert_eq!(item("owner/review").update, UpdateStatus::NotApplicable);
+        assert_eq!(
+            items.iter().filter(|item| item.healthy()).count(),
+            1,
+            "only the enabled, current, strongly matched entry is healthy"
+        );
+    }
+
+    #[test]
+    fn uncertain_marketplace_data_never_reports_current() {
+        const DAY_MS: u64 = 86_400_000;
+        let desired = vec![Spec::parse("owner/current")];
+        let installed = vec![installed_at("owner", "current", 20_000 * DAY_MS)];
+        let market = vec![market_entry("owner/current", "1970-01-01T00:00:00Z")];
+
+        let items = check_items(&desired, &installed, &market, false);
+        assert_eq!(
+            items[0].update,
+            UpdateStatus::Unknown("marketplace data is stale or unavailable".to_string())
+        );
+        assert!(!items[0].healthy());
+        assert!(items[0].uncertain());
+    }
+
+    #[test]
+    fn weak_matches_are_visible_as_identity_uncertainty() {
+        let desired = vec![Spec::parse("other/repo")];
+        let installed = vec![installed("repo", "local", &[])];
+        let items = check_items(&desired, &installed, &[], true);
+
+        assert!(items[0].weak_match);
+        assert_eq!(items[0].update, UpdateStatus::NotApplicable);
+        assert!(!items[0].healthy());
+        assert!(items[0].uncertain());
+    }
+
+    #[test]
+    fn check_reads_a_legacy_list_without_migrating_it() {
+        let root = env::temp_dir().join(format!("herdr-lazy-check-legacy-{}", std::process::id()));
+        let current = root.join("current/plugins.list");
+        let legacy = root.join("legacy/plugins.list");
+        let body = b"# kept in place\nowner/repo\n";
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, body).unwrap();
+
+        let (specs, path) = read_check_specs(&current, Some(&legacy)).unwrap();
+
+        assert_eq!(specs, vec![Spec::parse("owner/repo")]);
+        assert_eq!(path, legacy);
+        assert!(!current.exists(), "read-only check must not create a list");
+        assert_eq!(fs::read(&legacy).unwrap(), body);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
