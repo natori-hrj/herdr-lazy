@@ -71,15 +71,25 @@ fn days_from_iso(s: &str) -> Option<i64> {
     let (y, rest) = s.split_once('-')?;
     let (m, rest) = rest.split_once('-')?;
     let d = rest.get(..2)?;
-    let (y, m, d): (i64, i64, i64) = (y.parse().ok()?, m.parse().ok()?, d.parse().ok()?);
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+    let (year, month, day): (i64, i64, i64) = (y.parse().ok()?, m.parse().ok()?, d.parse().ok()?);
+    if !(1..=12).contains(&month) || day < 1 {
         return None;
     }
-    let y = if m <= 2 { y - 1 } else { y };
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if day > days_in_month {
+        return None;
+    }
+    let y = if month <= 2 { year - 1 } else { year };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400;
-    let mp = (m + if m > 2 { -3 } else { 9 }) % 12;
-    let doy = (153 * mp + 2) / 5 + d - 1;
+    let mp = (month + if month > 2 { -3 } else { 9 }) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     Some(era * 146_097 + doe - 719_468)
 }
@@ -114,13 +124,20 @@ pub(crate) fn age_label(pushed_at: &str, today: i64) -> String {
 /// A false "maybe" costs a wasted `u`; a false "you are current" would hide real updates,
 /// which is the worse failure, so it errs toward reporting.
 pub(crate) fn pushed_since(pushed_at: &str, installed_unix_ms: u64) -> bool {
-    let Some(pushed_day) = days_from_iso(pushed_at) else {
-        return false;
-    };
+    push_status(pushed_at, installed_unix_ms).unwrap_or(false)
+}
+
+/// Compare a marketplace push date with an install time.
+///
+/// The boolean helper above is kept for the manage pane, where an absent hint simply means
+/// there is no marker to draw. The check command needs a third state so malformed marketplace
+/// metadata cannot be mistaken for a clean, current plugin.
+pub(crate) fn push_status(pushed_at: &str, installed_unix_ms: u64) -> Option<bool> {
+    let pushed_day = days_from_iso(pushed_at)?;
     let installed_day = (installed_unix_ms / 1000 / 86_400) as i64;
     // Day resolution: the index only carries a date we can rely on parsing, and an install
     // and a push on the same day is not worth flagging either way.
-    pushed_day > installed_day
+    Some(pushed_day > installed_day)
 }
 
 /// Today, as days since the epoch.
@@ -352,6 +369,8 @@ mod tests {
         );
         assert_eq!(days_from_iso("not a date"), None);
         assert_eq!(days_from_iso("2026-13-01"), None, "month out of range");
+        assert_eq!(days_from_iso("2026-02-31"), None, "day out of range");
+        assert!(days_from_iso("2024-02-29").is_some(), "leap day is valid");
     }
 
     #[test]
@@ -375,6 +394,12 @@ mod tests {
         assert!(!pushed_since("2026-07-21T23:59:00Z", installed_ms));
         assert!(pushed_since("2026-07-22T00:01:00Z", installed_ms));
         assert!(!pushed_since("2026-07-20T00:01:00Z", installed_ms));
+    }
+
+    #[test]
+    fn malformed_push_date_is_uncertain_not_current() {
+        assert_eq!(push_status("not a date", 0), None);
+        assert_eq!(push_status("2026-07-21T00:00:00Z", 0), Some(true));
     }
 
     #[test]
