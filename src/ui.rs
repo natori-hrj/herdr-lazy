@@ -814,6 +814,12 @@ impl AdoptPicker {
 #[derive(Default)]
 struct App {
     rows: Vec<Row>,
+    /// The point-in-time workspace in which Herdr opened this pane, when available.
+    workspace_context: Option<crate::context::PluginContext>,
+    /// Set when Herdr supplied malformed context but the pane can still operate safely.
+    context_warning: Option<String>,
+    /// The last supported worktree event for this same workspace, if one was recorded.
+    last_event: Option<crate::context::PluginEvent>,
     /// Present while the marketplace browser is open; the pane draws that instead of the list.
     browser: Option<crate::browse::Browser>,
     /// Present while the extras picker is open, for the same reason.
@@ -853,6 +859,13 @@ struct App {
 
 impl App {
     fn load() -> App {
+        let context = crate::context::read_context_from_env();
+        let last_event = context
+            .context
+            .as_ref()
+            .and_then(crate::context::last_event_for);
+        let workspace_context = context.context;
+        let context_warning = context.warning;
         let desired: Vec<Spec> = crate::desired_plugins()
             .iter()
             .map(|l| Spec::parse(l))
@@ -866,6 +879,9 @@ impl App {
         match installed_plugins() {
             Ok(installed) => App {
                 rows: rows_with_herdr_version(&desired, &installed, &market, herdr_version),
+                workspace_context: workspace_context.clone(),
+                context_warning: context_warning.clone(),
+                last_event: last_event.clone(),
                 browser: None,
                 extras: None,
                 adopt: None,
@@ -882,6 +898,9 @@ impl App {
             },
             Err(e) => App {
                 rows: Vec::new(),
+                workspace_context,
+                context_warning,
+                last_event,
                 browser: None,
                 extras: None,
                 adopt: None,
@@ -919,6 +938,33 @@ impl App {
 
     fn selected(&self) -> Option<&Row> {
         self.rows.get(self.cursor)
+    }
+
+    /// Add workspace information without changing the two-line list layout. The values were
+    /// cleaned while parsing Herdr's payload, and the event name is limited to known constants,
+    /// so this remains safe to write directly into the terminal.
+    fn context_suffix(&self) -> String {
+        let Some(context) = self.workspace_context.as_ref() else {
+            return if self.context_warning.is_some() {
+                " · workspace context unavailable".to_string()
+            } else {
+                String::new()
+            };
+        };
+        let Some(mut summary) = context.summary() else {
+            return if self.context_warning.is_some() {
+                " · workspace context unavailable".to_string()
+            } else {
+                String::new()
+            };
+        };
+        if let Some(event) = &self.last_event {
+            summary.push_str(&format!(" · last {}", event.name));
+        }
+        if self.context_warning.is_some() {
+            summary.push_str(" · context fallback");
+        }
+        format!(" · {}", summary)
     }
 
     fn open_logs(&mut self) {
@@ -2355,6 +2401,7 @@ impl App {
             None => " \x1b[2m· no update info yet, / fetches it\x1b[0m".to_string(),
             _ => String::new(),
         };
+        let context = self.context_suffix();
 
         // Showing auto-sync here is the only way a user learns it exists: it has no row of its
         // own, and something that installs software at startup should be visible, not buried.
@@ -2365,7 +2412,7 @@ impl App {
         };
         writeln!(
             out,
-            "\x1b[1m herdr-lazy\x1b[0m  \x1b[2m{} ok · {} to sync · {} unlisted{}{}\x1b[0m{}{}\r",
+            "\x1b[1m herdr-lazy\x1b[0m  \x1b[2m{} ok · {} to sync · {} unlisted{}{}{}\x1b[0m{}{}\r",
             ok,
             todo,
             extra,
@@ -2383,7 +2430,8 @@ impl App {
                 String::new()
             },
             auto,
-            freshness
+            freshness,
+            context
         )?;
         writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
 
@@ -3732,6 +3780,41 @@ mod tests {
         let r = rows(&[Spec::parse("owner/thing")], &[p]);
         assert_eq!(r[0].status, Status::Ok);
         assert_eq!(r[0].trailing_text(), "does a useful thing");
+    }
+
+    #[test]
+    fn workspace_context_is_a_quiet_header_suffix() {
+        let mut app = App::default();
+        app.workspace_context = Some(crate::context::PluginContext {
+            workspace_id: Some("w1".to_string()),
+            workspace_label: Some("demo".to_string()),
+            workspace_cwd: Some("/repo/demo".to_string()),
+            ..Default::default()
+        });
+        app.last_event = Some(crate::context::PluginEvent {
+            name: "worktree.opened".to_string(),
+            context: app.workspace_context.clone().unwrap(),
+        });
+
+        assert_eq!(
+            app.context_suffix(),
+            " · workspace demo (w1) · cwd /repo/demo · last worktree.opened"
+        );
+    }
+
+    #[test]
+    fn absent_or_malformed_context_does_not_change_the_normal_pane() {
+        let empty = App::default();
+        assert_eq!(empty.context_suffix(), "");
+
+        let malformed = App {
+            context_warning: Some("bad payload".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            malformed.context_suffix(),
+            " · workspace context unavailable"
+        );
     }
 
     #[test]

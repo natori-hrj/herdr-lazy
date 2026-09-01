@@ -51,6 +51,29 @@ command = ["./target/release/herdr-lazy", "startup"]
 platforms = ["windows"]
 command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "& .\\target\\release\\herdr-lazy.exe startup"]
 
+# Keep a quiet, workspace-matched lifecycle hint for the manage pane. The event command only
+# records Herdr's context under HERDR_PLUGIN_STATE_DIR; it never installs, removes, enables, or
+# disables a plugin and never edits plugins.list or plugins.lock.
+[[events]]
+on = "worktree.created"
+platforms = ["linux", "macos"]
+command = ["./target/release/herdr-lazy", "event"]
+
+[[events]]
+on = "worktree.created"
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "& .\\target\\release\\herdr-lazy.exe event"]
+
+[[events]]
+on = "worktree.opened"
+platforms = ["linux", "macos"]
+command = ["./target/release/herdr-lazy", "event"]
+
+[[events]]
+on = "worktree.opened"
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "& .\\target\\release\\herdr-lazy.exe event"]
+
 # Actions surface herdr-lazy inside herdr's command palette.
 [[actions]]
 id = "probe"
