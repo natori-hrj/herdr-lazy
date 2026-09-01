@@ -23,6 +23,7 @@
 
 mod browse;
 mod category;
+mod context;
 mod extras;
 mod github;
 mod json;
@@ -364,7 +365,7 @@ fn copy_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
     result
 }
 
-fn write_bytes_atomically(path: &Path, body: &[u8]) -> io::Result<()> {
+pub(crate) fn write_bytes_atomically(path: &Path, body: &[u8]) -> io::Result<()> {
     let temporary = loop {
         let candidate = lock_temp_path(path);
         match fs::OpenOptions::new()
@@ -1820,6 +1821,30 @@ fn cmd_check() -> io::Result<()> {
     Ok(())
 }
 
+/// Handle the small worktree lifecycle hook declared in `herdr-plugin.toml`.
+///
+/// Events are deliberately limited to recording Herdr's context in herdr-lazy's own state
+/// directory. They never install, remove, enable, disable, or rewrite the user's list or lock.
+/// A malformed or incomplete event is reported to the plugin log and treated as a no-op so a
+/// notification helper cannot make Herdr startup fail.
+fn cmd_event() -> io::Result<()> {
+    let event = match context::event_from_env() {
+        Ok(Some(event)) => event,
+        Ok(None) => return Ok(()),
+        Err(error) => {
+            eprintln!("herdr-lazy: ignoring lifecycle event — {}", error);
+            return Ok(());
+        }
+    };
+
+    match context::persist_last_event(&event) {
+        Ok(true) => {}
+        Ok(false) => {}
+        Err(error) => eprintln!("herdr-lazy: could not record {} — {}", event.name, error),
+    }
+    Ok(())
+}
+
 /// herdr's `[[startup]]` hook: converge an already configured machine to the list when herdr
 /// starts, but only when there is a gap, and only for gaps that can be closed without a network
 /// round trip per plugin or a surprising rebuild.
@@ -3162,6 +3187,7 @@ fn main() {
     let result = match cmd {
         "probe" => cmd_probe(rest.contains(&"--raw") || rest.contains(&"--verbose")),
         "startup" => cmd_startup(),
+        "event" => cmd_event(),
         "auto-sync" => cmd_auto_sync(rest.first().copied()),
         "init" => cmd_init(
             rest.contains(&"--force"),

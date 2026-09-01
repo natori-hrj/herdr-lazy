@@ -30,6 +30,9 @@ lockfile records.
   `i`/`u`/`x`/`r` as in lazy.nvim. Tick rows with space or a click to act on several at
   once, or act on just the row under the cursor when nothing is ticked. `?` shows the full
   keymap; the mouse scrolls and ticks.
+- **A workspace-aware manage pane.** When Herdr opens it in a workspace, the header identifies
+  that workspace and its working directory. Worktree create/open events leave a small,
+  workspace-matched hint, without changing the plugin list or installed state.
 - **A list that tells you what each plugin is.** Every installed row shows its own one-line
   description, so you can tell what you have and spot two plugins that do the same thing
   without opening each one.
@@ -141,6 +144,19 @@ herdr-lazy extras                    # list the opt-in extras
 herdr-lazy init --extras worktrunk   # defaults plus a chosen extra
 herdr-lazy init --from owner/repo    # start from someone else's list instead
 ```
+
+### Workspace context
+
+When Herdr opens the manage pane, herdr-lazy reads the point-in-time
+`HERDR_PLUGIN_CONTEXT_JSON` snapshot and shows the workspace label, cwd, worktree branch, and
+focused agent when Herdr provides them. The context is a label for the pane, not a second plugin
+configuration: the list and lockfile remain the same across workspaces, and a missing context
+leaves the pane behaving as before.
+
+herdr-lazy also listens for `worktree.created` and `worktree.opened`. Those hooks only save the
+last event under `HERDR_PLUGIN_STATE_DIR`, so the pane can show it when it belongs to the current
+workspace. They do not install, remove, enable, disable, or update anything. An absent or
+malformed context/event is ignored safely; a malformed event is reported in Herdr's plugin log.
 
 `sync` and `update` take plugin names to work on just those:
 
