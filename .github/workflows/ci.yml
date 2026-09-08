@@ -35,6 +35,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --target ${{ matrix.target }} -- -D warnings
+      - if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          expected=$(sh scripts/build-fingerprint.sh)
+          actual=$(powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-fingerprint.ps1 | tr -d '\r')
+          test "$expected" = "$actual"
       - run: cargo test --locked --target ${{ matrix.target }}
 
   # The declared MSRV is a promise; check it rather than letting it rot.

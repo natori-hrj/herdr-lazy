@@ -1,10 +1,9 @@
 #!/bin/sh
 # Print a short, deterministic hash of everything that affects the compiled binary.
 #
-# Used by BOTH the release workflow (to name assets) and the install script (to find them).
-# One implementation, two callers — if these ever computed the fingerprint differently, the
-# install would silently fetch a binary built from different source, which is the exact bug
-# this exists to prevent.
+# Used by the Unix release workflow and install script. `build-fingerprint.ps1` mirrors this
+# byte-for-byte for Windows; CI compares both outputs. If they ever differ, the install falls
+# back to a local build instead of silently fetching a binary built from different source.
 #
 # Why a fingerprint of the source rather than the git commit: herdr installs the default
 # branch HEAD, so a README or CI commit moves the commit id without changing the binary at

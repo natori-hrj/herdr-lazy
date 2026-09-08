@@ -10,18 +10,18 @@ description = "Be lazy: a curated, batteries-included plugin distro & manager fo
 platforms = ["linux", "macos", "windows"]
 
 # herdr runs this after `plugin install`, before registering the plugin.
-# Both paths produce target/release/herdr-lazy, which the actions and pane below execute.
+# Both paths produce the platform's release binary, which the actions and pane below execute.
 #
-# On Unix, try a checksum-verified prebuilt binary first so installing does not require a
-# Rust toolchain; the script falls back to `cargo build --release` whenever that is not
-# possible. Windows has no prebuilt yet and builds from source directly.
+# On Unix and Windows, try a checksum-verified prebuilt binary first so installing does not
+# require a Rust toolchain; the platform-specific script falls back to `cargo build --release`
+# whenever that is not possible.
 [[build]]
 platforms = ["linux", "macos"]
 command = ["/bin/sh", "scripts/fetch-or-build.sh"]
 
 [[build]]
 platforms = ["windows"]
-command = ["cargo", "build", "--release"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/fetch-or-build.ps1"]
 
 # herdr runs this once after the server starts (0.7.5+). It converges the machine to your
 # list only when `auto-sync` is on — otherwise it exits immediately and silently. See
@@ -35,14 +35,10 @@ command = ["./target/release/herdr-lazy", "startup"]
 # though the process runs with the plugin directory as its cwd. Actions happen to tolerate
 # the bare form, but every other plugin uses `./`, so keep both consistent.
 #
-# Windows needs a different shape again. herdr hands a relative program straight to
-# CreateProcessW, which neither appends `.exe` nor resolves it the way a shell would, so
-# `./target/release/herdr-lazy` simply never launches — the action fails with no exit code
-# and no stderr. Routing through `powershell -Command "& .\...exe"` gets the resolution
-# done by a shell that understands both the cwd and the extension. herdr also sets the
-# plugin cwd to a \\?\ verbatim path, which PowerShell handles but most things do not,
-# so the relative form is deliberate here rather than an absolute path built from
-# $env:HERDR_PLUGIN_ROOT.
+# Keep the PowerShell shape for Windows runtime commands while the manifest supports Herdr
+# versions down to 0.7.5. Herdr 0.9.0 fixes relative plugin-pane launch paths, but the shell
+# form also keeps startup, event, and action entries working on older Windows installs. Herdr
+# sets the plugin cwd to a \\?\ verbatim path, which PowerShell handles reliably.
 #
 # herdr rejects duplicate action and pane ids even when they are gated to disjoint
 # platforms, hence the `-windows` suffixes below.
