@@ -8,6 +8,7 @@ $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
 $files = New-Object 'System.Collections.Generic.List[string]'
+$sourceFiles = New-Object 'System.Collections.Generic.List[string]'
 
 foreach ($relative in @("Cargo.toml", "Cargo.lock")) {
     $path = Join-Path $root ($relative -replace '/', '\')
@@ -21,13 +22,17 @@ if (Test-Path -LiteralPath $src -PathType Container) {
     Get-ChildItem -LiteralPath $src -Recurse -File -Filter "*.rs" |
         ForEach-Object {
             $relative = $_.FullName.Substring($root.Length + 1).Replace('\', '/')
-            [void]$files.Add($relative)
+            [void]$sourceFiles.Add($relative)
         }
 }
 
-# build-fingerprint.sh uses LC_ALL=C sort. Ordinal comparison is the PowerShell equivalent
-# for these repository-relative paths and does not vary with the user's locale.
-$files.Sort([System.StringComparer]::Ordinal)
+# build-fingerprint.sh keeps the manifest files in a fixed order and uses LC_ALL=C sort only
+# for source paths. Ordinal comparison is the PowerShell equivalent for these repository-
+# relative paths and does not vary with the user's locale.
+$sourceFiles.Sort([System.StringComparer]::Ordinal)
+foreach ($relative in $sourceFiles) {
+    [void]$files.Add($relative)
+}
 
 $stream = New-Object System.IO.MemoryStream
 try {
