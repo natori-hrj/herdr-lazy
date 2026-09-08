@@ -129,6 +129,6 @@ pushed. The release workflow is building now.
   gh run watch \$(gh run list --workflow=release.yml --limit 1 --json databaseId -q '.[0].databaseId')
   gh release view v$VERSION --json isDraft,assets -q '"draft: \(.isDraft) | assets: \(.assets|length)"'
 
-Expect draft: false and 8 assets. The workflow verifies each asset is actually downloadable
+Expect draft: false and 10 assets. The workflow verifies each asset is actually downloadable
 at its published URL, so a green run means installs will find it.
 EOF

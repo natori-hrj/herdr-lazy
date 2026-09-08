@@ -59,17 +59,18 @@ arrives. Earlier versions used to install this and then quietly do nothing.
 herdr plugin install natori-hrj/herdr-lazy
 ```
 
-Install fetches a prebuilt binary and verifies its SHA-256; if none matches your platform,
-or anything about the download is not exactly right, it falls back to building from source
-with [Rust](https://rustup.rs) (≥ 1.78). No toolchain is needed on the fast path.
+Install fetches a platform-matched prebuilt binary and verifies its SHA-256; if none matches
+your platform, or anything about the download is not exactly right, it falls back to building
+from source with [Rust](https://rustup.rs) (≥ 1.78). No toolchain is needed on the fast path.
 
 **Platform status.** Developed and verified end-to-end on macOS (arm64). Linux binaries are
 built and the test suite runs on Linux in CI, but the install has not been exercised on a
-real Linux machine. Windows has no prebuilt binary and builds from source, and needs a Rust
-toolchain for that reason; the install, `probe`, and opening the manage pane have been
-verified on Windows 11 with herdr 0.7.5-preview in Windows Terminal (ConPTY), but the pane's
-keymap and a real `sync --prune` have not been exercised there. If you run Linux or Windows,
-reports are very welcome — see the open issues.
+real Linux machine. Windows now has a prebuilt x86_64 binary and keeps a source-build
+fallback; x86_64 is also the Herdr-documented path for Windows ARM64 under emulation. The
+install, `probe`, and opening the manage pane have been verified on Windows 11 with herdr
+0.7.5-preview in Windows Terminal (ConPTY), but the pane's keymap and a real `sync --prune`
+have not been exercised there. If you run Linux or Windows, reports are very welcome — see
+the open issues.
 
 **The first herdr start after installing sets up the route into the manager** (a `[[startup]]`
 hook): it writes the curated list and binds `prefix+shift+l` to the manage pane, but does not
@@ -498,8 +499,8 @@ exactly as anyone else's do.
 A third criterion showed up during testing: it has to actually install. herdr runs plugin
 builds with a minimal PATH that excludes `~/.cargo/bin`, so a plugin whose build is a bare
 `cargo build --release` fails on machines where Rust is installed and works fine in your own
-shell. herdr-lazy itself works around this (see `scripts/fetch-or-build.sh`), but a default
-set cannot hand a new user a failed install.
+shell. herdr-lazy itself works around this on Unix and Windows (see the platform-specific
+scripts in `scripts/`), but a default set cannot hand a new user a failed install.
 
 Deliberately **not** included, despite being good:
 [herdr-spreader](https://github.com/yuk1ty/herdr-spreader) (41★) is the better-known layout

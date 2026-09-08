@@ -3030,10 +3030,10 @@ pub(crate) fn build_check(repo: &str) -> BuildCheck {
 
 /// The reading half of `build_check`, split out so it can be tested against real manifests.
 ///
-/// Never warns on Windows. The minimal build PATH is a thing observed on Unix; on Windows herdr
-/// found and ran `cargo` without trouble (#2), and this repository's own Windows build is a
-/// bare `cargo build --release` that installs. Warning there would be a false alarm about a
-/// plugin that works — the failure this check exists to prevent.
+/// Never warns on Windows. The minimal build PATH is a thing observed on Unix; Windows plugins
+/// may use a native build command or a platform-specific fallback such as this repository's
+/// checksum-verified fetch script. Warning there would be a false alarm about a plugin that
+/// works — the failure this check exists to prevent.
 fn classify_build(toml: &str) -> BuildCheck {
     if cfg!(target_os = "windows") {
         return BuildCheck::Fine;
@@ -4277,15 +4277,11 @@ command = "something.else"
         entries
     }
 
-    /// herdr hands a plugin's command to the platform's own process spawner. On Windows
-    /// that is CreateProcessW, which neither appends `.exe` nor resolves a relative
-    /// program the way a shell would, so `./target/release/herdr-lazy` never launches —
-    /// the action fails with no exit code and no stderr, which is a miserable thing to
-    /// debug. `/bin/sh` is not there to run either.
-    ///
-    /// An entry that declares no `platforms` applies to every platform, so it counts as
-    /// Windows-reachable. That is precisely how this was wrong: the actions, the startup
-    /// command and the pane were all unqualified, and all four were unspawnable.
+    /// Every Windows-reachable command must name something the Windows launcher can spawn.
+    /// The manifest keeps the PowerShell forms for compatibility with its 0.7.5 floor; a
+    /// bare Unix path or `/bin/sh` would still be an install-time/runtime failure on older
+    /// Windows Herdr versions. Herdr 0.9.0 also resolves relative plugin-pane paths, but
+    /// retaining the explicit forms keeps all command kinds on one compatibility path.
     #[test]
     fn every_windows_reachable_command_names_a_program_windows_can_spawn() {
         for e in manifest_entries(include_str!("../herdr-plugin.toml")) {
@@ -4482,8 +4478,7 @@ command = "something.else"
         assert_eq!(classify_build(toml), BuildCheck::NeedsCargoOnPath);
     }
 
-    /// The warning is about a Unix PATH, so on Windows it must never fire — including on this
-    /// repository's own manifest, whose Windows build is exactly a bare `cargo build`.
+    /// The warning is about a Unix PATH, so on Windows it must never fire.
     #[test]
     #[cfg(target_os = "windows")]
     fn windows_is_never_warned_about_cargo() {
@@ -4612,14 +4607,11 @@ command = "something.else"
         );
     }
 
-    /// Until herdr resolves relative commands on Windows (#28), every action and pane is
-    /// declared twice — once for Unix, once for Windows under a `-windows` id. Nothing stops
+    /// Actions and panes are declared twice — once for Unix, once for Windows under a
+    /// `-windows` id — because their commands need different argv forms. Nothing stops
     /// someone adding only one half, and nothing would fail: the test above only checks that
     /// what *is* declared can be spawned, so a feature silently missing on one platform is
-    /// green CI.
-    ///
-    /// This is the guard that makes carrying the split entries safe rather than merely ugly.
-    /// It goes away with them.
+    /// green CI. This guard keeps the platform variants paired.
     #[test]
     fn platform_split_entries_come_in_pairs() {
         const SUFFIX: &str = "-windows";

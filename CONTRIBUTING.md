@@ -31,7 +31,7 @@ Things that are held to a higher standard, because getting them wrong destroys u
 
 - `Installed::matches` and the strong/weak distinction
 - anything reached by `--prune` or `uninstall`
-- `scripts/fetch-or-build.sh`, especially the checksum path
+- the platform-specific fetch scripts, especially the checksum and source-fallback paths
 
 ## Adding a plugin to the default set
 

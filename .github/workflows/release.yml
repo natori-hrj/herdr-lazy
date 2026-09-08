@@ -1,8 +1,8 @@
 name: release
 
-# Publishes the prebuilt binaries that scripts/fetch-or-build.sh looks for, so installing
-# the plugin does not require a Rust toolchain. Asset names must stay in sync with that
-# script: herdr-lazy-<version>-<triple>.tar.gz, each with a .sha256 beside it.
+# Publishes the prebuilt binaries that the platform-specific fetch scripts look for, so
+# installing the plugin does not require a Rust toolchain. Asset names must stay in sync with
+# those scripts: herdr-lazy-<version>-<fingerprint>-<target>.tar.gz, each with a .sha256 beside it.
 on:
   push:
     tags: ["v*"]
@@ -53,6 +53,10 @@ jobs:
     # `always()` so a non-tag run, where create-release is skipped, still builds.
     if: always() && needs.create-release.result != 'failure'
 
+    defaults:
+      run:
+        shell: bash
+
     strategy:
       fail-fast: false
       matrix:
@@ -72,6 +76,9 @@ jobs:
           - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
             native: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            native: true
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -87,6 +94,12 @@ jobs:
 
       - if: matrix.native
         run: cargo test --locked --target ${{ matrix.target }}
+
+      - if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: |
+          expected=$(sh scripts/build-fingerprint.sh)
+          actual=$(powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-fingerprint.ps1 | tr -d '\r')
+          test "$expected" = "$actual"
 
       - run: cargo build --release --locked --target ${{ matrix.target }}
 
@@ -111,14 +124,23 @@ jobs:
           fi
 
           staging=$(mktemp -d)
-          cp "target/${{ matrix.target }}/release/herdr-lazy" "$staging/"
-          tar -czf "$asset" -C "$staging" herdr-lazy
+          binary="target/${{ matrix.target }}/release/herdr-lazy"
+          if [[ "${{ matrix.target }}" == *-windows-* ]]; then
+            binary="${binary}.exe"
+          fi
+          cp "$binary" "$staging/"
+          binary_name=$(basename "$binary")
+          tar -czf "$asset" -C "$staging" "$binary_name"
           # shasum is present on GitHub's macOS and Ubuntu images, but prefer sha256sum
           # where it exists so this keeps working on a leaner container.
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$asset" | cut -d' ' -f1 > "$asset.sha256"
-          else
+          elif command -v shasum >/dev/null 2>&1; then
             shasum -a 256 "$asset" | cut -d' ' -f1 > "$asset.sha256"
+          else
+            ASSET_PATH="$asset" powershell.exe -NoProfile -Command \
+              "(Get-FileHash -LiteralPath \$env:ASSET_PATH -Algorithm SHA256).Hash.ToLowerInvariant()" \
+              > "$asset.sha256"
           fi
           echo "asset=$asset" >> "$GITHUB_OUTPUT"
 
