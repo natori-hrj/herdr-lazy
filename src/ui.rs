@@ -816,6 +816,15 @@ struct App {
     rows: Vec<Row>,
     /// The point-in-time workspace in which Herdr opened this pane, when available.
     workspace_context: Option<crate::context::PluginContext>,
+    /// A valid project-scoped list discovered from that workspace, when present.
+    workspace_profile: Option<crate::profile::WorkspaceProfile>,
+    /// A profile path was found but could not be parsed safely. It is kept separate from the
+    /// normal list error so the global list can still be shown and used.
+    profile_error: Option<String>,
+    /// The profile preview is modal; discovery itself never opens it or changes state.
+    profile_open: bool,
+    /// An explicit profile operation waiting for the user's y/n decision.
+    pending_profile: Option<ProfileAction>,
     /// Set when Herdr supplied malformed context but the pane can still operate safely.
     context_warning: Option<String>,
     /// The last supported worktree event for this same workspace, if one was recorded.
@@ -857,6 +866,13 @@ struct App {
     flash: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileAction {
+    Sync,
+    Restore,
+    Merge,
+}
+
 impl App {
     fn load() -> App {
         let context = crate::context::read_context_from_env();
@@ -866,6 +882,11 @@ impl App {
             .and_then(crate::context::last_event_for);
         let workspace_context = context.context;
         let context_warning = context.warning;
+        let (workspace_profile, profile_error) =
+            match crate::profile::discover(workspace_context.as_ref()) {
+                Ok(profile) => (profile, None),
+                Err(error) => (None, Some(error)),
+            };
         let desired: Vec<Spec> = crate::desired_plugins()
             .iter()
             .map(|l| Spec::parse(l))
@@ -880,6 +901,10 @@ impl App {
             Ok(installed) => App {
                 rows: rows_with_herdr_version(&desired, &installed, &market, herdr_version),
                 workspace_context: workspace_context.clone(),
+                workspace_profile: workspace_profile.clone(),
+                profile_error: profile_error.clone(),
+                profile_open: false,
+                pending_profile: None,
                 context_warning: context_warning.clone(),
                 last_event: last_event.clone(),
                 browser: None,
@@ -899,6 +924,10 @@ impl App {
             Err(e) => App {
                 rows: Vec::new(),
                 workspace_context,
+                workspace_profile,
+                profile_error,
+                profile_open: false,
+                pending_profile: None,
                 context_warning,
                 last_event,
                 browser: None,
@@ -921,12 +950,16 @@ impl App {
     fn refresh(&mut self) {
         let (cursor, flash) = (self.cursor, self.flash.take());
         let (browser, help) = (self.browser.take(), self.help);
+        let profile_open = self.profile_open;
+        let pending_profile = self.pending_profile;
         let extras = self.extras.take();
         let adopt = self.adopt.take();
         let changes = self.detail_changes.take();
         let logs = self.log_view.take();
         *self = App::load();
         self.browser = browser;
+        self.profile_open = profile_open;
+        self.pending_profile = pending_profile;
         self.extras = extras;
         self.adopt = adopt;
         self.help = help;
@@ -965,6 +998,144 @@ impl App {
             summary.push_str(" · context fallback");
         }
         format!(" · {}", summary)
+    }
+
+    fn profile_suffix(&self) -> String {
+        if self.workspace_profile.is_some() {
+            " · \x1b[36m[p] project profile\x1b[2m".to_string()
+        } else if self.profile_error.is_some() {
+            " · \x1b[31m[p] invalid project profile\x1b[2m".to_string()
+        } else {
+            String::new()
+        }
+    }
+
+    fn global_specs(&self) -> Vec<Spec> {
+        self.rows
+            .iter()
+            .filter_map(|row| row.listed_as.as_deref().map(Spec::parse))
+            .collect()
+    }
+
+    fn profile_diff(&self) -> Option<crate::profile::ProfileDiff> {
+        let profile = self.workspace_profile.as_ref()?;
+        Some(crate::profile::diff(&profile.specs, &self.global_specs()))
+    }
+
+    fn open_profile(&mut self) {
+        if self.workspace_profile.is_some() || self.profile_error.is_some() {
+            self.profile_open = true;
+            self.pending_profile = None;
+            self.flash = None;
+        } else {
+            self.flash = Some(
+                "no workspace profile found — expected .herdr-lazy/plugins.list in the workspace"
+                    .to_string(),
+            );
+        }
+    }
+
+    fn request_profile_action(&mut self, action: ProfileAction) {
+        let Some(profile) = self.workspace_profile.as_ref() else {
+            self.flash = Some(
+                self.profile_error
+                    .clone()
+                    .unwrap_or_else(|| "no valid workspace profile to apply".to_string()),
+            );
+            return;
+        };
+        if action == ProfileAction::Restore
+            && !matches!(profile.lock_status, crate::profile::LockStatus::Ready(_))
+        {
+            self.flash = Some(match &profile.lock_status {
+                crate::profile::LockStatus::Missing => {
+                    "no profile lockfile yet — sync the profile first".to_string()
+                }
+                crate::profile::LockStatus::Invalid(error) => {
+                    format!("profile lockfile is invalid — {}", error)
+                }
+                crate::profile::LockStatus::Ready(_) => unreachable!(),
+            });
+            return;
+        }
+        if action == ProfileAction::Merge {
+            let Some(diff) = self.profile_diff() else {
+                return;
+            };
+            if diff.additions.is_empty() && diff.pin_changes.is_empty() {
+                self.flash = Some("the profile adds nothing new to your global list".to_string());
+                return;
+            }
+        }
+        self.pending_profile = Some(action);
+        self.flash = None;
+    }
+
+    /// Confirmed profile actions are the only path from discovery to an install or list edit.
+    fn commit_profile_action(&mut self) -> io::Result<()> {
+        let Some(action) = self.pending_profile.take() else {
+            return Ok(());
+        };
+        let Some(profile) = self.workspace_profile.clone() else {
+            self.profile_open = false;
+            self.flash = Some("workspace profile is no longer available".to_string());
+            return Ok(());
+        };
+        let profile = match crate::profile::discover_at(&profile.root) {
+            Ok(Some(profile)) => profile,
+            Ok(None) => {
+                self.profile_open = false;
+                self.flash = Some("workspace profile was removed before applying it".to_string());
+                return Ok(());
+            }
+            Err(error) => {
+                self.profile_open = false;
+                self.flash = Some(format!("workspace profile is no longer valid: {}", error));
+                return Ok(());
+            }
+        };
+
+        match action {
+            ProfileAction::Merge => {
+                let result = crate::merge_specs_into_list(&crate::bundle_path(), &profile.specs);
+                self.profile_open = false;
+                self.refresh();
+                self.flash = Some(match result {
+                    Ok(result) => {
+                        let mut changed = Vec::new();
+                        if result.added > 0 {
+                            changed.push(format!("{} added", result.added));
+                        }
+                        if result.updated > 0 {
+                            changed.push(format!("{} pin(s) updated", result.updated));
+                        }
+                        format!("merged profile into your list ({})", changed.join(", "))
+                    }
+                    Err(error) => format!("could not merge profile: {}", error),
+                });
+            }
+            ProfileAction::Sync | ProfileAction::Restore => {
+                self.profile_open = false;
+                let mut result = None;
+                suspended(|| {
+                    result = Some(match action {
+                        ProfileAction::Sync => crate::cmd_sync_profile(&profile),
+                        ProfileAction::Restore => crate::cmd_restore_profile(&profile),
+                        ProfileAction::Merge => unreachable!(),
+                    });
+                })?;
+                self.refresh();
+                self.flash = Some(match result.expect("profile action ran") {
+                    Ok(()) => match action {
+                        ProfileAction::Sync => "workspace profile synced".to_string(),
+                        ProfileAction::Restore => "workspace profile lock restored".to_string(),
+                        ProfileAction::Merge => unreachable!(),
+                    },
+                    Err(error) => format!("profile action failed: {}", error),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn open_logs(&mut self) {
@@ -1734,6 +1905,9 @@ impl App {
         if self.pending_bind.is_some() {
             return self.draw_bind_confirm(out, width, height);
         }
+        if self.pending_profile.is_some() {
+            return self.draw_profile_confirm(out, width, height);
+        }
         if self.log_view.is_some() {
             return self.draw_logs(out, width, height);
         }
@@ -1748,6 +1922,9 @@ impl App {
         }
         if self.adopt.is_some() {
             return self.draw_adopt(out, width, height);
+        }
+        if self.profile_open {
+            return self.draw_profile(out, width, height);
         }
         self.draw_list(out, width, height)
     }
@@ -1798,6 +1975,222 @@ impl App {
              \x1b[1m[n / esc]\x1b[0m cancel\r",
             height.saturating_sub(1),
             rule
+        )?;
+        out.flush()
+    }
+
+    /// Review a project profile before an explicit operation changes files or installed state.
+    fn draw_profile_confirm(
+        &self,
+        out: &mut impl Write,
+        width: u16,
+        height: u16,
+    ) -> io::Result<()> {
+        let rule = "─".repeat((width as usize).clamp(20, 200));
+        let action = self.pending_profile.expect("checked by caller");
+        let profile_path = self
+            .workspace_profile
+            .as_ref()
+            .map(|profile| profile.list_path.display().to_string())
+            .unwrap_or_else(|| "(workspace profile)".to_string());
+
+        write!(out, "\x1b[H\x1b[2J")?;
+        writeln!(
+            out,
+            "\x1b[1m workspace profile\x1b[0m  \x1b[33mconfirm\x1b[0m\r"
+        )?;
+        writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
+        writeln!(
+            out,
+            " profile: \x1b[1m{}\x1b[0m\r",
+            truncate(&profile_path, width as usize)
+        )?;
+        writeln!(out, "\r")?;
+
+        match action {
+            ProfileAction::Sync => {
+                writeln!(
+                    out,
+                    " This will install missing profile plugins and repair drifted pins."
+                )?;
+                writeln!(
+                    out,
+                    " It writes the lock beside the profile and leaves the global list unchanged."
+                )?;
+                writeln!(
+                    out,
+                    " Plugins outside the profile remain installed; no prune is performed."
+                )?;
+            }
+            ProfileAction::Restore => {
+                writeln!(
+                    out,
+                    " This will install the exact versions recorded in the profile lock."
+                )?;
+                writeln!(
+                    out,
+                    " It leaves both the global list and the global lockfile unchanged."
+                )?;
+            }
+            ProfileAction::Merge => {
+                writeln!(
+                    out,
+                    " This will merge the profile entries into the global plugins.list."
+                )?;
+                writeln!(
+                    out,
+                    " Same-repository pins in the global list will be replaced by the profile pin."
+                )?;
+                writeln!(
+                    out,
+                    " It does not install or uninstall anything; the global lock is not rewritten."
+                )?;
+            }
+        }
+
+        write!(
+            out,
+            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m\x1b[1m[y]\x1b[0m apply  \
+             \x1b[1m[n / esc]\x1b[0m cancel\r",
+            height.saturating_sub(1),
+            rule
+        )?;
+        out.flush()
+    }
+
+    /// Show the project-scoped diff and its safe, explicit actions.
+    fn draw_profile(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        let rule = "─".repeat((width as usize).clamp(20, 200));
+        write!(out, "\x1b[H\x1b[2J")?;
+        writeln!(
+            out,
+            "\x1b[1m workspace profile\x1b[0m  \x1b[36mproject-scoped\x1b[0m\r"
+        )?;
+        writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
+
+        let Some(profile) = self.workspace_profile.as_ref() else {
+            writeln!(out, " \x1b[31mprofile is unavailable:\x1b[0m\r")?;
+            writeln!(
+                out,
+                "   {}\r",
+                self.profile_error
+                    .as_deref()
+                    .unwrap_or("no valid workspace profile was found")
+            )?;
+            writeln!(
+                out,
+                "\r no action was taken; the global list is unchanged.\r"
+            )?;
+            return self.draw_profile_footer(out, width, height, &rule);
+        };
+
+        writeln!(
+            out,
+            " root: {}\r",
+            truncate(&profile.root.display().to_string(), width as usize)
+        )?;
+        writeln!(
+            out,
+            " list: {}\r",
+            truncate(&profile.list_path.display().to_string(), width as usize)
+        )?;
+        let lock = match &profile.lock_status {
+            crate::profile::LockStatus::Missing => "missing — sync writes it".to_string(),
+            crate::profile::LockStatus::Ready(count) => format!("ready ({} entries)", count),
+            crate::profile::LockStatus::Invalid(error) => {
+                format!(
+                    "invalid — {}",
+                    truncate(error, width.saturating_sub(9) as usize)
+                )
+            }
+        };
+        writeln!(
+            out,
+            " lock: {}\r",
+            truncate(
+                &format!("{} ({})", profile.lock_path.display(), lock),
+                width as usize
+            )
+        )?;
+        writeln!(out, "\r")?;
+
+        let diff = self.profile_diff().unwrap_or_default();
+        let mut lines = Vec::new();
+        if diff.is_empty() {
+            lines.push(" = profile selection matches your global list".to_string());
+        } else {
+            if !diff.additions.is_empty() {
+                lines.push(format!(
+                    " + add to project selection ({})",
+                    diff.additions.len()
+                ));
+                lines.extend(
+                    diff.additions
+                        .iter()
+                        .map(|spec| format!("   + {}", spec.display())),
+                );
+            }
+            if !diff.pin_changes.is_empty() {
+                lines.push(format!(" ~ pin changes ({})", diff.pin_changes.len()));
+                lines.extend(diff.pin_changes.iter().map(|(global, wanted)| {
+                    format!("   ~ {} -> {}", global.display(), wanted.display())
+                }));
+            }
+            if !diff.global_only.is_empty() {
+                lines.push(format!(
+                    " - global-only entries ({})",
+                    diff.global_only.len()
+                ));
+                lines.extend(diff.global_only.iter().map(|spec| {
+                    format!(
+                        "   - {}  (kept; profile sync does not prune)",
+                        spec.display()
+                    )
+                }));
+            }
+            if diff.unchanged > 0 {
+                lines.push(format!(" = {} shared unchanged", diff.unchanged));
+            }
+        }
+
+        writeln!(out, " \x1b[1mdiff\x1b[0m\r")?;
+        let visible = (height as usize).saturating_sub(13).max(1);
+        for line in lines.iter().take(visible) {
+            writeln!(
+                out,
+                "{}\r",
+                truncate(line, width.saturating_sub(1) as usize)
+            )?;
+        }
+        if lines.len() > visible {
+            writeln!(out, "   … {} more entries\r", lines.len() - visible)?;
+        }
+        writeln!(
+            out,
+            "\r \x1b[2msync writes only the project lock; merge is the only action that edits the global list.\x1b[0m\r"
+        )?;
+        self.draw_profile_footer(out, width, height, &rule)
+    }
+
+    fn draw_profile_footer(
+        &self,
+        out: &mut impl Write,
+        _width: u16,
+        height: u16,
+        rule: &str,
+    ) -> io::Result<()> {
+        let footer = match &self.flash {
+            Some(message) => format!("\x1b[36m{}\x1b[0m", message),
+            None => "\x1b[1m[s]\x1b[0m sync  \x1b[1m[r]\x1b[0m restore lock  \
+                     \x1b[1m[m]\x1b[0m merge into global  \x1b[1m[esc/q]\x1b[0m back"
+                .to_string(),
+        };
+        write!(
+            out,
+            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
+            height.saturating_sub(1),
+            rule,
+            footer
         )?;
         out.flush()
     }
@@ -2109,6 +2502,10 @@ impl App {
                     "f",
                     "read someone else's list — tick what you want, enter takes it",
                 ),
+                (
+                    "p",
+                    "review the workspace profile — sync, restore its lock, or merge explicitly",
+                ),
             ],
         )?;
         section(
@@ -2402,6 +2799,7 @@ impl App {
             _ => String::new(),
         };
         let context = self.context_suffix();
+        let profile = self.profile_suffix();
 
         // Showing auto-sync here is the only way a user learns it exists: it has no row of its
         // own, and something that installs software at startup should be visible, not buried.
@@ -2412,7 +2810,7 @@ impl App {
         };
         writeln!(
             out,
-            "\x1b[1m herdr-lazy\x1b[0m  \x1b[2m{} ok · {} to sync · {} unlisted{}{}{}\x1b[0m{}{}\r",
+            "\x1b[1m herdr-lazy\x1b[0m  \x1b[2m{} ok · {} to sync · {} unlisted{}{}{}\x1b[0m{}{}{}\r",
             ok,
             todo,
             extra,
@@ -2431,7 +2829,8 @@ impl App {
             },
             auto,
             freshness,
-            context
+            context,
+            profile
         )?;
         writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
 
@@ -2517,6 +2916,7 @@ impl App {
             ("d", "drop"),
             ("/", "search"),
             ("e", "extras"),
+            ("p", "profile"),
             ("?", "help"),
         ]
         .iter()
@@ -2717,6 +3117,22 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                 _ => {
                     app.pending_bind = None;
                     app.flash = Some("not bound".to_string());
+                }
+            }
+            continue;
+        }
+
+        // Profile operations are confirmation-first: discovery only opens a review, and the
+        // actual sync/restore/merge cannot be reached by a single accidental keypress.
+        if app.pending_profile.is_some() {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                return Ok(());
+            }
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => app.commit_profile_action()?,
+                _ => {
+                    app.pending_profile = None;
+                    app.flash = Some("profile action cancelled".to_string());
                 }
             }
             continue;
@@ -2966,6 +3382,27 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             continue;
         }
 
+        if app.profile_open {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                return Ok(());
+            }
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    app.profile_open = false;
+                    app.flash = None;
+                }
+                KeyCode::Char('s') => app.request_profile_action(ProfileAction::Sync),
+                KeyCode::Char('m') => app.request_profile_action(ProfileAction::Merge),
+                KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.refresh();
+                    app.flash = Some("re-read workspace profile".to_string());
+                }
+                KeyCode::Char('r') => app.request_profile_action(ProfileAction::Restore),
+                _ => {}
+            }
+            continue;
+        }
+
         // Ctrl+R re-reads state in both views: the list here, the marketplace index in the
         // browser. Plain `r` is restore, following lazy.nvim.
         if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -3054,6 +3491,7 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             KeyCode::Char('/') => app.open_browser(false),
             KeyCode::Char('e') => app.open_extras(),
             KeyCode::Char('f') => app.open_adopt(),
+            KeyCode::Char('p') => app.open_profile(),
             KeyCode::Char('?') => app.help = true,
 
             // Keys lazy.nvim has that this does not. Rather than doing nothing — which reads
@@ -3107,6 +3545,21 @@ mod tests {
 
     const SHA: &str = "f32b0825f12543c1d03e54fb10d1741c40d66cdc";
     const OTHER: &str = "a8f86ec4103bc367b52e547b492483f3b792a952";
+
+    fn profile(
+        entries: &[&str],
+        lock_status: crate::profile::LockStatus,
+    ) -> crate::profile::WorkspaceProfile {
+        let root = std::path::PathBuf::from("/repo/project");
+        let directory = root.join(crate::profile::PROFILE_DIRECTORY);
+        crate::profile::WorkspaceProfile {
+            root,
+            list_path: directory.join(crate::profile::PROFILE_LIST_NAME),
+            lock_path: directory.join(crate::profile::PROFILE_LOCK_NAME),
+            specs: entries.iter().map(|entry| Spec::parse(entry)).collect(),
+            lock_status,
+        }
+    }
 
     fn version(s: &str) -> HerdrVersion {
         HerdrVersion::parse(s).expect("test version should parse")
@@ -3799,6 +4252,53 @@ mod tests {
         assert_eq!(
             app.context_suffix(),
             " · workspace demo (w1) · cwd /repo/demo · last worktree.opened"
+        );
+    }
+
+    #[test]
+    fn profile_view_shows_a_reviewable_diff_and_safe_actions() {
+        let app = App {
+            rows: rows(
+                &[Spec::parse("owner/global"), Spec::parse("owner/shared")],
+                &[],
+            ),
+            workspace_profile: Some(profile(
+                &["owner/profile", "owner/shared"],
+                crate::profile::LockStatus::Missing,
+            )),
+            profile_open: true,
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        app.draw_profile(&mut buf, 100, 24).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("project-scoped"));
+        assert!(out.contains("owner/profile"));
+        assert!(out.contains("owner/global"));
+        assert!(out.contains("profile sync does not prune"));
+        assert!(out.contains("[s]"));
+        assert!(out.contains("[m]"));
+    }
+
+    #[test]
+    fn profile_actions_are_confirmation_first_and_restore_requires_a_lock() {
+        let mut app = App {
+            workspace_profile: Some(profile(
+                &["owner/profile"],
+                crate::profile::LockStatus::Missing,
+            )),
+            ..Default::default()
+        };
+
+        app.request_profile_action(ProfileAction::Sync);
+        assert_eq!(app.pending_profile, Some(ProfileAction::Sync));
+
+        app.pending_profile = None;
+        app.request_profile_action(ProfileAction::Restore);
+        assert_eq!(app.pending_profile, None);
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("no profile lockfile yet — sync the profile first")
         );
     }
 

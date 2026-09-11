@@ -33,6 +33,9 @@ lockfile records.
 - **A workspace-aware manage pane.** When Herdr opens it in a workspace, the header identifies
   that workspace and its working directory. Worktree create/open events leave a small,
   workspace-matched hint, without changing the plugin list or installed state.
+- **Workspace-scoped profiles.** Put an optional `.herdr-lazy/plugins.list` in a project to
+  review project-specific plugins with `p`. Syncing writes `.herdr-lazy/plugins.lock` and leaves
+  the global list alone; merging into the global list is a separate, confirmed action.
 - **A list that tells you what each plugin is.** Every installed row shows its own one-line
   description, so you can tell what you have and spot two plugins that do the same thing
   without opening each one.
@@ -151,8 +154,24 @@ herdr-lazy init --from owner/repo    # start from someone else's list instead
 When Herdr opens the manage pane, herdr-lazy reads the point-in-time
 `HERDR_PLUGIN_CONTEXT_JSON` snapshot and shows the workspace label, cwd, worktree branch, and
 focused agent when Herdr provides them. The context is a label for the pane, not a second plugin
-configuration: the list and lockfile remain the same across workspaces, and a missing context
-leaves the pane behaving as before.
+configuration: a missing context leaves the pane behaving as before.
+
+If the current workspace has `.herdr-lazy/plugins.list`, the header shows a project profile and
+`p` opens a reviewable diff against the global selection. The profile is read only from that
+exact workspace root; herdr-lazy does not search parent directories or use an unrelated shell
+cwd. The profile uses the same one-entry-per-line `owner/repo[@ref]` format as the global list.
+
+The profile view has three explicit actions:
+
+- `s` confirms a profile sync. It installs missing profile entries, repairs drifted pins, and
+  writes `.herdr-lazy/plugins.lock`. It never prunes plugins that are outside the profile.
+- `r` confirms a restore from that profile lockfile, reproducing its recorded commits without
+  touching the global list or lockfile.
+- `m` confirms a merge into the global `plugins.list`; profile pins replace a pin for the same
+  repository. This edits the global list but does not install or uninstall anything.
+
+Discovery is read-only. A missing or malformed profile is shown as an error and cannot fall back
+to an empty list or affect the global configuration.
 
 herdr-lazy also listens for `worktree.created` and `worktree.opened`. Those hooks only save the
 last event under `HERDR_PLUGIN_STATE_DIR`, so the pane can show it when it belongs to the current
@@ -215,6 +234,11 @@ herdr-lazy` prints it:
 
 Run from a shell, herdr-lazy asks herdr for that path rather than guessing, so the CLI and
 the manage pane always read the same files.
+
+Workspace profiles are independent of those global files and live in the project checkout:
+
+- `.herdr-lazy/plugins.list` — the optional project-scoped selection
+- `.herdr-lazy/plugins.lock` — the project commits recorded by profile sync
 
 ## What did I just install?
 
