@@ -27,6 +27,7 @@ mod context;
 mod extras;
 mod github;
 mod json;
+mod profile;
 mod registry;
 mod ui;
 
@@ -595,7 +596,7 @@ fn repo_leaf(spec: &str) -> String {
 ///
 /// herdr's `plugin install` takes `--ref REF`, so pinning is native — the `@ref` suffix maps
 /// straight onto it. No git-checkout management of our own is needed.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Spec {
     /// `owner/repo[/subdir]` — what `install`/`uninstall` want as the positional arg.
     pub(crate) repo: String,
@@ -1524,6 +1525,64 @@ pub(crate) fn cmd_sync(prune: bool, targets: &[&str]) -> io::Result<()> {
     converge(&all, targets, prune, true)
 }
 
+/// Sync a workspace profile without changing the global list or using the global lockfile.
+///
+/// Re-read the profile at the moment of action. The pane may have been open while somebody
+/// edited the project file, and a malformed replacement must fail closed instead of falling
+/// back to an empty desired set.
+pub(crate) fn cmd_sync_profile(profile: &profile::WorkspaceProfile) -> io::Result<()> {
+    let current = profile::discover_at(&profile.root).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("workspace profile is no longer valid: {}", error),
+        )
+    })?;
+    let Some(current) = current else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "workspace profile was removed before sync",
+        ));
+    };
+    if current.specs.is_empty() {
+        println!(
+            "workspace profile at {} has no plugin entries — nothing to sync.",
+            current.list_path.display()
+        );
+        return Ok(());
+    }
+    converge_to(&current.specs, &[], false, Some(&current.lock_path))
+}
+
+/// Restore the exact versions recorded by a workspace profile lockfile.
+pub(crate) fn cmd_restore_profile(profile: &profile::WorkspaceProfile) -> io::Result<()> {
+    let current = profile::discover_at(&profile.root).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("workspace profile is no longer valid: {}", error),
+        )
+    })?;
+    let Some(current) = current else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "workspace profile was removed before restore",
+        ));
+    };
+    match current.lock_status {
+        profile::LockStatus::Ready(_) => restore_from_lock(&current.lock_path, &[], false, None),
+        profile::LockStatus::Missing => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "no workspace profile lockfile at {}",
+                current.lock_path.display()
+            ),
+        )),
+        profile::LockStatus::Invalid(error) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("workspace profile lockfile is invalid: {}", error),
+        )),
+    }
+}
+
 fn matched_installed<'a>(
     spec: &Spec,
     installed: &'a [Installed],
@@ -2197,6 +2256,21 @@ fn cmd_auto_sync(arg: Option<&str>) -> io::Result<()> {
 }
 
 fn converge(all: &[Spec], targets: &[&str], prune: bool, write_the_lock: bool) -> io::Result<()> {
+    let lock_destination = write_the_lock.then(lock_path);
+    converge_to(all, targets, prune, lock_destination.as_deref())
+}
+
+/// Converge to a list and optionally write its sibling lockfile.
+///
+/// A workspace profile uses the same install/match logic as the global list, but its lock must
+/// stay beside `.herdr-lazy/plugins.list`. Passing the destination in keeps that operation
+/// explicit and prevents a profile action from silently overwriting the global lock.
+fn converge_to(
+    all: &[Spec],
+    targets: &[&str],
+    prune: bool,
+    lock_destination: Option<&Path>,
+) -> io::Result<()> {
     let installed = match installed_plugins() {
         Ok(v) => v,
         Err(e) => {
@@ -2204,7 +2278,7 @@ fn converge(all: &[Spec], targets: &[&str], prune: bool, write_the_lock: bool) -
             return Ok(());
         }
     };
-    converge_with_installed(all, targets, prune, write_the_lock, installed)
+    converge_with_installed_at(all, targets, prune, lock_destination, installed)
 }
 
 fn converge_with_installed(
@@ -2212,6 +2286,17 @@ fn converge_with_installed(
     targets: &[&str],
     prune: bool,
     write_the_lock: bool,
+    installed: Vec<Installed>,
+) -> io::Result<()> {
+    let lock_destination = write_the_lock.then(lock_path);
+    converge_with_installed_at(all, targets, prune, lock_destination.as_deref(), installed)
+}
+
+fn converge_with_installed_at(
+    all: &[Spec],
+    targets: &[&str],
+    prune: bool,
+    lock_destination: Option<&Path>,
     installed: Vec<Installed>,
 ) -> io::Result<()> {
     let all: Vec<Spec> = all.to_vec();
@@ -2342,12 +2427,12 @@ fn converge_with_installed(
     );
     // Re-query: the snapshot above predates this run's installs, so it has no commits for
     // them. Locking against it would silently record the new plugins as unpinned.
-    if write_the_lock {
+    if let Some(lock_destination) = lock_destination {
         let after = installed_plugins().unwrap_or_else(|e| {
             eprintln!("warning: could not re-read plugin list for the lock: {}", e);
             installed.clone()
         });
-        write_lock(&all, &after)?;
+        write_lock_at(lock_destination, &all, &after)?;
     }
     Ok(())
 }
@@ -2862,8 +2947,11 @@ pub(crate) fn short(commit: &str) -> String {
 /// is genuinely reproducible across machines, which is the whole point of the lockfile.
 /// Unpinned entries still float, and are flagged as such.
 fn write_lock(desired: &[Spec], installed: &[Installed]) -> io::Result<()> {
-    let p = lock_path();
-    ensure_parent(&p)?;
+    write_lock_at(&lock_path(), desired, installed)
+}
+
+fn write_lock_at(p: &Path, desired: &[Spec], installed: &[Installed]) -> io::Result<()> {
+    ensure_parent(p)?;
 
     // Prefer the commit herdr actually checked out (`source.resolved_commit`) over the ref the
     // bundle asked for: a bundle may say `main`, but the lock must say which `main`. This is
@@ -2903,7 +2991,7 @@ fn write_lock(desired: &[Spec], installed: &[Installed]) -> io::Result<()> {
         body.push_str(l);
         body.push('\n');
     }
-    if write_lock_contents(&p, &body)? {
+    if write_lock_contents(p, &body)? {
         println!("wrote lock -> {}", p.display());
     } else {
         println!("lock unchanged -> {}", p.display());
@@ -2944,6 +3032,54 @@ pub(crate) fn add_to_list(spec: &str) -> io::Result<String> {
     existing.push('\n');
     fs::write(&p, existing)?;
     Ok(format!("added {} to your list", spec))
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ListMergeResult {
+    pub(crate) added: usize,
+    pub(crate) updated: usize,
+}
+
+/// Merge profile entries into a list after an explicit user choice.
+///
+/// A profile never calls this as part of discovery or sync. Existing global entries are kept
+/// unless the caller deliberately chooses merge; when the same repository has a different pin,
+/// the profile's pin becomes the global one and is reported as an update.
+pub(crate) fn merge_specs_into_list(path: &Path, specs: &[Spec]) -> io::Result<ListMergeResult> {
+    let existing = match fs::read_to_string(path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    let mut lines: Vec<String> = existing.lines().map(str::to_string).collect();
+    let mut result = ListMergeResult::default();
+
+    for spec in specs {
+        if let Some(line) = lines.iter_mut().find(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty()
+                && !trimmed.starts_with('#')
+                && Spec::parse(trimmed).repo == spec.repo
+        }) {
+            if line.trim() != spec.display() {
+                *line = spec.display();
+                result.updated += 1;
+            }
+        } else {
+            lines.push(spec.display());
+            result.added += 1;
+        }
+    }
+
+    if result == ListMergeResult::default() {
+        return Ok(result);
+    }
+
+    ensure_parent(path)?;
+    let mut body = lines.join("\n");
+    body.push('\n');
+    write_bytes_atomically(path, body.as_bytes())?;
+    Ok(result)
 }
 
 /// Which of an extra's plugins a list does not already declare.
@@ -3806,6 +3942,44 @@ command = "something.else"
         if let Some(dir) = lock.parent() {
             let _ = fs::remove_dir_all(dir);
         }
+    }
+
+    #[test]
+    fn merging_profile_entries_is_idempotent_and_updates_only_conflicting_repos() {
+        let dir = env::temp_dir().join(format!("herdr-lazy-profile-merge-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let list = dir.join("plugins.list");
+        fs::write(
+            &list,
+            "# keep this comment\nowner/existing@old\nowner/untouched\n",
+        )
+        .unwrap();
+
+        let profile = vec![
+            Spec::parse("owner/existing@new"),
+            Spec::parse("owner/additional"),
+        ];
+        assert_eq!(
+            merge_specs_into_list(&list, &profile).unwrap(),
+            ListMergeResult {
+                added: 1,
+                updated: 1,
+            }
+        );
+        assert_eq!(
+            fs::read_to_string(&list).unwrap(),
+            "# keep this comment\nowner/existing@new\nowner/untouched\nowner/additional\n"
+        );
+        assert_eq!(
+            merge_specs_into_list(&list, &profile).unwrap(),
+            ListMergeResult::default()
+        );
+        assert_eq!(
+            fs::read_to_string(&list).unwrap(),
+            "# keep this comment\nowner/existing@new\nowner/untouched\nowner/additional\n"
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
