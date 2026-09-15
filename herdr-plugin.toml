@@ -134,6 +134,22 @@ title = "Lazy: open manage pane"
 contexts = ["workspace"]
 command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "$b = $env:HERDR_BIN_PATH; if (-not $b) { $b = 'herdr' }; & $b plugin pane open --plugin herdr-lazy --entrypoint manage-windows --focus"]
 
+# The workspace starter is a separate confirmation-first workflow. Like the manage action,
+# the action asks Herdr to open a pane because actions do not receive a PTY of their own.
+[[actions]]
+id = "starter"
+platforms = ["linux", "macos"]
+title = "Lazy: start workspace"
+contexts = ["workspace"]
+command = ["/bin/sh", "scripts/open-starter-pane.sh"]
+
+[[actions]]
+id = "starter-windows"
+platforms = ["windows"]
+title = "Lazy: start workspace"
+contexts = ["workspace"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "$b = $env:HERDR_BIN_PATH; if (-not $b) { $b = 'herdr' }; & $b plugin pane open --plugin herdr-lazy --entrypoint starter-windows --focus"]
+
 # The manage UI. `overlay` is the right placement for it: a temporary zoomed view that
 # hands focus back to whatever you were doing when it closes.
 [[panes]]
@@ -149,3 +165,17 @@ platforms = ["windows"]
 title = "herdr-lazy"
 placement = "overlay"
 command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "& .\\target\\release\\herdr-lazy.exe ui"]
+
+[[panes]]
+id = "starter"
+platforms = ["linux", "macos"]
+title = "herdr-lazy workspace starter"
+placement = "overlay"
+command = ["./target/release/herdr-lazy", "starter"]
+
+[[panes]]
+id = "starter-windows"
+platforms = ["windows"]
+title = "herdr-lazy workspace starter"
+placement = "overlay"
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "& .\\target\\release\\herdr-lazy.exe starter"]

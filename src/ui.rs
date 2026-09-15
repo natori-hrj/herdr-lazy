@@ -2506,6 +2506,10 @@ impl App {
                     "p",
                     "review the workspace profile — sync, restore its lock, or merge explicitly",
                 ),
+                (
+                    "w",
+                    "open the workspace starter — preview, sync, then launch declared targets",
+                ),
             ],
         )?;
         section(
@@ -2917,6 +2921,7 @@ impl App {
             ("/", "search"),
             ("e", "extras"),
             ("p", "profile"),
+            ("w", "starter"),
             ("?", "help"),
         ]
         .iter()
@@ -2976,7 +2981,7 @@ fn truncate(s: &str, max: usize) -> String {
 ///
 /// The alternate screen is left entirely so the command's own output scrolls normally and
 /// stays scrollable in the terminal's history afterwards.
-fn suspended<F: FnOnce()>(f: F) -> io::Result<()> {
+pub(crate) fn suspended<F: FnOnce()>(f: F) -> io::Result<()> {
     terminal::disable_raw_mode()?;
     let mut out = io::stdout();
     write!(out, "\x1b[?1049l")?;
@@ -3492,6 +3497,9 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             KeyCode::Char('e') => app.open_extras(),
             KeyCode::Char('f') => app.open_adopt(),
             KeyCode::Char('p') => app.open_profile(),
+            KeyCode::Char('w') => {
+                app.flash = Some(crate::open_starter_pane());
+            }
             KeyCode::Char('?') => app.help = true,
 
             // Keys lazy.nvim has that this does not. Rather than doing nothing — which reads
