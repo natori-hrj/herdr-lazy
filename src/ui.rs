@@ -676,6 +676,123 @@ impl ExtrasPicker {
     }
 }
 
+/// `n` — the agent-aware recommendations picker.
+///
+/// This is intentionally separate from the normal extras menu: a recommendation is a hint about
+/// the current focused agent, not a new default bundle. Adding one writes only the plugin list;
+/// installation remains the existing, explicit `i` step.
+struct RecommendationsPicker {
+    agent: crate::recommendations::Agent,
+    items: Vec<RecommendationItem>,
+    cursor: usize,
+}
+
+struct RecommendationItem {
+    extra: crate::extras::Extra,
+    reason: &'static str,
+    picked: bool,
+    listed: bool,
+}
+
+const RECOMMENDATIONS_TOP: usize = 3;
+
+impl RecommendationsPicker {
+    fn new(agent: &str, listed: &[String]) -> Option<RecommendationsPicker> {
+        let recommendations = crate::recommendations::for_agent(agent)?;
+        let mut items = Vec::new();
+        for recommendation in recommendations.items {
+            if items
+                .iter()
+                .any(|item: &RecommendationItem| item.extra.id == recommendation.extra_id)
+            {
+                continue;
+            }
+            // A local extra may override or hide a bundled definition. If a curated id is
+            // unavailable in this checkout, skip that recommendation rather than making the
+            // whole known-agent view disappear.
+            let Some(extra) = crate::extras::find(recommendation.extra_id) else {
+                continue;
+            };
+            let listed = extra
+                .plugins
+                .iter()
+                .all(|plugin| listed.iter().any(|l| l == plugin));
+            items.push(RecommendationItem {
+                extra,
+                reason: recommendation.reason,
+                picked: false,
+                listed,
+            });
+        }
+        (!items.is_empty()).then_some(RecommendationsPicker {
+            agent: recommendations.agent,
+            items,
+            cursor: 0,
+        })
+    }
+
+    fn count(&self) -> usize {
+        self.items.len()
+    }
+
+    fn move_cursor(&mut self, down: bool) {
+        if down {
+            if self.cursor + 1 < self.items.len() {
+                self.cursor += 1;
+            }
+        } else {
+            self.cursor = self.cursor.saturating_sub(1);
+        }
+    }
+
+    fn window(&self, height: u16) -> (usize, usize) {
+        let visible = (height as usize).saturating_sub(7).max(1);
+        let start = if self.cursor >= visible {
+            self.cursor - visible + 1
+        } else {
+            0
+        };
+        (visible, start)
+    }
+
+    fn row_at(&self, screen_row: u16, height: u16) -> Option<usize> {
+        let (visible, start) = self.window(height);
+        let y = screen_row as usize;
+        if y < RECOMMENDATIONS_TOP {
+            return None;
+        }
+        let idx = start + (y - RECOMMENDATIONS_TOP);
+        (y - RECOMMENDATIONS_TOP < visible && idx < self.items.len()).then_some(idx)
+    }
+
+    fn toggle(&mut self) {
+        if let Some(item) = self.items.get_mut(self.cursor) {
+            item.picked = !item.picked;
+        }
+    }
+
+    /// Remove the highlighted item from this picker. Dismissals are intentionally session-local:
+    /// they are presentation state, not configuration that should be written to disk.
+    fn dismiss(&mut self) -> bool {
+        if self.items.is_empty() {
+            return false;
+        }
+        self.items.remove(self.cursor);
+        self.cursor = self.cursor.min(self.items.len().saturating_sub(1));
+        !self.items.is_empty()
+    }
+
+    /// Ticked recommendations win; with none ticked, Enter uses the highlighted item.
+    fn targets(&self) -> Vec<&RecommendationItem> {
+        let picked: Vec<&RecommendationItem> =
+            self.items.iter().filter(|item| item.picked).collect();
+        if !picked.is_empty() {
+            return picked;
+        }
+        self.items.get(self.cursor).into_iter().collect()
+    }
+}
+
 /// What your own list already says about an entry in someone else's.
 #[derive(PartialEq, Clone, Copy, Debug)]
 enum Held {
@@ -833,6 +950,8 @@ struct App {
     browser: Option<crate::browse::Browser>,
     /// Present while the extras picker is open, for the same reason.
     extras: Option<ExtrasPicker>,
+    /// Present while the focused-agent recommendations are open.
+    recommendations: Option<RecommendationsPicker>,
     /// Present while reading someone else's list.
     adopt: Option<AdoptPicker>,
     /// `?` — the full keymap. The footer only has room for the common half.
@@ -909,6 +1028,7 @@ impl App {
                 last_event: last_event.clone(),
                 browser: None,
                 extras: None,
+                recommendations: None,
                 adopt: None,
                 help: false,
                 detail_of: None,
@@ -932,6 +1052,7 @@ impl App {
                 last_event,
                 browser: None,
                 extras: None,
+                recommendations: None,
                 adopt: None,
                 help: false,
                 detail_of: None,
@@ -953,6 +1074,7 @@ impl App {
         let profile_open = self.profile_open;
         let pending_profile = self.pending_profile;
         let extras = self.extras.take();
+        let recommendations = self.recommendations.take();
         let adopt = self.adopt.take();
         let changes = self.detail_changes.take();
         let logs = self.log_view.take();
@@ -961,6 +1083,7 @@ impl App {
         self.profile_open = profile_open;
         self.pending_profile = pending_profile;
         self.extras = extras;
+        self.recommendations = recommendations;
         self.adopt = adopt;
         self.help = help;
         self.detail_changes = changes;
@@ -1008,6 +1131,38 @@ impl App {
         } else {
             String::new()
         }
+    }
+
+    fn recommendation_info(&self) -> Option<(crate::recommendations::Agent, usize)> {
+        let agent = self
+            .workspace_context
+            .as_ref()?
+            .focused_pane_agent
+            .as_deref()?;
+        let recommendations = crate::recommendations::for_agent(agent)?;
+        let available = recommendations
+            .items
+            .iter()
+            .filter(|recommendation| crate::extras::find(recommendation.extra_id).is_some())
+            .count();
+        (available > 0).then_some((recommendations.agent, available))
+    }
+
+    fn recommendation_suffix(&self) -> String {
+        let Some((agent, count)) = self.recommendation_info() else {
+            return String::new();
+        };
+        let noun = if count == 1 {
+            "recommendation"
+        } else {
+            "recommendations"
+        };
+        format!(
+            " · \x1b[36m[n] {} {} for {}\x1b[2m",
+            count,
+            noun,
+            agent.label()
+        )
     }
 
     fn global_specs(&self) -> Vec<Spec> {
@@ -1600,6 +1755,22 @@ impl App {
             return Ok(());
         }
 
+        if let Some(p) = self.recommendations.as_mut() {
+            match m.kind {
+                MouseEventKind::ScrollDown => p.move_cursor(true),
+                MouseEventKind::ScrollUp => p.move_cursor(false),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(i) = p.row_at(m.row, height) {
+                        p.cursor = i;
+                        p.toggle();
+                        self.flash = None;
+                    }
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
         match m.kind {
             MouseEventKind::ScrollDown => {
                 if self.cursor + 1 < self.rows.len() {
@@ -1753,6 +1924,55 @@ impl App {
         }
     }
 
+    /// `n` — show the curated recommendations for the currently focused agent.
+    fn open_recommendations(&mut self) {
+        let Some(agent) = self
+            .workspace_context
+            .as_ref()
+            .and_then(|context| context.focused_pane_agent.clone())
+        else {
+            self.flash = Some(
+                "no focused agent context — recommendations stay hidden until Herdr provides one"
+                    .to_string(),
+            );
+            return;
+        };
+        // Opening a presentation-only recommendation view must not trigger the legacy-list
+        // migration performed by `desired_plugins`.
+        let listed: Vec<String> = crate::read_bundle_specs()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|spec| spec.repo)
+            .collect();
+        match RecommendationsPicker::new(&agent, &listed) {
+            Some(picker) => {
+                self.recommendations = Some(picker);
+                self.flash = None;
+            }
+            None => {
+                self.flash = Some(format!(
+                    "no curated recommendations for focused agent {}",
+                    agent
+                ));
+            }
+        }
+    }
+
+    /// Add recommended extras to the existing list review path. This never installs anything.
+    fn apply_recommendations(&mut self) {
+        let Some(picker) = self.recommendations.as_ref() else {
+            return;
+        };
+        let agent = picker.agent.label().to_string();
+        let ids: Vec<String> = picker
+            .targets()
+            .iter()
+            .map(|item| item.extra.id.clone())
+            .collect();
+        self.recommendations = None;
+        self.apply_extra_ids(ids, &format!("from {} recommendations", agent));
+    }
+
     /// Enter, in the picker — write the chosen extras into the list, then show what arrived.
     ///
     /// Nothing is installed here. The rows that were just added come back ticked, so `i`
@@ -1771,6 +1991,14 @@ impl App {
         if ids.is_empty() {
             return;
         }
+        self.extras = None;
+        self.apply_extra_ids(ids, "from extras");
+    }
+
+    fn apply_extra_ids(&mut self, ids: Vec<String>, source: &str) {
+        if ids.is_empty() {
+            return;
+        }
         let mut added: Vec<String> = Vec::new();
         for id in &ids {
             let Some(e) = crate::extras::find(id) else {
@@ -1785,7 +2013,6 @@ impl App {
             }
         }
 
-        self.extras = None;
         self.refresh();
         let arrived: Vec<usize> = self
             .rows
@@ -1808,11 +2035,7 @@ impl App {
         self.flash = Some(if added.is_empty() {
             format!("{} — already in your list", ids.join(", "))
         } else {
-            format!(
-                "added {} from {} — press i to install",
-                added.join(", "),
-                ids.join(", ")
-            )
+            format!("added {} {} — press i to install", added.join(", "), source)
         });
     }
 
@@ -1919,6 +2142,9 @@ impl App {
         }
         if self.extras.is_some() {
             return self.draw_extras(out, width, height);
+        }
+        if self.recommendations.is_some() {
+            return self.draw_recommendations(out, width, height);
         }
         if self.adopt.is_some() {
             return self.draw_adopt(out, width, height);
@@ -2510,6 +2736,10 @@ impl App {
                     "w",
                     "open the workspace starter — preview, sync, then launch declared targets",
                 ),
+                (
+                    "n",
+                    "show recommendations for the focused agent — add to the review list only",
+                ),
             ],
         )?;
         section(
@@ -2695,6 +2925,77 @@ impl App {
         out.flush()
     }
 
+    fn draw_recommendations(
+        &self,
+        out: &mut impl Write,
+        width: u16,
+        height: u16,
+    ) -> io::Result<()> {
+        let p = self.recommendations.as_ref().expect("checked by caller");
+        let rule = "─".repeat((width as usize).clamp(20, 200));
+
+        write!(out, "\x1b[H\x1b[2J")?;
+        writeln!(
+            out,
+            "\x1b[1m agent recommendations\x1b[0m  \x1b[2mfor {} · {} available · add to your list for review\x1b[0m\r",
+            p.agent.label(),
+            p.count()
+        )?;
+        writeln!(
+            out,
+            " \x1b[2mThese are curated presentation hints. Nothing installs until you use [i].\x1b[0m\r"
+        )?;
+        writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
+
+        let (visible, start) = p.window(height);
+        let details_width = (width as usize).saturating_sub(24);
+        let description_width = details_width / 2;
+        let reason_width = details_width.saturating_sub(description_width + 3);
+        for (i, item) in p.items.iter().enumerate().skip(start).take(visible) {
+            let pointer = if i == p.cursor {
+                "\x1b[7m>\x1b[0m"
+            } else {
+                " "
+            };
+            let tick = if item.picked {
+                "\x1b[1m[x]\x1b[0m"
+            } else {
+                "[ ]"
+            };
+            let mark = if item.listed {
+                "\x1b[32m✔\x1b[0m"
+            } else {
+                " "
+            };
+            writeln!(
+                out,
+                "{} {} {} {:<14} \x1b[2m{} — {}\x1b[0m\r",
+                pointer,
+                tick,
+                mark,
+                truncate(&item.extra.id, 14),
+                truncate(&item.extra.description, description_width),
+                truncate(item.reason, reason_width)
+            )?;
+        }
+
+        let footer = match &self.flash {
+            Some(msg) => format!("\x1b[36m{}\x1b[0m", msg),
+            None => "\x1b[1m[space]\x1b[0m tick  \x1b[1m[enter]\x1b[0m add to review list  \
+                     \x1b[1m[d]\x1b[0m dismiss  \x1b[1m[↑↓]\x1b[0m move  \
+                     \x1b[1m[esc]\x1b[0m back"
+                .to_string(),
+        };
+        write!(
+            out,
+            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
+            height.saturating_sub(1),
+            rule,
+            footer
+        )?;
+        out.flush()
+    }
+
     fn draw_adopt(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
         let a = self.adopt.as_ref().expect("checked by caller");
         let rule = "─".repeat((width as usize).clamp(20, 200));
@@ -2804,6 +3105,7 @@ impl App {
         };
         let context = self.context_suffix();
         let profile = self.profile_suffix();
+        let recommendations = self.recommendation_suffix();
 
         // Showing auto-sync here is the only way a user learns it exists: it has no row of its
         // own, and something that installs software at startup should be visible, not buried.
@@ -2814,7 +3116,7 @@ impl App {
         };
         writeln!(
             out,
-            "\x1b[1m herdr-lazy\x1b[0m  \x1b[2m{} ok · {} to sync · {} unlisted{}{}{}\x1b[0m{}{}{}\r",
+            "\x1b[1m herdr-lazy\x1b[0m  \x1b[2m{} ok · {} to sync · {} unlisted{}{}{}\x1b[0m{}{}{}{}\r",
             ok,
             todo,
             extra,
@@ -2834,7 +3136,8 @@ impl App {
             auto,
             freshness,
             context,
-            profile
+            profile,
+            recommendations
         )?;
         writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
 
@@ -2922,6 +3225,7 @@ impl App {
             ("e", "extras"),
             ("p", "profile"),
             ("w", "starter"),
+            ("n", "recommendations"),
             ("?", "help"),
         ]
         .iter()
@@ -3301,6 +3605,42 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             continue;
         }
 
+        // Agent recommendations are a modal, presentation-only picker. Adding a recommendation
+        // uses the same list-writing path as extras, while dismissing it changes only this view.
+        if app.recommendations.is_some() {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                return Ok(());
+            }
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    app.recommendations = None;
+                    app.flash = None;
+                }
+                KeyCode::Char(' ') => app.recommendations.as_mut().unwrap().toggle(),
+                KeyCode::Enter => app.apply_recommendations(),
+                KeyCode::Char('j') | KeyCode::Char('m')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    app.apply_recommendations()
+                }
+                KeyCode::Char('d') => {
+                    let remaining = app.recommendations.as_mut().unwrap().dismiss();
+                    app.flash = Some("recommendation dismissed for this view".to_string());
+                    if !remaining {
+                        app.recommendations = None;
+                    }
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    app.recommendations.as_mut().unwrap().move_cursor(true)
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    app.recommendations.as_mut().unwrap().move_cursor(false)
+                }
+                _ => {}
+            }
+            continue;
+        }
+
         // The picker is a menu, not a text field, so plain letters can stay commands here —
         // but it is still modal: nothing below may act on the list hidden behind it.
         if app.extras.is_some() {
@@ -3500,6 +3840,7 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             KeyCode::Char('w') => {
                 app.flash = Some(crate::open_starter_pane());
             }
+            KeyCode::Char('n') => app.open_recommendations(),
             KeyCode::Char('?') => app.help = true,
 
             // Keys lazy.nvim has that this does not. Rather than doing nothing — which reads
@@ -4323,6 +4664,75 @@ mod tests {
             malformed.context_suffix(),
             " · workspace context unavailable"
         );
+    }
+
+    #[test]
+    fn focused_agent_recommendations_use_the_curated_extra() {
+        let picker = RecommendationsPicker::new("openai-codex", &[]).expect("Codex is known");
+        assert_eq!(picker.agent.label(), "Codex");
+        assert_eq!(picker.count(), 1);
+        assert_eq!(picker.items[0].extra.id, "worktrunk");
+        assert_eq!(
+            picker.items[0].reason,
+            "Keep each Codex task in an isolated git worktree."
+        );
+        assert!(!picker.items[0].picked);
+    }
+
+    #[test]
+    fn listed_recommendations_are_marked_but_not_selected() {
+        let listed = crate::extras::find("worktrunk")
+            .expect("worktrunk is registered")
+            .plugins;
+        let picker = RecommendationsPicker::new("codex", &listed).expect("Codex is known");
+        assert!(picker.items[0].listed);
+        assert!(
+            !picker.items[0].picked,
+            "listed does not mean install-selected"
+        );
+    }
+
+    #[test]
+    fn dismissing_a_recommendation_is_bounded_and_session_local() {
+        let mut picker = RecommendationsPicker::new("muse", &[]).expect("Muse is known");
+        assert!(!picker.dismiss());
+        assert_eq!(picker.count(), 0);
+        assert_eq!(picker.cursor, 0);
+    }
+
+    #[test]
+    fn recommendation_view_explains_the_reason_and_explicit_install_step() {
+        let app = App {
+            recommendations: RecommendationsPicker::new("codex", &[]),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        app.draw_recommendations(&mut buf, 100, 24).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("agent recommendations"));
+        assert!(out.contains("Codex"));
+        assert!(out.contains("worktrunk"));
+        assert!(out.contains("Keep each Codex task"));
+        assert!(out.contains("Nothing installs until you use [i]."));
+    }
+
+    #[test]
+    fn recommendations_require_known_focused_agent_context() {
+        let mut app = App::default();
+        assert_eq!(app.recommendation_suffix(), "");
+
+        app.workspace_context = Some(crate::context::PluginContext {
+            focused_pane_agent: Some("third-party-agent".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(app.recommendation_suffix(), "");
+
+        app.workspace_context = Some(crate::context::PluginContext {
+            focused_pane_agent: Some("claude-code".to_string()),
+            ..Default::default()
+        });
+        assert!(app.recommendation_suffix().contains("[n] 1 recommendation"));
+        assert!(app.recommendation_suffix().contains("Claude Code"));
     }
 
     #[test]

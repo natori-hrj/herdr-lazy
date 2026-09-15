@@ -33,6 +33,9 @@ lockfile records.
 - **A workspace-aware manage pane.** When Herdr opens it in a workspace, the header identifies
   that workspace and its working directory. Worktree create/open events leave a small,
   workspace-matched hint, without changing the plugin list or installed state.
+- **Agent-aware recommendations.** When Herdr supplies a known focused agent, `n` shows a curated
+  extra with the reason it fits. Recommendations stay separate from the default bundle and are
+  added to the list for review; they never install or enable anything automatically.
 - **Workspace-scoped profiles.** Put an optional `.herdr-lazy/plugins.list` in a project to
   review project-specific plugins with `p`. Syncing writes `.herdr-lazy/plugins.lock` and leaves
   the global list alone; merging into the global list is a separate, confirmed action.
@@ -159,6 +162,18 @@ When Herdr opens the manage pane, herdr-lazy reads the point-in-time
 `HERDR_PLUGIN_CONTEXT_JSON` snapshot and shows the workspace label, cwd, worktree branch, and
 focused agent when Herdr provides them. The context is a label for the pane, not a second plugin
 configuration: a missing context leaves the pane behaving as before.
+
+#### Agent-aware recommendations
+
+If Herdr provides a focused `Codex`, `Claude Code`, or `Muse` agent, the header offers `n`. The
+picker explains why each curated extra is relevant and keeps it separate from the default bundle.
+`Enter` adds the highlighted recommendation to the existing plugin list for review; it does not
+install or enable anything. Use the normal `i` action when you explicitly want to install the
+newly listed rows. `d` dismisses a recommendation for the current view only.
+
+The current mapping is deliberately small and inspectable: Codex and Claude Code recommend
+`worktrunk`, while Muse recommends `pluck`. Missing or unknown agent context leaves the
+marketplace and normal list unchanged.
 
 If the current workspace has `.herdr-lazy/plugins.list`, the header shows a project profile and
 `p` opens a reviewable diff against the global selection. The profile is read only from that
