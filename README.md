@@ -175,6 +175,20 @@ The current mapping is deliberately small and inspectable: Codex and Claude Code
 `worktrunk`, while Muse recommends `pluck`. Missing or unknown agent context leaves the
 marketplace and normal list unchanged.
 
+#### Machine health
+
+Press `m` in the manage pane to inspect plugin health for the local machine and saved SSH
+machines. Select a target with `j`/`k`, press `Enter` to inspect it, and use `i` or `u` only
+after the confirmation screen names the exact target. The view shows connection state, Herdr
+version and compatibility, missing/drifted/disabled plugins, cached update candidates, and the
+latest known sync result.
+
+The view is read-only until that confirmation. A disconnected machine is shown as unavailable;
+it is never interpreted as a reason to remove or change local plugins. Herdr versions without
+machine-scoped command forwarding keep the existing local-only view. The remote `sync` and
+`update` actions are invoked for one saved machine at a time, and an unavailable action is
+reported without falling back to a local operation.
+
 If the current workspace has `.herdr-lazy/plugins.list`, the header shows a project profile and
 `p` opens a reviewable diff against the global selection. The profile is read only from that
 exact workspace root; herdr-lazy does not search parent directories or use an unrelated shell

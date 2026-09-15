@@ -27,6 +27,7 @@ mod context;
 mod extras;
 mod github;
 mod json;
+mod machine;
 mod profile;
 mod recommendations;
 mod registry;
@@ -452,13 +453,20 @@ fn ensure_parent(p: &Path) -> io::Result<()> {
 }
 
 /// Run a herdr subcommand, returning (success, stdout, stderr).
-fn run_herdr(args: &[&str]) -> io::Result<(bool, String, String)> {
+pub(crate) fn run_herdr(args: &[&str]) -> io::Result<(bool, String, String)> {
     let out = Command::new(herdr_bin()).args(args).output()?;
     Ok((
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).to_string(),
         String::from_utf8_lossy(&out.stderr).to_string(),
     ))
+}
+
+/// Owned-argument counterpart used by machine forwarding, where the profile id comes from
+/// JSON and has to be kept as one argument rather than interpolated into a shell command.
+pub(crate) fn run_herdr_owned(args: &[String]) -> io::Result<(bool, String, String)> {
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_herdr(&refs)
 }
 
 /// The three numeric components herdr uses for its compatibility floor.
@@ -811,7 +819,7 @@ fn collect_strings(v: &json::Value, out: &mut Vec<String>) {
     }
 }
 
-fn parse_plugin_list(stdout: &str) -> Result<Vec<Installed>, String> {
+pub(crate) fn parse_plugin_list(stdout: &str) -> Result<Vec<Installed>, String> {
     let v = json::parse(stdout.trim()).map_err(|e| format!("could not parse JSON: {}", e))?;
     let plugins = v
         .path(&["result", "plugins"])
