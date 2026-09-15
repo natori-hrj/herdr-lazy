@@ -283,6 +283,190 @@ impl LogView {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MachineAction {
+    Sync,
+    Update,
+}
+
+impl MachineAction {
+    fn label(self) -> &'static str {
+        match self {
+            MachineAction::Sync => "sync",
+            MachineAction::Update => "update",
+        }
+    }
+
+    fn action_base(self) -> &'static str {
+        match self {
+            MachineAction::Sync => "sync",
+            MachineAction::Update => "update",
+        }
+    }
+}
+
+struct MachineEntry {
+    health: crate::machine::MachineHealth,
+    rows: Vec<Row>,
+}
+
+/// The machine picker and its per-machine health view. The picker owns the rows so opening a
+/// saved machine never changes the local list behind it, and a disconnected profile cannot
+/// accidentally turn into a list of "missing" plugins.
+struct MachineView {
+    entries: Vec<MachineEntry>,
+    cursor: usize,
+    detail_of: Option<usize>,
+    plugin_cursor: usize,
+    notice: Option<String>,
+}
+
+const MACHINE_LIST_TOP: usize = 3;
+const MACHINE_DETAIL_TOP: usize = 7;
+
+impl MachineView {
+    fn new(
+        collection: crate::machine::MachineCollection,
+        desired: &[Spec],
+        market: &[crate::registry::Entry],
+    ) -> Self {
+        let entries = collection
+            .machines
+            .into_iter()
+            .map(|health| {
+                let rows = if health.plugin_list_available {
+                    rows_with_herdr_version(
+                        desired,
+                        &health.installed,
+                        market,
+                        health.herdr_version,
+                    )
+                } else {
+                    Vec::new()
+                };
+                MachineEntry { health, rows }
+            })
+            .collect();
+        Self {
+            entries,
+            cursor: 0,
+            detail_of: None,
+            plugin_cursor: 0,
+            notice: collection.notice,
+        }
+    }
+
+    fn selected_index(&self) -> usize {
+        self.detail_of.unwrap_or(self.cursor)
+    }
+
+    fn move_machine(&mut self, down: bool) {
+        if down {
+            if self.cursor + 1 < self.entries.len() {
+                self.cursor += 1;
+            }
+        } else {
+            self.cursor = self.cursor.saturating_sub(1);
+        }
+    }
+
+    fn open_selected(&mut self) {
+        if self.entries.is_empty() {
+            return;
+        }
+        self.detail_of = Some(self.cursor);
+        self.plugin_cursor = 0;
+    }
+
+    fn move_plugin(&mut self, down: bool) {
+        let Some(index) = self.detail_of else {
+            return;
+        };
+        let Some(entry) = self.entries.get(index) else {
+            return;
+        };
+        if down {
+            if self.plugin_cursor + 1 < entry.rows.len() {
+                self.plugin_cursor += 1;
+            }
+        } else {
+            self.plugin_cursor = self.plugin_cursor.saturating_sub(1);
+        }
+    }
+
+    fn plugin_window(&self, height: u16) -> (usize, usize) {
+        let visible = (height as usize)
+            .saturating_sub(MACHINE_DETAIL_TOP + 3)
+            .max(1);
+        let start = if self.plugin_cursor >= visible {
+            self.plugin_cursor - visible + 1
+        } else {
+            0
+        };
+        (visible, start)
+    }
+}
+
+fn machine_target(entry: &MachineEntry) -> String {
+    match entry.health.profile.as_ref() {
+        None => "local machine".to_string(),
+        Some(profile) => format!("{} ({})", profile.label, profile.target),
+    }
+}
+
+fn machine_connection_label(
+    connection: crate::machine::MachineConnection,
+) -> (&'static str, &'static str) {
+    match connection {
+        crate::machine::MachineConnection::Local => ("local", "32"),
+        crate::machine::MachineConnection::Connected => ("connected", "32"),
+        crate::machine::MachineConnection::Disconnected => ("disconnected", "31"),
+        crate::machine::MachineConnection::Incompatible => ("incompatible", "33"),
+        crate::machine::MachineConnection::Disabled => ("disabled", "36"),
+    }
+}
+
+fn machine_summary(entry: &MachineEntry) -> String {
+    if !entry.health.plugin_list_available {
+        return "plugin health unavailable".to_string();
+    }
+    if entry.rows.is_empty() {
+        return "no plugins".to_string();
+    }
+
+    let count =
+        |predicate: fn(&Row) -> bool| entry.rows.iter().filter(|row| predicate(row)).count();
+    let ok = count(|row| row.status == Status::Ok && row.herdr_warning.is_none());
+    let missing = count(|row| row.status == Status::Missing);
+    let drifted = count(|row| matches!(row.status, Status::Drifted { .. }));
+    let disabled = count(|row| row.status == Status::Disabled);
+    let updates = count(|row| row.maybe_stale);
+    let mut parts = vec![format!("{} ok", ok)];
+    if missing > 0 {
+        parts.push(format!("{} missing", missing));
+    }
+    if drifted > 0 {
+        parts.push(format!("{} drifted", drifted));
+    }
+    if disabled > 0 {
+        parts.push(format!("{} disabled", disabled));
+    }
+    if updates > 0 {
+        parts.push(format!("{} updates", updates));
+    }
+    parts.join(" · ")
+}
+
+fn sync_result_text(result: Option<&crate::machine::SyncResult>) -> String {
+    let Some(result) = result else {
+        return "no record".to_string();
+    };
+    match result.detail.as_deref() {
+        Some(detail) => format!("{} — {}", result.status, detail),
+        None => result.status.clone(),
+    }
+}
+
 /// Remove terminal controls before plugin output is written into the manage pane.
 ///
 /// Plugin commands are user code, so their logs must not be allowed to move the cursor or
@@ -967,6 +1151,11 @@ struct App {
     /// Recent command logs for the selected plugin. This is a modal overlay so the list/detail
     /// cursor remains where the user left it when they go back.
     log_view: Option<LogView>,
+    /// Machine health is a separate modal: its rows are snapshots for the selected local or
+    /// saved SSH target, never the local list's mutable selection.
+    machine_view: Option<MachineView>,
+    /// An operation is held until the confirmation screen names the exact target.
+    pending_machine: Option<(usize, MachineAction)>,
     /// Set while waiting for the letter to bind an action to.
     awaiting_bind: bool,
     /// `(action_id, key)` chosen but not yet written, while the user confirms.
@@ -1035,6 +1224,8 @@ impl App {
                 detail_cursor: 0,
                 detail_changes: None,
                 log_view: None,
+                machine_view: None,
+                pending_machine: None,
                 awaiting_bind: false,
                 pending_bind: None,
                 cursor: 0,
@@ -1059,6 +1250,8 @@ impl App {
                 detail_cursor: 0,
                 detail_changes: None,
                 log_view: None,
+                machine_view: None,
+                pending_machine: None,
                 awaiting_bind: false,
                 pending_bind: None,
                 cursor: 0,
@@ -1090,6 +1283,158 @@ impl App {
         self.log_view = logs;
         self.cursor = cursor.min(self.rows.len().saturating_sub(1));
         self.flash = flash;
+    }
+
+    /// Open a read-only snapshot of the local machine and any saved SSH profiles. The local
+    /// list remains the source for the ordinary pane; this view owns its own rows so a remote
+    /// failure cannot turn into local missing-plugin state.
+    fn open_machine_view(&mut self) {
+        let installed = match installed_plugins() {
+            Ok(installed) => installed,
+            Err(error) => {
+                self.flash = Some(format!("could not read machine health: {}", error));
+                return;
+            }
+        };
+        let desired: Vec<Spec> = crate::desired_plugins()
+            .iter()
+            .map(|line| Spec::parse(line))
+            .collect();
+        let market = crate::registry::cached_entries();
+        let collection =
+            crate::machine::collect_machine_health(&installed, current_herdr_version());
+        self.machine_view = Some(MachineView::new(collection, &desired, &market));
+        self.pending_machine = None;
+        self.flash = None;
+    }
+
+    fn reload_machine_view(&mut self) {
+        self.machine_view = None;
+        self.open_machine_view();
+        if self.machine_view.is_some() {
+            self.flash = Some("re-read local and saved-machine status".to_string());
+        }
+    }
+
+    fn request_machine_action(&mut self, action: MachineAction) {
+        let Some(view) = self.machine_view.as_ref() else {
+            return;
+        };
+        let index = view.selected_index();
+        let Some(entry) = view.entries.get(index) else {
+            return;
+        };
+        match entry.health.connection {
+            crate::machine::MachineConnection::Local
+            | crate::machine::MachineConnection::Connected => {}
+            crate::machine::MachineConnection::Disconnected => {
+                self.flash = Some(format!(
+                    "{} is disconnected — no operation was sent",
+                    machine_target(entry)
+                ));
+                return;
+            }
+            crate::machine::MachineConnection::Incompatible => {
+                self.flash = Some(format!(
+                    "{} is incompatible — no operation was sent",
+                    machine_target(entry)
+                ));
+                return;
+            }
+            crate::machine::MachineConnection::Disabled => {
+                self.flash = Some(format!(
+                    "{} is disabled — no operation was sent",
+                    machine_target(entry)
+                ));
+                return;
+            }
+        }
+
+        if entry.health.profile.is_some()
+            && entry
+                .health
+                .installed
+                .iter()
+                .find(|plugin| plugin.plugin_id == crate::PLUGIN_ID)
+                .is_some_and(|plugin| !plugin.enabled)
+        {
+            self.flash = Some(format!(
+                "herdr-lazy is disabled on {} — no operation was sent",
+                machine_target(entry)
+            ));
+            return;
+        }
+
+        if entry.health.profile.is_some()
+            && crate::machine::action_for(&entry.health.action_ids, action.action_base()).is_none()
+        {
+            self.flash = Some(format!(
+                "{} action is unavailable on {} — update herdr-lazy on that machine first",
+                action.label(),
+                machine_target(entry)
+            ));
+            return;
+        }
+        self.pending_machine = Some((index, action));
+    }
+
+    /// Run only the profile named by the confirmation screen. Remote actions are invoked through
+    /// Herdr's machine dispatcher; they are never emulated by changing local plugin files.
+    fn commit_machine_action(&mut self) -> io::Result<()> {
+        let Some((index, action)) = self.pending_machine.take() else {
+            return Ok(());
+        };
+        let Some(view) = self.machine_view.as_ref() else {
+            self.flash = Some("machine view is no longer open".to_string());
+            return Ok(());
+        };
+        let Some(entry) = view.entries.get(index) else {
+            self.flash = Some("selected machine is no longer available".to_string());
+            return Ok(());
+        };
+        let target = machine_target(entry);
+        let profile = entry.health.profile.clone();
+        let action_id = profile.as_ref().and_then(|_| {
+            crate::machine::action_for(&entry.health.action_ids, action.action_base())
+        });
+
+        self.machine_view = None;
+        let mut outcome: Option<Result<(), String>> = None;
+        suspended(|| {
+            outcome = Some(match profile {
+                None => match action {
+                    MachineAction::Sync => crate::cmd_sync(false, &[])
+                        .map_err(|error| format!("could not sync: {}", error)),
+                    MachineAction::Update => crate::cmd_update(&[])
+                        .map_err(|error| format!("could not update: {}", error)),
+                },
+                Some(profile) => match action_id {
+                    Some(action_id) => {
+                        match crate::machine::invoke_machine_action(&profile.id, &action_id) {
+                            Ok(output) => {
+                                let output = truncate_log_output(&sanitize_log_output(&output));
+                                if !output.trim().is_empty() {
+                                    println!("{}", output);
+                                }
+                                Ok(())
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    None => Err("machine action is no longer available".to_string()),
+                },
+            });
+        })?;
+        let outcome = outcome.unwrap_or_else(|| Err("operation did not run".to_string()));
+
+        // Re-read after returning to the pane. Herdr action invocation is asynchronous, so this
+        // may still show `running`; the log result remains visible and can be refreshed with r.
+        self.open_machine_view();
+        self.flash = Some(match outcome {
+            Ok(()) => format!("{} started on {}", action.label(), target),
+            Err(error) => format!("{} failed on {}: {}", action.label(), target, error),
+        });
+        Ok(())
     }
 
     fn selected(&self) -> Option<&Row> {
@@ -1692,6 +2037,49 @@ impl App {
     fn handle_mouse(&mut self, m: crossterm::event::MouseEvent, height: u16) -> io::Result<()> {
         use crossterm::event::{MouseButton, MouseEventKind};
 
+        // The machine view is modal. A click can select or scroll its read-only rows, but it
+        // cannot run an operation or tick a hidden local row.
+        if self.pending_machine.is_some() {
+            return Ok(());
+        }
+        if let Some(view) = self.machine_view.as_mut() {
+            match m.kind {
+                MouseEventKind::ScrollDown => {
+                    if view.detail_of.is_some() {
+                        view.move_plugin(true);
+                    } else {
+                        view.move_machine(true);
+                    }
+                }
+                MouseEventKind::ScrollUp => {
+                    if view.detail_of.is_some() {
+                        view.move_plugin(false);
+                    } else {
+                        view.move_machine(false);
+                    }
+                }
+                MouseEventKind::Down(MouseButton::Left) if view.detail_of.is_none() => {
+                    let visible = (height as usize)
+                        .saturating_sub(MACHINE_LIST_TOP + 3)
+                        .max(1);
+                    let start = if view.cursor >= visible {
+                        view.cursor - visible + 1
+                    } else {
+                        0
+                    };
+                    let y = m.row as usize;
+                    if y >= MACHINE_LIST_TOP {
+                        let index = start + y - MACHINE_LIST_TOP;
+                        if y - MACHINE_LIST_TOP < visible && index < view.entries.len() {
+                            view.cursor = index;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
         // The browser is a search field; scrolling it is useful, clicking rows less so, and
         // there is no safe "act" gesture while a query is being typed.
         if let Some(b) = self.browser.as_mut() {
@@ -2131,6 +2519,9 @@ impl App {
         if self.pending_profile.is_some() {
             return self.draw_profile_confirm(out, width, height);
         }
+        if self.pending_machine.is_some() {
+            return self.draw_machine_confirm(out, width, height);
+        }
         if self.log_view.is_some() {
             return self.draw_logs(out, width, height);
         }
@@ -2151,6 +2542,9 @@ impl App {
         }
         if self.profile_open {
             return self.draw_profile(out, width, height);
+        }
+        if self.machine_view.is_some() {
+            return self.draw_machines(out, width, height);
         }
         self.draw_list(out, width, height)
     }
@@ -2740,6 +3134,10 @@ impl App {
                     "n",
                     "show recommendations for the focused agent — add to the review list only",
                 ),
+                (
+                    "m",
+                    "inspect plugin health on the local and saved SSH machines",
+                ),
             ],
         )?;
         section(
@@ -3074,6 +3472,283 @@ impl App {
         out.flush()
     }
 
+    /// Show the machine picker or the selected machine's plugin health snapshot.
+    fn draw_machines(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        let view = self.machine_view.as_ref().expect("checked by caller");
+        if view.detail_of.is_some() {
+            return self.draw_machine_detail(out, width, height);
+        }
+
+        let rule = "─".repeat((width as usize).clamp(20, 200));
+        let selected = view
+            .entries
+            .get(view.cursor)
+            .map(machine_target)
+            .unwrap_or_else(|| "none".to_string());
+        write!(out, "\x1b[H\x1b[2J")?;
+        writeln!(
+            out,
+            "\x1b[1m machine health\x1b[0m  \x1b[2m{} target(s) · selected: {}\x1b[0m\r",
+            view.entries.len(),
+            truncate(&selected, width.saturating_sub(32) as usize)
+        )?;
+        writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
+        writeln!(
+            out,
+            " {}\r",
+            view.notice
+                .as_deref()
+                .map(|notice| format!("\x1b[33m{}\x1b[0m", notice))
+                .unwrap_or_else(|| {
+                    "\x1b[2mread-only status; Enter inspects the selected target\x1b[0m".to_string()
+                })
+        )?;
+
+        let visible = (height as usize)
+            .saturating_sub(MACHINE_LIST_TOP + 3)
+            .max(1);
+        let start = if view.cursor >= visible {
+            view.cursor - visible + 1
+        } else {
+            0
+        };
+        for (index, entry) in view.entries.iter().enumerate().skip(start).take(visible) {
+            let pointer = if index == view.cursor {
+                "\x1b[7m>"
+            } else {
+                " "
+            };
+            let (state, colour) = machine_connection_label(entry.health.connection);
+            let version = entry
+                .health
+                .herdr_version
+                .map(|version| version.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            let compatibility = match entry.health.compatible {
+                Some(true) => "compat ok",
+                Some(false) => "incompatible",
+                None => "compat ?",
+            };
+            let summary = machine_summary(entry);
+            let label = machine_target(entry);
+            writeln!(
+                out,
+                "{}\x1b[0m {:<30} \x1b[{}m{:<13}\x1b[0m herdr {:<7} {:<12} \x1b[2m{}\x1b[0m\r",
+                pointer,
+                truncate(&label, 30),
+                colour,
+                state,
+                version,
+                compatibility,
+                truncate(&summary, width.saturating_sub(78) as usize)
+            )?;
+        }
+
+        let footer = match &self.flash {
+            Some(message) => format!("\x1b[36m{}\x1b[0m", message),
+            None => "\x1b[1m[enter]\x1b[0m inspect  \x1b[1m[j/k]\x1b[0m target  \
+                     \x1b[1m[r]\x1b[0m refresh  \x1b[1m[esc/q]\x1b[0m back"
+                .to_string(),
+        };
+        write!(
+            out,
+            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
+            height.saturating_sub(1),
+            rule,
+            footer
+        )?;
+        out.flush()
+    }
+
+    fn draw_machine_detail(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        let view = self.machine_view.as_ref().expect("checked by caller");
+        let index = view.detail_of.expect("detail view has a target");
+        let Some(entry) = view.entries.get(index) else {
+            return Ok(());
+        };
+        let rule = "─".repeat((width as usize).clamp(20, 200));
+        let (state, colour) = machine_connection_label(entry.health.connection);
+        let version = entry
+            .health
+            .herdr_version
+            .map(|version| version.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let compatibility = match entry.health.compatible {
+            Some(true) => "yes",
+            Some(false) => "no",
+            None => "unknown",
+        };
+
+        write!(out, "\x1b[H\x1b[2J")?;
+        writeln!(
+            out,
+            "\x1b[1m machine / {}\x1b[0m  \x1b[{}m{}\x1b[0m\r",
+            truncate(&machine_target(entry), width.saturating_sub(28) as usize),
+            colour,
+            state
+        )?;
+        if let Some(profile) = entry.health.profile.as_ref() {
+            writeln!(
+                out,
+                " target: {}  · session: {}  · id: {}\r",
+                truncate(&profile.target, width.saturating_sub(45) as usize),
+                truncate(&profile.session, 20),
+                truncate(&profile.id, 36)
+            )?;
+        } else {
+            writeln!(out, " target: local machine\r")?;
+        }
+        writeln!(
+            out,
+            " Herdr: {}  · compatible: {}\r",
+            version, compatibility
+        )?;
+        writeln!(
+            out,
+            " last sync: {}\r",
+            sync_result_text(entry.health.last_sync.as_ref())
+        )?;
+        if let Some(error) = entry.health.error.as_deref() {
+            writeln!(
+                out,
+                " \x1b[33mnote:\x1b[0m {}\r",
+                truncate(error, width.saturating_sub(10) as usize)
+            )?;
+        } else {
+            writeln!(out, "\r")?;
+        }
+        writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
+        writeln!(
+            out,
+            " \x1b[1mplugin health\x1b[0m  \x1b[2m{}\x1b[0m\r",
+            machine_summary(entry)
+        )?;
+
+        if !entry.health.plugin_list_available {
+            writeln!(
+                out,
+                " \x1b[31mplugin state unavailable for this target\x1b[0m\r"
+            )?;
+            writeln!(
+                out,
+                " \x1b[2mNo missing-plugin conclusions or local changes were made.\x1b[0m\r"
+            )?;
+        } else if entry.rows.is_empty() {
+            writeln!(out, " \x1b[2mno plugin entries reported\x1b[0m\r")?;
+        } else {
+            let (visible, start) = view.plugin_window(height);
+            for (row_index, row) in entry.rows.iter().enumerate().skip(start).take(visible) {
+                let pointer = if row_index == view.plugin_cursor {
+                    "\x1b[7m>"
+                } else {
+                    " "
+                };
+                let commit = row
+                    .commit
+                    .as_deref()
+                    .map(crate::short)
+                    .unwrap_or_else(|| "-".to_string());
+                let note = row.trailing_text();
+                let trailing_width = (width as usize).saturating_sub(66);
+                writeln!(
+                    out,
+                    "{}\x1b[0m {}{}\x1b[0m {:<44} \x1b[2m{:<12}\x1b[0m {}\r",
+                    pointer,
+                    row.colour(),
+                    row.marker(),
+                    truncate(&row.label, 44),
+                    commit,
+                    truncate(&note, trailing_width)
+                )?;
+            }
+        }
+
+        let footer = match &self.flash {
+            Some(message) => format!("\x1b[36m{}\x1b[0m", message),
+            None => "\x1b[1m[i]\x1b[0m sync this target  \x1b[1m[u]\x1b[0m update this target  \
+                     \x1b[1m[r]\x1b[0m refresh  \x1b[1m[esc/q]\x1b[0m back"
+                .to_string(),
+        };
+        write!(
+            out,
+            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
+            height.saturating_sub(1),
+            rule,
+            footer
+        )?;
+        out.flush()
+    }
+
+    fn draw_machine_confirm(
+        &self,
+        out: &mut impl Write,
+        width: u16,
+        height: u16,
+    ) -> io::Result<()> {
+        let view = self
+            .machine_view
+            .as_ref()
+            .expect("machine action has a view");
+        let (index, action) = self.pending_machine.expect("checked by caller");
+        let Some(entry) = view.entries.get(index) else {
+            return Ok(());
+        };
+        let rule = "─".repeat((width as usize).clamp(20, 200));
+        let preview = machine_summary(entry);
+
+        write!(out, "\x1b[H\x1b[2J")?;
+        writeln!(
+            out,
+            "\x1b[1m machine {}\x1b[0m  \x1b[33mconfirm\x1b[0m\r",
+            action.label()
+        )?;
+        writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
+        writeln!(
+            out,
+            " target: \x1b[1m{}\x1b[0m\r",
+            truncate(&machine_target(entry), width.saturating_sub(10) as usize)
+        )?;
+        if let Some(profile) = entry.health.profile.as_ref() {
+            writeln!(
+                out,
+                " ssh target: {}  · session: {}\r",
+                truncate(&profile.target, width.saturating_sub(28) as usize),
+                truncate(&profile.session, 20)
+            )?;
+        }
+        writeln!(out, "\r")?;
+        writeln!(
+            out,
+            " This will {} the declared plugin set on exactly this target.",
+            action.label()
+        )?;
+        writeln!(
+            out,
+            " Preview: {}.",
+            truncate(&preview, width.saturating_sub(11) as usize)
+        )?;
+        writeln!(out, " No other machine will be contacted or changed.")?;
+        if action == MachineAction::Update {
+            writeln!(
+                out,
+                " Update skips entries pinned to a commit, tag, or branch."
+            )?;
+        }
+        writeln!(out, "\r")?;
+        writeln!(
+            out,
+            " \x1b[2mDisconnected or incompatible targets cannot reach this screen.\x1b[0m\r"
+        )?;
+        write!(
+            out,
+            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m\x1b[1m[y]\x1b[0m run on this target  \
+             \x1b[1m[n / esc]\x1b[0m cancel\r",
+            height.saturating_sub(1),
+            rule
+        )?;
+        out.flush()
+    }
+
     fn draw_list(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
         // Rules span the pane. A fixed width looked deliberate at 80 columns and plainly
         // broken at 140, where the list ran well past the line meant to underline it.
@@ -3224,6 +3899,7 @@ impl App {
             ("/", "search"),
             ("e", "extras"),
             ("p", "profile"),
+            ("m", "machines"),
             ("w", "starter"),
             ("n", "recommendations"),
             ("?", "help"),
@@ -3447,6 +4123,22 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             continue;
         }
 
+        // Machine operations are confirmation-first too. The target index is captured when the
+        // request is made, so the confirmation cannot drift to another profile.
+        if app.pending_machine.is_some() {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                return Ok(());
+            }
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => app.commit_machine_action()?,
+                _ => {
+                    app.pending_machine = None;
+                    app.flash = Some("machine action cancelled".to_string());
+                }
+            }
+            continue;
+        }
+
         if app.log_view.is_some() {
             if key.modifiers.contains(KeyModifiers::CONTROL) {
                 if key.code == KeyCode::Char('c') {
@@ -3476,6 +4168,84 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                 KeyCode::Char('g') | KeyCode::Home => app.seek_logs(false, visible, width),
                 KeyCode::Char('G') | KeyCode::End => app.seek_logs(true, visible, width),
                 KeyCode::Char('r') => app.reload_logs(),
+                _ => {}
+            }
+            continue;
+        }
+
+        if app.machine_view.is_some() {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                match key.code {
+                    KeyCode::Char('c') => return Ok(()),
+                    KeyCode::Char('r') => app.reload_machine_view(),
+                    _ => {}
+                }
+                continue;
+            }
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                continue;
+            }
+
+            let detail = app
+                .machine_view
+                .as_ref()
+                .and_then(|view| view.detail_of)
+                .is_some();
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    if detail {
+                        if let Some(view) = app.machine_view.as_mut() {
+                            view.detail_of = None;
+                            view.plugin_cursor = 0;
+                        }
+                        app.flash = None;
+                    } else {
+                        app.machine_view = None;
+                        app.flash = None;
+                    }
+                }
+                KeyCode::Enter if !detail => {
+                    app.machine_view.as_mut().unwrap().open_selected();
+                    app.flash = None;
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if detail {
+                        app.machine_view.as_mut().unwrap().move_plugin(true);
+                    } else {
+                        app.machine_view.as_mut().unwrap().move_machine(true);
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    if detail {
+                        app.machine_view.as_mut().unwrap().move_plugin(false);
+                    } else {
+                        app.machine_view.as_mut().unwrap().move_machine(false);
+                    }
+                }
+                KeyCode::Char('g') | KeyCode::Home => {
+                    if detail {
+                        app.machine_view.as_mut().unwrap().plugin_cursor = 0;
+                    } else {
+                        app.machine_view.as_mut().unwrap().cursor = 0;
+                    }
+                }
+                KeyCode::Char('G') | KeyCode::End => {
+                    if let Some(view) = app.machine_view.as_mut() {
+                        if detail {
+                            view.plugin_cursor = view
+                                .entries
+                                .get(view.selected_index())
+                                .map(|entry| entry.rows.len().saturating_sub(1))
+                                .unwrap_or(0);
+                        } else {
+                            view.cursor = view.entries.len().saturating_sub(1);
+                        }
+                    }
+                }
+                KeyCode::Char('i') if detail => app.request_machine_action(MachineAction::Sync),
+                KeyCode::Char('u') if detail => app.request_machine_action(MachineAction::Update),
+                KeyCode::Char('r') => app.reload_machine_view(),
+                KeyCode::Char('?') => app.help = true,
                 _ => {}
             }
             continue;
@@ -3837,6 +4607,7 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             KeyCode::Char('e') => app.open_extras(),
             KeyCode::Char('f') => app.open_adopt(),
             KeyCode::Char('p') => app.open_profile(),
+            KeyCode::Char('m') => app.open_machine_view(),
             KeyCode::Char('w') => {
                 app.flash = Some(crate::open_starter_pane());
             }
@@ -4957,5 +5728,159 @@ mod tests {
             assert!(!s.marker().is_empty());
             assert!(s.colour().starts_with("\x1b["));
         }
+    }
+
+    fn saved_machine_profile() -> crate::machine::MachineProfile {
+        crate::machine::MachineProfile {
+            id: "0123456789abcdef0123456789abcdef".to_string(),
+            label: "Build machine".to_string(),
+            target: "dev@example.com".to_string(),
+            session: "default".to_string(),
+            enabled: true,
+        }
+    }
+
+    fn machine_health(
+        profile: Option<crate::machine::MachineProfile>,
+        connection: crate::machine::MachineConnection,
+        plugin_list_available: bool,
+        installed: Vec<Installed>,
+    ) -> crate::machine::MachineHealth {
+        crate::machine::MachineHealth {
+            profile,
+            connection,
+            herdr_version: Some(version("0.9.0")),
+            compatible: match connection {
+                crate::machine::MachineConnection::Incompatible => Some(false),
+                crate::machine::MachineConnection::Disabled
+                | crate::machine::MachineConnection::Disconnected => None,
+                _ => Some(true),
+            },
+            installed,
+            plugin_list_available,
+            action_ids: vec!["sync".to_string(), "update".to_string()],
+            last_sync: Some(crate::machine::SyncResult {
+                status: "succeeded".to_string(),
+                detail: None,
+            }),
+            error: None,
+        }
+    }
+
+    fn machine_view_for_test(
+        connection: crate::machine::MachineConnection,
+        plugin_list_available: bool,
+    ) -> MachineView {
+        let desired = [Spec::parse("owner/repo")];
+        let installed = vec![github("owner", "repo", SHA, true)];
+        MachineView::new(
+            crate::machine::MachineCollection {
+                machines: vec![
+                    machine_health(
+                        None,
+                        crate::machine::MachineConnection::Local,
+                        true,
+                        installed.clone(),
+                    ),
+                    machine_health(
+                        Some(saved_machine_profile()),
+                        connection,
+                        plugin_list_available,
+                        if plugin_list_available {
+                            installed
+                        } else {
+                            Vec::new()
+                        },
+                    ),
+                ],
+                notice: None,
+            },
+            &desired,
+            &[],
+        )
+    }
+
+    #[test]
+    fn machine_picker_shows_saved_target_and_connection_state() {
+        let mut view =
+            machine_view_for_test(crate::machine::MachineConnection::Disconnected, false);
+        view.cursor = 1;
+        let app = App {
+            machine_view: Some(view),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        app.draw_machines(&mut buf, 120, 24).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("machine health"));
+        assert!(output.contains("Build machine"));
+        assert!(output.contains("dev@example.com"));
+        assert!(output.contains("disconnected"));
+        assert!(output.contains("plugin health unavailable"));
+    }
+
+    #[test]
+    fn disconnected_machine_does_not_create_missing_plugin_rows() {
+        let view = machine_view_for_test(crate::machine::MachineConnection::Disconnected, false);
+        assert!(
+            view.entries[1].rows.is_empty(),
+            "a failed read must not be rendered as missing plugins"
+        );
+    }
+
+    #[test]
+    fn machine_confirmation_names_the_exact_target_and_disallows_other_targets() {
+        let mut view = machine_view_for_test(crate::machine::MachineConnection::Connected, true);
+        view.cursor = 1;
+        view.detail_of = Some(1);
+        let app = App {
+            machine_view: Some(view),
+            pending_machine: Some((1, MachineAction::Sync)),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        app.draw(&mut buf, 120, 24).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("Build machine"));
+        assert!(output.contains("dev@example.com"));
+        assert!(output.contains("session: default"));
+        assert!(output.contains("No other machine will be contacted or changed."));
+        assert!(output.contains("[y]"));
+    }
+
+    #[test]
+    fn disconnected_machine_cannot_queue_an_operation() {
+        let mut view =
+            machine_view_for_test(crate::machine::MachineConnection::Disconnected, false);
+        view.cursor = 1;
+        view.detail_of = Some(1);
+        let mut app = App {
+            machine_view: Some(view),
+            ..Default::default()
+        };
+        app.request_machine_action(MachineAction::Sync);
+        assert!(app.pending_machine.is_none());
+        assert!(app
+            .flash
+            .as_deref()
+            .is_some_and(|message| message.contains("disconnected")));
+    }
+
+    #[test]
+    fn unavailable_remote_action_does_not_fall_back_to_a_local_update() {
+        let mut view = machine_view_for_test(crate::machine::MachineConnection::Connected, true);
+        view.detail_of = Some(1);
+        view.entries[1].health.action_ids = vec!["sync".to_string()];
+        let mut app = App {
+            machine_view: Some(view),
+            ..Default::default()
+        };
+
+        app.request_machine_action(MachineAction::Update);
+        assert!(app.pending_machine.is_none());
+        assert!(app
+            .flash
+            .as_deref()
+            .is_some_and(|message| message.contains("update action is unavailable")));
     }
 }
