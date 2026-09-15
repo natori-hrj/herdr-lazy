@@ -36,6 +36,9 @@ lockfile records.
 - **Workspace-scoped profiles.** Put an optional `.herdr-lazy/plugins.list` in a project to
   review project-specific plugins with `p`. Syncing writes `.herdr-lazy/plugins.lock` and leaves
   the global list alone; merging into the global list is a separate, confirmed action.
+- **A workspace starter.** Press `w`, choose `Lazy: start workspace`, or run `starter` to
+  preview a profile/bundle, install or update with separate confirmations, then open only the
+  panes and actions declared by installed plugin manifests.
 - **A list that tells you what each plugin is.** Every installed row shows its own one-line
   description, so you can tell what you have and spot two plugins that do the same thing
   without opening each one.
@@ -142,6 +145,7 @@ herdr-lazy list          # show what the list asks for
 herdr-lazy check         # inspect local state and update hints without changing plugins
 herdr-lazy sync          # install what is missing
 herdr-lazy update        # move unpinned entries to their latest commit
+herdr-lazy starter       # preview and start the current workspace
 herdr-lazy sync --prune  # also uninstall anything not in the list
 
 herdr-lazy extras                    # list the opt-in extras
@@ -173,6 +177,23 @@ The profile view has three explicit actions:
 Discovery is read-only. A missing or malformed profile is shown as an error and cannot fall back
 to an empty list or affect the global configuration.
 
+### Workspace starter
+
+The workspace starter is the repeatable setup path for a project. Press `w` in the manage pane,
+choose `Lazy: start workspace` from Herdr, or run `herdr-lazy starter` from a Herdr workspace.
+When a valid `.herdr-lazy/plugins.list` exists, it is selected; otherwise the starter uses the
+global bundle. A malformed profile is blocked until you explicitly press `b` to use the global
+bundle.
+
+The first screen previews missing entries, pinned drift, disabled plugins, and cached update
+hints. Install/repair and update are separate confirmations. The starter never runs commands
+from a repository profile, never prunes, and never edits the global list. After the state is
+ready, a second screen lets you choose panes and actions. Those choices are re-checked against
+the currently installed, enabled plugin manifests immediately before launch; unavailable or
+changed targets are reported and the remaining safe targets continue. Running the workflow
+again is safe because it only opens declared Herdr targets and does not add duplicate list
+entries.
+
 herdr-lazy also listens for `worktree.created` and `worktree.opened`. Those hooks only save the
 last event under `HERDR_PLUGIN_STATE_DIR`, so the pane can show it when it belongs to the current
 workspace. They do not install, remove, enable, disable, or update anything. An absent or
@@ -195,6 +216,7 @@ herdr-lazy update smarzban/herdr-file-viewer
 | `update [<repo>…]` | re-resolve unpinned entries to their latest commit |
 | `restore [--previous] [<repo>…]` | put plugins back to the commits in the active lockfile, or the newest saved lockfile with `--previous` |
 | `ui` / `manage` | open the manage pane (`/` inside it searches the marketplace) |
+| `starter` | open the confirmation-first workspace starter pane |
 | `add <owner/repo>` | add an entry to the bundle |
 | `remove <owner/repo>` | remove an entry from the bundle |
 | `lock` | write the lockfile from the current bundle |

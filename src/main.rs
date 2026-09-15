@@ -29,6 +29,8 @@ mod github;
 mod json;
 mod profile;
 mod registry;
+mod starter;
+mod starter_ui;
 mod ui;
 
 use std::env;
@@ -91,7 +93,7 @@ fn herdr_bin() -> String {
 }
 
 /// Must match `id` in herdr-plugin.toml — it is how we ask herdr about ourselves.
-const PLUGIN_ID: &str = "herdr-lazy";
+pub(crate) const PLUGIN_ID: &str = "herdr-lazy";
 
 /// Where the bundle and lock live.
 ///
@@ -146,7 +148,7 @@ pub(crate) fn bundle_path() -> PathBuf {
 /// It is generated, but it is also the file you copy to another machine to reproduce a
 /// setup — the same reasoning that puts Cargo.lock next to Cargo.toml. So a dotfiles user who
 /// moved their list into their repo gets the lock there too, both git-managed together.
-fn lock_path() -> PathBuf {
+pub(crate) fn lock_path() -> PathBuf {
     lock_beside(&bundle_path())
 }
 
@@ -639,6 +641,15 @@ fn read_specs(path: &Path) -> io::Result<Vec<Spec>> {
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(|line| Spec::parse(&line))
         .collect())
+}
+
+/// Read the current bundle without the legacy migration performed by `desired_plugins`.
+///
+/// The workspace starter is a review workflow and must not edit the global list merely by
+/// opening it. Commands that intentionally preserve the existing migration behaviour continue
+/// to use `desired_plugins`.
+pub(crate) fn read_bundle_specs() -> io::Result<Vec<Spec>> {
+    read_specs(&bundle_path())
 }
 
 /// Read the configured list, falling back to the pre-config-dir location without migrating it.
@@ -1525,6 +1536,15 @@ pub(crate) fn cmd_sync(prune: bool, targets: &[&str]) -> io::Result<()> {
     converge(&all, targets, prune, true)
 }
 
+/// Converge an explicit selection into its own lockfile.
+///
+/// The workspace starter uses this instead of going through the global bundle path. Keeping the
+/// lock destination an argument makes it impossible for a profile action to accidentally write
+/// the global lockfile.
+pub(crate) fn sync_specs_to_lock(specs: &[Spec], lock_destination: &Path) -> io::Result<()> {
+    converge_to(specs, &[], false, Some(lock_destination))
+}
+
 /// Sync a workspace profile without changing the global list or using the global lockfile.
 ///
 /// Re-read the profile at the moment of action. The pane may have been open while somebody
@@ -2176,6 +2196,55 @@ fn manage_pane_command(installed: &[Installed]) -> String {
         "herdr plugin pane open --plugin {} --entrypoint {} --focus",
         PLUGIN_ID, id
     )
+}
+
+/// The platform-specific entrypoint for the workspace starter pane.
+pub(crate) fn starter_pane_entrypoint() -> String {
+    installed_plugins()
+        .ok()
+        .and_then(|installed| {
+            installed.iter().find(|p| is_self(p)).and_then(|me| {
+                platform_variant(me.panes.iter().map(|(id, _, _)| id.as_str()), "starter")
+            })
+        })
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                "starter-windows".to_string()
+            } else {
+                "starter".to_string()
+            }
+        })
+}
+
+pub(crate) fn starter_pane_hint() -> String {
+    format!(
+        "herdr plugin pane open --plugin {} --entrypoint {} --focus",
+        PLUGIN_ID,
+        starter_pane_entrypoint()
+    )
+}
+
+/// Open the starter from the manage pane. The extra `--focus` makes the result visible even
+/// when Herdr chooses an existing pane for the same entrypoint.
+pub(crate) fn open_starter_pane() -> String {
+    let entrypoint = starter_pane_entrypoint();
+    match run_herdr(&[
+        "plugin",
+        "pane",
+        "open",
+        "--plugin",
+        PLUGIN_ID,
+        "--entrypoint",
+        entrypoint.as_str(),
+        "--focus",
+    ]) {
+        Ok((true, _, _)) => format!("opened {} ({})", entrypoint, PLUGIN_ID),
+        Ok((false, out, err)) => {
+            let msg = if err.trim().is_empty() { out } else { err };
+            format!("could not open {}: {}", entrypoint, msg.trim())
+        }
+        Err(e) => format!("could not run herdr: {}", e),
+    }
 }
 
 /// The same, for a caller that has not already asked herdr what is installed.
@@ -2834,6 +2903,23 @@ pub(crate) fn cmd_update(targets: &[&str]) -> io::Result<()> {
         return Ok(());
     }
 
+    update_specs_to(&desired, targets, &lock_path())
+}
+
+/// Re-resolve selected unpinned entries in an explicit list and write its lockfile.
+///
+/// This is the update counterpart to `sync_specs_to_lock`: the workspace starter can update a
+/// profile without ever consulting or rewriting the global list.
+pub(crate) fn update_specs_to(
+    desired: &[Spec],
+    targets: &[&str],
+    lock_destination: &Path,
+) -> io::Result<()> {
+    if desired.is_empty() {
+        println!("nothing to update.");
+        return Ok(());
+    }
+
     // Restrict to named plugins, if any were given.
     let selected: Vec<&Spec> = if targets.is_empty() {
         desired.iter().collect()
@@ -2927,7 +3013,7 @@ pub(crate) fn cmd_update(targets: &[&str]) -> io::Result<()> {
     );
 
     let after = installed_plugins().unwrap_or(before);
-    write_lock(&desired, &after)?;
+    write_lock_at(lock_destination, desired, &after)?;
     Ok(())
 }
 
@@ -3309,6 +3395,7 @@ fn print_help() {
     println!("  restore [--previous] [<repo>…] put plugins back to a lockfile");
     println!("                    --previous uses the newest saved lockfile");
     println!("  ui                open the manage pane (also `manage`)");
+    println!("  starter           open the workspace starter pane");
     println!("  add <owner/repo>  add a plugin to the bundle");
     println!("  remove <owner/repo>  remove a plugin from the bundle");
     println!("  lock              write the lockfile from the current bundle");
@@ -3346,6 +3433,7 @@ fn main() {
             cmd_sync(rest.contains(&"--prune"), &targets)
         }
         "ui" | "manage" => ui::run(),
+        "starter" => starter_ui::run(),
         "restore" => {
             let previous = rest.contains(&"--previous");
             let targets: Vec<&str> = rest
