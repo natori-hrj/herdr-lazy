@@ -28,6 +28,7 @@ mod extras;
 mod github;
 mod json;
 mod profile;
+mod recommendations;
 mod registry;
 mod starter;
 mod starter_ui;
