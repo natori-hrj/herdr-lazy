@@ -4,6 +4,10 @@
 
 A declarative plugin **manager** and curated **distro** for [herdr](https://herdr.dev).
 
+[![CI](https://github.com/natori-hrj/herdr-lazy/actions/workflows/ci.yml/badge.svg)](https://github.com/natori-hrj/herdr-lazy/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/natori-hrj/herdr-lazy)](https://github.com/natori-hrj/herdr-lazy/releases/latest)
+![Platforms: macOS, Linux, Windows](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-informational)
+
 herdr installs plugins one imperative command at a time. There is no way to declare the
 set you want, and no lockfile — so a working setup cannot be reproduced on another
 machine.
@@ -16,6 +20,40 @@ edits it on single keys — and `sync` makes your machine match it, at the exact
 lockfile records.
 
 ![herdr-lazy: the manage pane, searching the marketplace and adding a plugin](docs/demo.gif)
+
+## Try it in 60 seconds
+
+On a new Herdr setup, install the plugin, restart Herdr, and press `prefix+shift+l` to open the
+manage pane:
+
+```sh
+herdr plugin install natori-hrj/herdr-lazy
+```
+
+The first start writes a list you can review; it does not install the recommended third-party
+plugins without an explicit action. In the pane, press `/` to find a plugin, `Enter` to add it to
+your list, and `i` to install what you selected. Press `?` whenever you want the complete keymap.
+
+If you already have a plugin list or want to open the pane directly:
+
+```sh
+herdr plugin pane open --plugin herdr-lazy --entrypoint manage --focus
+```
+
+On Windows, use the platform entrypoint `manage-windows`. The first-run bootstrap selects the
+right entrypoint automatically.
+
+The short version: the manage pane is the convenient part; `plugins.list` and `plugins.lock` are
+the reproducible part. You can use either independently, and neither requires a new project or a
+second configuration format.
+
+| If you want to… | Use… |
+| --- | --- |
+| Manage installed plugins quickly | the manage pane (`prefix+shift+l`) |
+| Reproduce a setup on another machine | `plugins.list` + `plugins.lock` |
+| Keep project plugins separate | `.herdr-lazy/plugins.list` + `p` |
+| Start a workspace from a reviewed bundle | `starter` or `w` |
+| Inspect local and saved-machine health | `m` in the manage pane |
 
 ## What it gives you
 
