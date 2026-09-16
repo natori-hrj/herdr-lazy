@@ -94,12 +94,69 @@ fn days_from_iso(s: &str) -> Option<i64> {
     Some(era * 146_097 + doe - 719_468)
 }
 
+/// A repository with no push for this long gets a factual "quiet" marker. This is a display
+/// bucket, not a quality score: a small plugin may be finished, and the person still decides
+/// whether the age matters to them.
+pub(crate) const QUIET_AFTER_DAYS: i64 = 180;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MaintenanceStatus {
+    Known { age: String, quiet: bool },
+    Unknown(String),
+}
+
+impl MaintenanceStatus {
+    pub(crate) fn is_quiet(&self) -> bool {
+        matches!(self, Self::Known { quiet: true, .. })
+    }
+
+    pub(crate) fn age(&self) -> Option<&str> {
+        match self {
+            Self::Known { age, .. } => Some(age),
+            Self::Unknown(_) => None,
+        }
+    }
+
+    /// The list only needs to call attention to quiet repositories. Details and reports can
+    /// use `age` when they want the complete fact without making every healthy row noisy.
+    pub(crate) fn quiet_note(&self) -> Option<String> {
+        self.is_quiet().then(|| {
+            format!(
+                "quiet — last pushed {} ago",
+                self.age().unwrap_or("unknown")
+            )
+        })
+    }
+}
+
+/// Number of days between a marketplace push date and today, or None for malformed input.
+pub(crate) fn age_days(pushed_at: &str, today: i64) -> Option<i64> {
+    days_from_iso(pushed_at).map(|then| (today - then).max(0))
+}
+
+/// Classify the marketplace's last-push fact without judging the repository.
+pub(crate) fn maintenance_status(pushed_at: &str, today: i64) -> MaintenanceStatus {
+    let Some(days) = age_days(pushed_at, today) else {
+        return MaintenanceStatus::Unknown(if pushed_at.trim().is_empty() {
+            "last push date is unavailable".to_string()
+        } else {
+            "last push date is invalid".to_string()
+        });
+    };
+    MaintenanceStatus::Known {
+        age: age_label_from_days(days),
+        quiet: days >= QUIET_AFTER_DAYS,
+    }
+}
+
 /// "3d", "2w", "5mo" — how long ago, in as few characters as possible.
 pub(crate) fn age_label(pushed_at: &str, today: i64) -> String {
-    let Some(then) = days_from_iso(pushed_at) else {
-        return String::new();
-    };
-    let days = (today - then).max(0);
+    age_days(pushed_at, today)
+        .map(age_label_from_days)
+        .unwrap_or_default()
+}
+
+fn age_label_from_days(days: i64) -> String {
     // Boundaries chosen so no bucket can render a leading zero: at 28 days `days / 30` is 0,
     // which showed as "0mo" — a label that reads as "never" for something touched last month.
     match days {
@@ -425,6 +482,29 @@ mod tests {
         assert_eq!(ago(30), "1mo");
         assert_eq!(ago(364), "12mo");
         assert_eq!(ago(365), "1y");
+    }
+
+    #[test]
+    fn quiet_is_a_factual_age_bucket_not_a_health_judgement() {
+        let today = days_from_iso("2026-07-21").unwrap();
+        assert_eq!(
+            maintenance_status("2026-01-22T00:00:00Z", today),
+            MaintenanceStatus::Known {
+                age: "6mo".to_string(),
+                quiet: true,
+            }
+        );
+        assert_eq!(
+            maintenance_status("2026-01-23T00:00:00Z", today),
+            MaintenanceStatus::Known {
+                age: "5mo".to_string(),
+                quiet: false,
+            }
+        );
+        assert_eq!(
+            maintenance_status("not a date", today),
+            MaintenanceStatus::Unknown("last push date is invalid".to_string())
+        );
     }
 
     /// A missing or malformed date must render as nothing, not as a wrong age.

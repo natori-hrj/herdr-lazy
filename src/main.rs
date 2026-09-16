@@ -1657,11 +1657,15 @@ struct CheckItem {
     disabled: bool,
     weak_match: bool,
     update: UpdateStatus,
+    maintenance: registry::MaintenanceStatus,
 }
 
 impl CheckItem {
     fn uncertain(&self) -> bool {
-        self.weak_match || self.pin_unverifiable || matches!(self.update, UpdateStatus::Unknown(_))
+        self.weak_match
+            || self.pin_unverifiable
+            || matches!(self.update, UpdateStatus::Unknown(_))
+            || matches!(self.maintenance, registry::MaintenanceStatus::Unknown(_))
     }
 
     fn healthy(&self) -> bool {
@@ -1674,7 +1678,45 @@ impl CheckItem {
                 self.update,
                 UpdateStatus::Current | UpdateStatus::NotApplicable
             )
+            && !matches!(self.maintenance, registry::MaintenanceStatus::Unknown(_))
     }
+}
+
+fn market_entry_for<'a>(
+    spec: &Spec,
+    installed: Option<&Installed>,
+    market: &'a [registry::Entry],
+) -> Option<&'a registry::Entry> {
+    if let Some(slug) = installed.and_then(|plugin| plugin.slug.as_deref()) {
+        return market
+            .iter()
+            .find(|entry| entry.full_name.eq_ignore_ascii_case(slug));
+    }
+
+    let repo = repo_root(&spec.repo);
+    market
+        .iter()
+        .find(|entry| entry.full_name.eq_ignore_ascii_case(&repo))
+}
+
+fn maintenance_status_for(
+    spec: &Spec,
+    installed: Option<&Installed>,
+    market: &[registry::Entry],
+    market_confident: bool,
+    today: i64,
+) -> registry::MaintenanceStatus {
+    if !market_confident {
+        return registry::MaintenanceStatus::Unknown(
+            "marketplace data is stale or unavailable".to_string(),
+        );
+    }
+    let Some(entry) = market_entry_for(spec, installed, market) else {
+        return registry::MaintenanceStatus::Unknown(
+            "repository is not in the marketplace".to_string(),
+        );
+    };
+    registry::maintenance_status(&entry.pushed_at, today)
 }
 
 fn update_status(
@@ -1694,15 +1736,7 @@ fn update_status(
 
     // A strong match is enough to use the bundle's repository as a fallback for source shapes
     // that do not expose a joined slug (for example, a clone URL).
-    let repo = installed
-        .slug
-        .as_deref()
-        .map(str::to_string)
-        .unwrap_or_else(|| repo_root(&spec.repo));
-    let Some(entry) = market
-        .iter()
-        .find(|entry| entry.full_name.eq_ignore_ascii_case(&repo))
-    else {
+    let Some(entry) = market_entry_for(spec, Some(installed), market) else {
         return UpdateStatus::Unknown("repository is not in the marketplace".to_string());
     };
     let Some(installed_at) = installed.installed_unix_ms else {
@@ -1722,6 +1756,22 @@ fn check_items(
     market: &[registry::Entry],
     market_confident: bool,
 ) -> Vec<CheckItem> {
+    check_items_at(
+        desired,
+        installed,
+        market,
+        market_confident,
+        registry::today_days(),
+    )
+}
+
+fn check_items_at(
+    desired: &[Spec],
+    installed: &[Installed],
+    market: &[registry::Entry],
+    market_confident: bool,
+    today: i64,
+) -> Vec<CheckItem> {
     desired
         .iter()
         .map(|spec| {
@@ -1734,6 +1784,13 @@ fn check_items(
                     disabled: false,
                     weak_match: false,
                     update: UpdateStatus::NotApplicable,
+                    maintenance: maintenance_status_for(
+                        spec,
+                        None,
+                        market,
+                        market_confident,
+                        today,
+                    ),
                 };
             };
 
@@ -1762,6 +1819,13 @@ fn check_items(
                 disabled: !plugin.enabled,
                 weak_match: match_kind == Match::Weak,
                 update: update_status(spec, plugin, match_kind, market, market_confident),
+                maintenance: maintenance_status_for(
+                    spec,
+                    Some(plugin),
+                    market,
+                    market_confident,
+                    today,
+                ),
             }
         })
         .collect()
@@ -1796,12 +1860,26 @@ fn print_check_item(item: &CheckItem) {
             }
             UpdateStatus::NotApplicable | UpdateStatus::Current => {}
         }
+
         if findings.is_empty() {
             findings.push(if item.spec.reference.is_some() {
                 "installed and pin is satisfied".to_string()
             } else {
                 "installed and current".to_string()
             });
+        }
+    }
+
+    match &item.maintenance {
+        registry::MaintenanceStatus::Known { age, quiet } => {
+            findings.push(if *quiet {
+                format!("quiet: last pushed {} ago", age)
+            } else {
+                format!("last pushed {} ago", age)
+            });
+        }
+        registry::MaintenanceStatus::Unknown(reason) => {
+            findings.push(format!("maintenance status unknown: {}", reason));
         }
     }
 
@@ -1827,6 +1905,10 @@ fn print_check_report(items: &[CheckItem], market_note: &str, market_confident: 
         .iter()
         .filter(|item| matches!(item.update, UpdateStatus::MaybeAvailable))
         .count();
+    let quiet = items
+        .iter()
+        .filter(|item| item.maintenance.is_quiet())
+        .count();
     let uncertain = items.iter().filter(|item| item.uncertain()).count();
 
     let mut summary = format!("{} plugin(s) · {} healthy", items.len(), healthy);
@@ -1835,6 +1917,7 @@ fn print_check_report(items: &[CheckItem], market_note: &str, market_confident: 
         (drifted, "drifted"),
         (disabled, "disabled"),
         (maybe_updates, "may have updates"),
+        (quiet, "quiet"),
         (uncertain, "uncertain"),
     ] {
         if count > 0 {
@@ -1844,8 +1927,13 @@ fn print_check_report(items: &[CheckItem], market_note: &str, market_confident: 
     println!("{}", summary);
     if market_confident {
         println!("update information: {}", market_note);
+        println!(
+            "maintenance information: quiet means no repository push in {} days (fact only)",
+            registry::QUIET_AFTER_DAYS
+        );
     } else {
         println!("update information: uncertain — {}", market_note);
+        println!("maintenance information: uncertain — {}", market_note);
     }
     for item in items {
         print_check_item(item);
@@ -3764,6 +3852,24 @@ mod tests {
             1,
             "only the enabled, current, strongly matched entry is healthy"
         );
+    }
+
+    #[test]
+    fn quiet_is_reported_without_making_a_current_plugin_unhealthy() {
+        const DAY_MS: u64 = 86_400_000;
+        let desired = vec![Spec::parse("owner/quiet")];
+        let installed = vec![installed_at("owner", "quiet", 10 * DAY_MS)];
+        let market = vec![market_entry("owner/quiet", "1970-01-01T00:00:00Z")];
+
+        let items = check_items_at(&desired, &installed, &market, true, 20_000);
+        assert!(
+            items[0].healthy(),
+            "quiet is not a failure or quality score"
+        );
+        assert!(matches!(
+            items[0].maintenance,
+            registry::MaintenanceStatus::Known { quiet: true, .. }
+        ));
     }
 
     #[test]
