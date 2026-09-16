@@ -118,6 +118,9 @@ struct Row {
     installed: Option<(String, String)>,
     /// Whether herdr currently runs the installed plugin. `None` means the row is not installed.
     enabled: Option<bool>,
+    /// The marketplace's last-push fact, when a cached entry is available. A quiet marker is a
+    /// factual age bucket, not a judgement that the plugin is unhealthy.
+    maintenance: Option<crate::registry::MaintenanceStatus>,
     /// Ticked for a bulk operation. Kept on the row rather than as a set of indices so it
     /// survives the list being rebuilt in a different order.
     picked: bool,
@@ -158,29 +161,44 @@ impl Row {
     /// it is for. When the row is healthy the description fills the space that used to be
     /// blank, which is where "the name alone doesn't tell me what it does" came from.
     fn trailing_text(&self) -> String {
+        let with_maintenance = |text: String| {
+            self.maintenance
+                .as_ref()
+                .and_then(crate::registry::MaintenanceStatus::quiet_note)
+                .map(|note| {
+                    if text.is_empty() {
+                        note
+                    } else {
+                        format!("{} · {}", text, note)
+                    }
+                })
+                .unwrap_or(text)
+        };
         if let Some(warning) = self.herdr_warning {
             let version = format!(
                 "needs herdr {}, running {}",
                 warning.required, warning.running
             );
             let note = self.status_note();
-            return if note.is_empty() {
+            return with_maintenance(if note.is_empty() {
                 version
             } else {
                 format!("{} · {}", version, note)
-            };
+            });
         }
         if self.maybe_stale && self.status_note().is_empty() {
-            return "updates available — press l to see what changed".to_string();
+            return with_maintenance("updates available — press l to see what changed".to_string());
         }
         let note = self.status_note();
         if !note.is_empty() {
-            return note;
+            return with_maintenance(note);
         }
-        self.detail
-            .as_ref()
-            .map(|d| d.description.clone())
-            .unwrap_or_default()
+        with_maintenance(
+            self.detail
+                .as_ref()
+                .map(|d| d.description.clone())
+                .unwrap_or_default(),
+        )
     }
 
     fn status_note(&self) -> String {
@@ -441,6 +459,11 @@ fn machine_summary(entry: &MachineEntry) -> String {
     let drifted = count(|row| matches!(row.status, Status::Drifted { .. }));
     let disabled = count(|row| row.status == Status::Disabled);
     let updates = count(|row| row.maybe_stale);
+    let quiet = count(|row| {
+        row.maintenance
+            .as_ref()
+            .is_some_and(crate::registry::MaintenanceStatus::is_quiet)
+    });
     let mut parts = vec![format!("{} ok", ok)];
     if missing > 0 {
         parts.push(format!("{} missing", missing));
@@ -453,6 +476,9 @@ fn machine_summary(entry: &MachineEntry) -> String {
     }
     if updates > 0 {
         parts.push(format!("{} updates", updates));
+    }
+    if quiet > 0 {
+        parts.push(format!("{} quiet", quiet));
     }
     parts.join(" · ")
 }
@@ -640,6 +666,15 @@ fn rows_with_herdr_version(
             .map(|e| crate::registry::pushed_since(&e.pushed_at, ms))
             .unwrap_or(false)
     };
+    let maintenance = |p: &Installed| -> Option<crate::registry::MaintenanceStatus> {
+        let slug = p.slug.as_ref()?;
+        market
+            .iter()
+            .find(|e| e.full_name.eq_ignore_ascii_case(slug))
+            .map(|e| {
+                crate::registry::maintenance_status(&e.pushed_at, crate::registry::today_days())
+            })
+    };
     let mut rows = Vec::new();
 
     for spec in desired {
@@ -671,6 +706,7 @@ fn rows_with_herdr_version(
             slug: Some(spec.repo.clone()),
             installed: hit.map(|(p, _)| (p.plugin_id.clone(), p.source_kind.clone())),
             enabled: hit.map(|(p, _)| p.enabled),
+            maintenance: hit.and_then(|(p, _)| maintenance(p)),
             maybe_stale: hit.map(|(p, _)| stale(p, Some(spec))).unwrap_or(false),
             picked: false,
             detail: hit.map(|(p, _)| detail_of(p)),
@@ -697,6 +733,7 @@ fn rows_with_herdr_version(
             slug: p.slug.clone(),
             installed: Some((p.plugin_id.clone(), p.source_kind.clone())),
             enabled: Some(p.enabled),
+            maintenance: maintenance(p),
             maybe_stale: stale(p, None),
             picked: false,
             detail: Some(detail_of(p)),
@@ -2917,6 +2954,17 @@ impl App {
             writeln!(out, "\r")?;
         }
 
+        if let Some(maintenance) = row.maintenance.as_ref() {
+            if let Some(age) = maintenance.age() {
+                let quiet = if maintenance.is_quiet() {
+                    " · quiet (fact only)"
+                } else {
+                    ""
+                };
+                writeln!(out, " maintenance: last pushed {} ago{}\r", age, quiet)?;
+            }
+        }
+
         if items.is_empty() && d.events.is_empty() {
             writeln!(
                 out,
@@ -3765,6 +3813,15 @@ impl App {
         let todo = counts(|s| matches!(s, Status::Missing | Status::Drifted { .. }));
         let extra = counts(|s| *s == Status::Extra);
         let stale = self.rows.iter().filter(|r| r.maybe_stale).count();
+        let quiet = self
+            .rows
+            .iter()
+            .filter(|r| {
+                r.maintenance
+                    .as_ref()
+                    .is_some_and(crate::registry::MaintenanceStatus::is_quiet)
+            })
+            .count();
         let herdr_too_old = self
             .rows
             .iter()
@@ -3791,12 +3848,17 @@ impl App {
         };
         writeln!(
             out,
-            "\x1b[1m herdr-lazy\x1b[0m  \x1b[2m{} ok · {} to sync · {} unlisted{}{}{}\x1b[0m{}{}{}{}\r",
+            "\x1b[1m herdr-lazy\x1b[0m  \x1b[2m{} ok · {} to sync · {} unlisted{}{}{}{}\x1b[0m{}{}{}{}\r",
             ok,
             todo,
             extra,
             if stale > 0 {
                 format!(" · \x1b[33m{} may have updates\x1b[0m\x1b[2m", stale)
+            } else {
+                String::new()
+            },
+            if quiet > 0 {
+                format!(" · \x1b[33m{} quiet\x1b[0m\x1b[2m", quiet)
             } else {
                 String::new()
             },
@@ -5312,6 +5374,21 @@ mod tests {
         let r = rows_with_updates(&desired, &installed, &market);
         assert!(r[0].maybe_stale, "a later push must be reported");
         assert!(!r[1].maybe_stale, "an older push must not be");
+    }
+
+    #[test]
+    fn a_quiet_repository_is_visible_without_being_called_unhealthy() {
+        let desired = vec![Spec::parse("owner/quiet")];
+        let installed = vec![installed_at("owner", "quiet", 20_000 * DAY_MS)];
+        let market = vec![market("owner/quiet", "1970-01-01T00:00:00Z")];
+
+        let rows = rows_with_updates(&desired, &installed, &market);
+        assert!(rows[0]
+            .maintenance
+            .as_ref()
+            .is_some_and(crate::registry::MaintenanceStatus::is_quiet));
+        assert!(rows[0].trailing_text().contains("quiet"));
+        assert_eq!(rows[0].status, Status::Ok);
     }
 
     /// A pin says "this commit, deliberately". Reporting it as out of date would train people

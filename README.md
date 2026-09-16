@@ -64,6 +64,8 @@ second configuration format.
   plugins at the same commits.
 - **A hint when something has moved.** `↑` marks a plugin whose repository has been pushed
   to since you installed it, so `u` is worth pressing.
+- **A maintenance view.** `check` and the manage pane show the last known repository push age;
+  repositories with no push for 180 days are marked `quiet` as a fact, not a health score.
 - **A manage pane.** A herdr overlay pane with the same operations on single keys —
   `i`/`u`/`x`/`r` as in lazy.nvim. Tick rows with space or a click to act on several at
   once, or act on just the row under the cursor when nothing is ticked. `?` shows the full
@@ -183,7 +185,7 @@ herdr-lazy() {
 ```sh
 herdr-lazy init          # write the curated default list
 herdr-lazy list          # show what the list asks for
-herdr-lazy check         # inspect local state and update hints without changing plugins
+herdr-lazy check         # inspect local state, update hints, and maintenance age without changing plugins
 herdr-lazy sync          # install what is missing
 herdr-lazy update        # move unpinned entries to their latest commit
 herdr-lazy starter       # preview and start the current workspace
@@ -313,6 +315,12 @@ The marketplace check is intentionally honest about uncertainty. If refreshing i
 only stale cache data is available, update status is shown as unknown rather than current.
 `doctor` checks whether repositories resolve; `check` checks whether your local setup needs
 attention.
+
+The same report includes each repository's last known push age. A repository with no push for
+180 days is marked `quiet`; this is a factual maintenance signal, not a claim that the plugin is
+broken, abandoned, or unsafe. It does not change install, update, enable, or uninstall behavior.
+The manage pane uses the cached index and only highlights quiet rows when that information is
+available, while `check` explicitly refreshes the index.
 
 Both files live in the directory herdr assigns the plugin — `herdr plugin config-dir
 herdr-lazy` prints it:
@@ -718,10 +726,8 @@ contributor's plugin and the author's.
 Directions, not promises. Anything with an issue open is specified enough to be worked on;
 the rest still needs design.
 
-- **Warn before installing what cannot install.** herdr runs plugin builds with a minimal
-  PATH, so a plugin whose build is a bare `cargo build` fails on machines where Rust works
-  fine everywhere else. The manifest is readable before install, so the browser could say so.
-- **enable / disable from the pane** — herdr supports both; herdr-lazy only reports the state.
+- **Platform-scoped list entries (#15)** — skip incompatible entries when lists and locks move
+  between operating systems.
 
 ## Design notes
 
