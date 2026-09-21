@@ -10,7 +10,7 @@ list and lockfile so the setup stays readable and reproducible.
 [![Latest release](https://img.shields.io/github/v/release/natori-hrj/herdr-lazy)](https://github.com/natori-hrj/herdr-lazy/releases/latest)
 ![Platforms: macOS, Linux, Windows](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-informational)
 
-![herdr-lazy: the manage pane, searching the marketplace and adding a plugin](docs/demo.gif)
+![herdr-lazy: Herdr's main screen, the manage pane, marketplace search, and adding a plugin](docs/demo.gif)
 
 ## Try it in 60 seconds
 
