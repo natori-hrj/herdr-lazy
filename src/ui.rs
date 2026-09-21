@@ -737,6 +737,16 @@ fn rows_with_herdr_version(
 const LIST_TOP: usize = 2;
 const BROWSER_TOP: usize = 3;
 
+const FOOTER_ROWS: u16 = 2;
+
+/// Leave the terminal's last row to the host pane.
+///
+/// Herdr owns that row when it embeds the plugin pane. A two-line footer that starts at
+/// `height - 1` therefore puts its actual hint on the clipped row after the rule.
+fn footer_start_row(height: u16) -> u16 {
+    height.saturating_sub(FOOTER_ROWS)
+}
+
 /// One line of the extras picker. Categories are drawn but never landed on — a heading is not
 /// something you can add.
 enum PickerLine {
@@ -2616,7 +2626,7 @@ impl App {
             out,
             "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m\x1b[1m[y]\x1b[0m write it  \
              \x1b[1m[n / esc]\x1b[0m cancel\r",
-            height.saturating_sub(1),
+            footer_start_row(height),
             rule
         )?;
         out.flush()
@@ -2695,7 +2705,7 @@ impl App {
             out,
             "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m\x1b[1m[y]\x1b[0m apply  \
              \x1b[1m[n / esc]\x1b[0m cancel\r",
-            height.saturating_sub(1),
+            footer_start_row(height),
             rule
         )?;
         out.flush()
@@ -2831,7 +2841,7 @@ impl App {
         write!(
             out,
             "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
-            height.saturating_sub(1),
+            footer_start_row(height),
             rule,
             footer
         )?;
@@ -2888,7 +2898,7 @@ impl App {
         write!(
             out,
             "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
-            height.saturating_sub(1),
+            footer_start_row(height),
             rule,
             footer
         )?;
@@ -2924,7 +2934,7 @@ impl App {
             write!(
                 out,
                 "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
-                height.saturating_sub(1),
+                footer_start_row(height),
                 rule,
                 footer
             )?;
@@ -3071,7 +3081,7 @@ impl App {
         write!(
             out,
             "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
-            height.saturating_sub(1),
+            footer_start_row(height),
             rule,
             footer
         )?;
@@ -3216,7 +3226,7 @@ impl App {
         write!(
             out,
             "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m\x1b[2many key closes this\x1b[0m\r",
-            height.saturating_sub(1),
+            footer_start_row(height),
             rule
         )?;
         out.flush()
@@ -3288,7 +3298,7 @@ impl App {
         write!(
             out,
             "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
-            height.saturating_sub(1),
+            footer_start_row(height),
             rule,
             footer
         )?;
@@ -3362,7 +3372,7 @@ impl App {
         write!(
             out,
             "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
-            height.saturating_sub(1),
+            footer_start_row(height),
             rule,
             footer
         )?;
@@ -3433,7 +3443,7 @@ impl App {
         write!(
             out,
             "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
-            height.saturating_sub(1),
+            footer_start_row(height),
             rule,
             footer
         )?;
@@ -3511,7 +3521,7 @@ impl App {
         write!(
             out,
             "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
-            height.saturating_sub(1),
+            footer_start_row(height),
             rule,
             footer
         )?;
@@ -3599,7 +3609,7 @@ impl App {
         write!(
             out,
             "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
-            height.saturating_sub(1),
+            footer_start_row(height),
             rule,
             footer
         )?;
@@ -3718,7 +3728,7 @@ impl App {
         write!(
             out,
             "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
-            height.saturating_sub(1),
+            footer_start_row(height),
             rule,
             footer
         )?;
@@ -3789,7 +3799,7 @@ impl App {
             out,
             "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m\x1b[1m[y]\x1b[0m run on this target  \
              \x1b[1m[n / esc]\x1b[0m cancel\r",
-            height.saturating_sub(1),
+            footer_start_row(height),
             rule
         )?;
         out.flush()
@@ -3908,7 +3918,7 @@ impl App {
         write!(
             out,
             "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
-            height.saturating_sub(1),
+            footer_start_row(height),
             rule,
             footer
         )?;
@@ -4629,6 +4639,12 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn footer_leaves_the_host_owned_terminal_row_visible() {
+        assert_eq!(footer_start_row(50), 48);
+        assert_eq!(footer_start_row(1), 0);
+    }
 
     fn github(owner: &str, repo: &str, commit: &str, enabled: bool) -> Installed {
         Installed {
