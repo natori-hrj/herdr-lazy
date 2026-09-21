@@ -85,7 +85,7 @@ impl PluginContext {
         }
     }
 
-    /// A short, control-free label for the manage-pane header.
+    /// A short, control-free label for the manage pane's optional context summary.
     pub(crate) fn summary(&self) -> Option<String> {
         let workspace = self
             .workspace_label

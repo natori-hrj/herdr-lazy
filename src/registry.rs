@@ -116,17 +116,6 @@ impl MaintenanceStatus {
             Self::Unknown(_) => None,
         }
     }
-
-    /// The list only needs to call attention to quiet repositories. Details and reports can
-    /// use `age` when they want the complete fact without making every healthy row noisy.
-    pub(crate) fn quiet_note(&self) -> Option<String> {
-        self.is_quiet().then(|| {
-            format!(
-                "quiet — last pushed {} ago",
-                self.age().unwrap_or("unknown")
-            )
-        })
-    }
 }
 
 /// Number of days between a marketplace push date and today, or None for malformed input.
@@ -343,11 +332,6 @@ pub(crate) fn load(force: bool) -> Result<(Vec<Entry>, String), String> {
             Err(e)
         }
     }
-}
-
-/// How old the cached index is, in hours. `None` when there is no cache.
-pub(crate) fn cache_age_hours() -> Option<u64> {
-    cache_age_seconds().map(|s| s / 3600)
 }
 
 /// Entries from the cache, or nothing. Never fetches.

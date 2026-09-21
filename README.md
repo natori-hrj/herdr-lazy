@@ -1,23 +1,14 @@
 # herdr-lazy
 
-> Be lazy. Declare the plugins you want; let the tool converge your machine to them.
+> Find, install, and update Herdr plugins from one pane.
 
-A declarative plugin **manager** and curated **distro** for [herdr](https://herdr.dev).
+A simple plugin **manager** for [herdr](https://herdr.dev). Search the marketplace, install
+what you need, update it later, or remove it when you are done. Underneath, it keeps a plain
+list and lockfile so the setup stays readable and reproducible.
 
 [![CI](https://github.com/natori-hrj/herdr-lazy/actions/workflows/ci.yml/badge.svg)](https://github.com/natori-hrj/herdr-lazy/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/natori-hrj/herdr-lazy)](https://github.com/natori-hrj/herdr-lazy/releases/latest)
 ![Platforms: macOS, Linux, Windows](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-informational)
-
-herdr installs plugins one imperative command at a time. There is no way to declare the
-set you want, and no lockfile — so a working setup cannot be reproduced on another
-machine.
-
-herdr-lazy replaces that with one file you own. `plugins.list` is a plain list of
-`owner/repo` lines: readable, editable by hand, keepable in git, copyable to another
-machine. Everything the tool does is a way to reach that file — `init` writes a good
-starting one, extras append curated bundles, `add` and `remove` edit it, the manage pane
-edits it on single keys — and `sync` makes your machine match it, at the exact commits the
-lockfile records.
 
 ![herdr-lazy: the manage pane, searching the marketplace and adding a plugin](docs/demo.gif)
 
@@ -43,58 +34,30 @@ herdr plugin pane open --plugin herdr-lazy --entrypoint manage --focus
 On Windows, use the platform entrypoint `manage-windows`. The first-run bootstrap selects the
 right entrypoint automatically.
 
-The short version: the manage pane is the convenient part; `plugins.list` and `plugins.lock` are
-the reproducible part. You can use either independently, and neither requires a new project or a
-second configuration format.
+The short version: start in the manage pane. `plugins.list` and `plugins.lock` stay underneath
+when you want to inspect, version, or reproduce the setup on another machine.
 
 | If you want to… | Use… |
 | --- | --- |
-| Manage installed plugins quickly | the manage pane (`prefix+shift+l`) |
-| Reproduce a setup on another machine | `plugins.list` + `plugins.lock` |
-| Keep project plugins separate | `.herdr-lazy/plugins.list` + `p` |
-| Start a workspace from a reviewed bundle | `starter` or `w` |
-| Inspect local and saved-machine health | `m` in the manage pane |
+| Find and add a plugin | `/`, then `Enter` |
+| Install what is selected | `i` |
+| Update installed plugins | `u` |
+| Remove a plugin | `x` |
+| Reproduce a setup elsewhere | `plugins.list` + `plugins.lock` |
 
 ## What it gives you
 
-- **A declarative plugin list.** `sync` converges your machine to it — installing what is
-  missing, and (with `--prune`) removing the rest.
-- **A real lockfile.** Entries pin to a commit, and the lock records the commit herdr
-  actually checked out. Copy the lock to another machine, `sync`, and you get the same
-  plugins at the same commits.
-- **A hint when something has moved.** `↑` marks a plugin whose repository has been pushed
-  to since you installed it, so `u` is worth pressing.
-- **A maintenance view.** `check` and the manage pane show the last known repository push age;
-  repositories with no push for 180 days are marked `quiet` as a fact, not a health score.
-- **A manage pane.** A herdr overlay pane with the same operations on single keys —
-  `i`/`u`/`x`/`r` as in lazy.nvim. Tick rows with space or a click to act on several at
-  once, or act on just the row under the cursor when nothing is ticked. `?` shows the full
-  keymap; the mouse scrolls and ticks.
-- **A workspace-aware manage pane.** When Herdr opens it in a workspace, the header identifies
-  that workspace and its working directory. Worktree create/open events leave a small,
-  workspace-matched hint, without changing the plugin list or installed state.
-- **Agent-aware recommendations.** When Herdr supplies a known focused agent, `n` shows a curated
-  extra with the reason it fits. Recommendations stay separate from the default bundle and are
-  added to the list for review; they never install or enable anything automatically.
-- **Workspace-scoped profiles.** Put an optional `.herdr-lazy/plugins.list` in a project to
-  review project-specific plugins with `p`. Syncing writes `.herdr-lazy/plugins.lock` and leaves
-  the global list alone; merging into the global list is a separate, confirmed action.
-- **A workspace starter.** Press `w`, choose `Lazy: start workspace`, or run `starter` to
-  preview a profile/bundle, install or update with separate confirmations, then open only the
-  panes and actions declared by installed plugin manifests.
-- **A list that tells you what each plugin is.** Every installed row shows its own one-line
-  description, so you can tell what you have and spot two plugins that do the same thing
-  without opening each one.
-- **A way to find out what you just installed.** Press `l` on any plugin to see what it
-  does, which actions it offers, which panes it can open, and what makes it run on its own
-  — then run an action right there.
-- **Marketplace search, in the pane.** Press `/` to search all published herdr plugins by
-  name, description or topic, and add one to your list without leaving the terminal.
-- **A curated default set.** `init` writes a starting bundle so a fresh herdr is useful
-  immediately, and `e` in the pane opens the opt-in extras on top of it.
-- **A first run that leaves you in control.** On a machine with nothing set up, the first herdr
-  start after installing writes the list and binds a key to the pane, but does not install the
-  third-party entries without an explicit `sync` or `i` action.
+- **Search the marketplace.** Press `/` to find plugins by name, description, or topic without
+  leaving the terminal.
+- **Install, update, and remove.** The common actions are one key away: `i`, `u`, and `x`.
+- **Keep a readable setup.** `plugins.list` is plain text, and `plugins.lock` records the exact
+  commits so the setup can be reproduced elsewhere.
+- **See what each plugin does.** Installed rows show a short description, and `l` opens the
+  full details when you need them.
+
+Advanced workflows — workspace profiles, the starter, machine health, recommendations, and
+maintenance checks — remain available when you need them. They are kept out of the first-run
+path so the common job stays easy to find.
 
 herdr-lazy is itself a herdr plugin: it drives the herdr CLI (via `HERDR_BIN_PATH`) to
 manage the *other* plugins.

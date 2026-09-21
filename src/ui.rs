@@ -159,46 +159,32 @@ impl Row {
     /// is about what to *do*; the description is about what the plugin *is*. When there is
     /// something to do, that wins — you need to know a plugin is missing before you care what
     /// it is for. When the row is healthy the description fills the space that used to be
-    /// blank, which is where "the name alone doesn't tell me what it does" came from.
+    /// blank, which is where "the name alone doesn't tell me what it does" came from. Repository
+    /// maintenance facts stay in the detail view so the main list can stay focused on actions.
     fn trailing_text(&self) -> String {
-        let with_maintenance = |text: String| {
-            self.maintenance
-                .as_ref()
-                .and_then(crate::registry::MaintenanceStatus::quiet_note)
-                .map(|note| {
-                    if text.is_empty() {
-                        note
-                    } else {
-                        format!("{} · {}", text, note)
-                    }
-                })
-                .unwrap_or(text)
-        };
         if let Some(warning) = self.herdr_warning {
             let version = format!(
                 "needs herdr {}, running {}",
                 warning.required, warning.running
             );
             let note = self.status_note();
-            return with_maintenance(if note.is_empty() {
+            return if note.is_empty() {
                 version
             } else {
                 format!("{} · {}", version, note)
-            });
+            };
         }
         if self.maybe_stale && self.status_note().is_empty() {
-            return with_maintenance("updates available — press l to see what changed".to_string());
+            return "updates available — press l to see what changed".to_string();
         }
         let note = self.status_note();
         if !note.is_empty() {
-            return with_maintenance(note);
+            return note;
         }
-        with_maintenance(
-            self.detail
-                .as_ref()
-                .map(|d| d.description.clone())
-                .unwrap_or_default(),
-        )
+        self.detail
+            .as_ref()
+            .map(|d| d.description.clone())
+            .unwrap_or_default()
     }
 
     fn status_note(&self) -> String {
@@ -1478,7 +1464,7 @@ impl App {
         self.rows.get(self.cursor)
     }
 
-    /// Add workspace information without changing the two-line list layout. The values were
+    /// Render workspace information when the user asks for the detailed keymap. The values were
     /// cleaned while parsing Herdr's payload, and the event name is limited to known constants,
     /// so this remains safe to write directly into the terminal.
     fn context_suffix(&self) -> String {
@@ -3107,6 +3093,18 @@ impl App {
         )?;
         writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
 
+        let optional_status = [
+            self.context_suffix(),
+            self.profile_suffix(),
+            self.recommendation_suffix(),
+        ]
+        .into_iter()
+        .filter(|status| !status.is_empty())
+        .collect::<String>();
+        if !optional_status.is_empty() {
+            writeln!(out, " \x1b[2moptional context{}\x1b[0m\r", optional_status)?;
+        }
+
         let section = |out: &mut dyn Write, title: &str, keys: &[(&str, &str)]| -> io::Result<()> {
             writeln!(out, " \x1b[1m{}\x1b[0m\r", title)?;
             for (k, desc) in keys {
@@ -3154,7 +3152,7 @@ impl App {
         )?;
         section(
             out,
-            "your list",
+            "optional tools and your list",
             &[
                 ("a", "add the selected installed plugin(s) to your list"),
                 ("d", "remove this entry (does not uninstall)"),
@@ -3804,77 +3802,21 @@ impl App {
         // Home the cursor and clear, rather than scrolling: redraw in place.
         write!(out, "\x1b[H\x1b[2J")?;
 
-        let counts = |s: fn(&Status) -> bool| self.rows.iter().filter(|r| s(&r.status)).count();
-        let ok = self
+        let installed = self
             .rows
             .iter()
-            .filter(|r| r.status == Status::Ok && r.herdr_warning.is_none())
+            .filter(|r| r.status != Status::Missing)
             .count();
-        let todo = counts(|s| matches!(s, Status::Missing | Status::Drifted { .. }));
-        let extra = counts(|s| *s == Status::Extra);
-        let stale = self.rows.iter().filter(|r| r.maybe_stale).count();
-        let quiet = self
+        let to_sync = self
             .rows
             .iter()
-            .filter(|r| {
-                r.maintenance
-                    .as_ref()
-                    .is_some_and(crate::registry::MaintenanceStatus::is_quiet)
-            })
+            .filter(|r| matches!(r.status, Status::Missing | Status::Drifted { .. }))
             .count();
-        let herdr_too_old = self
-            .rows
-            .iter()
-            .filter(|r| r.herdr_warning.is_some())
-            .count();
-        // Say how old the update information is once it is old enough to mislead. Without
-        // this, "nothing has updates" is indistinguishable from "I last looked two days ago",
-        // and the only cure — pressing `/` — is not something anyone would think to try.
-        let freshness = match crate::registry::cache_age_hours() {
-            Some(h) if h >= 12 => format!(" \x1b[2m· update info {}h old, / refreshes\x1b[0m", h),
-            None => " \x1b[2m· no update info yet, / fetches it\x1b[0m".to_string(),
-            _ => String::new(),
-        };
-        let context = self.context_suffix();
-        let profile = self.profile_suffix();
-        let recommendations = self.recommendation_suffix();
-
-        // Showing auto-sync here is the only way a user learns it exists: it has no row of its
-        // own, and something that installs software at startup should be visible, not buried.
-        let auto = if crate::auto_sync_enabled() {
-            "  \x1b[32m· auto-sync on\x1b[0m"
-        } else {
-            ""
-        };
+        let updates = self.rows.iter().filter(|r| r.maybe_stale).count();
         writeln!(
             out,
-            "\x1b[1m herdr-lazy\x1b[0m  \x1b[2m{} ok · {} to sync · {} unlisted{}{}{}{}\x1b[0m{}{}{}{}\r",
-            ok,
-            todo,
-            extra,
-            if stale > 0 {
-                format!(" · \x1b[33m{} may have updates\x1b[0m\x1b[2m", stale)
-            } else {
-                String::new()
-            },
-            if quiet > 0 {
-                format!(" · \x1b[33m{} quiet\x1b[0m\x1b[2m", quiet)
-            } else {
-                String::new()
-            },
-            if herdr_too_old > 0 {
-                format!(
-                    " · \x1b[33m{} need newer herdr\x1b[0m\x1b[2m",
-                    herdr_too_old
-                )
-            } else {
-                String::new()
-            },
-            auto,
-            freshness,
-            context,
-            profile,
-            recommendations
+            "\x1b[1m herdr-lazy\x1b[0m  \x1b[2m{} installed · {} to sync · {} updates\x1b[0m\r",
+            installed, to_sync, updates
         )?;
         writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
 
@@ -3883,7 +3825,7 @@ impl App {
         } else if self.rows.is_empty() {
             writeln!(
                 out,
-                " \x1b[2mno plugin list yet — run `herdr-lazy init`\x1b[0m\r"
+                " \x1b[2mno plugins yet — press / to browse, or run `herdr-lazy init`\x1b[0m\r"
             )?;
         }
 
@@ -3951,20 +3893,9 @@ impl App {
         let legend = [
             ("i", "install"),
             ("u", "update"),
-            ("x", "uninstall"),
-            ("r", "restore"),
-            ("E", "enable"),
-            ("D", "disable"),
-            ("L", "logs"),
-            ("a", "adopt"),
-            ("d", "drop"),
+            ("x", "remove"),
             ("/", "search"),
-            ("e", "extras"),
-            ("p", "profile"),
-            ("m", "machines"),
-            ("w", "starter"),
-            ("n", "recommendations"),
-            ("?", "help"),
+            ("?", "more"),
         ]
         .iter()
         .map(|(k, label)| format!("\x1b[1m[{}]\x1b[0m {}", k, label))
@@ -5387,8 +5318,31 @@ mod tests {
             .maintenance
             .as_ref()
             .is_some_and(crate::registry::MaintenanceStatus::is_quiet));
-        assert!(rows[0].trailing_text().contains("quiet"));
+        assert!(
+            !rows[0].trailing_text().contains("quiet"),
+            "maintenance facts belong in the detail view, not the main action list"
+        );
         assert_eq!(rows[0].status, Status::Ok);
+    }
+
+    #[test]
+    fn the_main_list_surfaces_only_common_actions() {
+        let app = App {
+            rows: rows(&[Spec::parse("owner/missing")], &[]),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        app.draw_list(&mut buf, 100, 24).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+
+        assert!(out.contains("0 installed · 1 to sync · 0 updates"));
+        assert!(out.contains("[i]") && out.contains("install"));
+        assert!(out.contains("[u]") && out.contains("update"));
+        assert!(out.contains("[x]") && out.contains("remove"));
+        assert!(out.contains("[/]") && out.contains("search"));
+        assert!(out.contains("[?]") && out.contains("more"));
+        assert!(!out.contains("[m] machines"));
+        assert!(!out.contains("[p] profile"));
     }
 
     /// A pin says "this commit, deliberately". Reporting it as out of date would train people
@@ -5433,7 +5387,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_context_is_a_quiet_header_suffix() {
+    fn workspace_context_is_available_as_an_optional_summary() {
         let mut app = App::default();
         app.workspace_context = Some(crate::context::PluginContext {
             workspace_id: Some("w1".to_string()),
@@ -5500,7 +5454,7 @@ mod tests {
     }
 
     #[test]
-    fn absent_or_malformed_context_does_not_change_the_normal_pane() {
+    fn absent_or_malformed_context_stays_out_of_the_default_list() {
         let empty = App::default();
         assert_eq!(empty.context_suffix(), "");
 
