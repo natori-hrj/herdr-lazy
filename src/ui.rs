@@ -12,7 +12,10 @@
 //! install`, whose output is worth reading verbatim when a build fails — capturing it into a
 //! spinner would hide the one thing you need.
 
-use std::io::{self, Write};
+use std::{
+    io::{self, Write},
+    time::Duration,
+};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
@@ -400,7 +403,7 @@ impl MachineView {
 
     fn plugin_window(&self, height: u16) -> (usize, usize) {
         let visible = (height as usize)
-            .saturating_sub(MACHINE_DETAIL_TOP + 3)
+            .saturating_sub(MACHINE_DETAIL_TOP + 4)
             .max(1);
         let start = if self.plugin_cursor >= visible {
             self.plugin_cursor - visible + 1
@@ -592,7 +595,7 @@ fn wrap_log_lines(text: &str, width: usize) -> Vec<String> {
 }
 
 fn log_visible_lines(height: u16, has_error: bool) -> usize {
-    let visible = (height as usize).saturating_sub(5).max(1);
+    let visible = (height as usize).saturating_sub(6).max(1);
     if has_error {
         visible.saturating_sub(1).max(1)
     } else {
@@ -737,14 +740,25 @@ fn rows_with_herdr_version(
 const LIST_TOP: usize = 2;
 const BROWSER_TOP: usize = 3;
 
-const FOOTER_ROWS: u16 = 2;
+const FOOTER_ROWS: u16 = 3;
+const STARTUP_REDRAWS: u8 = 3;
 
-/// Leave the terminal's last row to the host pane.
+/// Leave the terminal's last two rows to the host pane.
 ///
-/// Herdr owns that row when it embeds the plugin pane. A two-line footer that starts at
-/// `height - 1` therefore puts its actual hint on the clipped row after the rule.
+/// Herdr's overlay has a couple of rows that can remain outside the client viewport. A two-line
+/// footer that starts at `height - 2` can therefore put its actual hint on the clipped row after
+/// the rule.
 fn footer_start_row(height: u16) -> u16 {
     height.saturating_sub(FOOTER_ROWS)
+}
+
+/// Keep decorative rules one cell short of the terminal edge.
+///
+/// Writing exactly `width` cells sets the terminal's wrap-pending state. The following CRLF
+/// can then consume an extra row in a PTY, which pushes the two-line footer onto Herdr's
+/// host-owned row. Leaving one cell empty keeps the cursor movement deterministic.
+fn rule_line(width: u16) -> String {
+    "─".repeat(usize::from(width.saturating_sub(1)).min(200))
 }
 
 /// One line of the extras picker. Categories are drawn but never landed on — a heading is not
@@ -845,7 +859,7 @@ impl ExtrasPicker {
     /// How many lines fit, and which is at the top — shared by drawing and clicking, so the
     /// two cannot disagree about what is on screen. The header is two lines, as in the list.
     fn window(&self, height: u16) -> (usize, usize) {
-        let visible = (height as usize).saturating_sub(5).max(1);
+        let visible = (height as usize).saturating_sub(6).max(1);
         let start = if self.cursor >= visible {
             self.cursor - visible + 1
         } else {
@@ -963,7 +977,7 @@ impl RecommendationsPicker {
     }
 
     fn window(&self, height: u16) -> (usize, usize) {
-        let visible = (height as usize).saturating_sub(7).max(1);
+        let visible = (height as usize).saturating_sub(8).max(1);
         let start = if self.cursor >= visible {
             self.cursor - visible + 1
         } else {
@@ -1123,7 +1137,7 @@ impl AdoptPicker {
 
     /// How many lines fit and which is at the top — shared by drawing and clicking.
     fn window(&self, height: u16) -> (usize, usize) {
-        let visible = (height as usize).saturating_sub(5).max(1);
+        let visible = (height as usize).saturating_sub(6).max(1);
         let start = if self.cursor >= visible {
             self.cursor - visible + 1
         } else {
@@ -1717,7 +1731,7 @@ impl App {
 
     /// How many rows fit, and which one is at the top. Used by both drawing and clicking.
     fn list_window(&self, height: u16) -> (usize, usize) {
-        let visible = (height as usize).saturating_sub(5).max(1);
+        let visible = (height as usize).saturating_sub(6).max(1);
         let start = if self.cursor >= visible {
             self.cursor - visible + 1
         } else {
@@ -2093,7 +2107,7 @@ impl App {
                 }
                 MouseEventKind::Down(MouseButton::Left) if view.detail_of.is_none() => {
                     let visible = (height as usize)
-                        .saturating_sub(MACHINE_LIST_TOP + 3)
+                        .saturating_sub(MACHINE_LIST_TOP + 4)
                         .max(1);
                     let start = if view.cursor >= visible {
                         view.cursor - visible + 1
@@ -2122,7 +2136,7 @@ impl App {
                 MouseEventKind::Down(MouseButton::Left) => {
                     let y = m.row as usize;
                     if y >= BROWSER_TOP {
-                        let visible = (height as usize).saturating_sub(6).max(1);
+                        let visible = (height as usize).saturating_sub(7).max(1);
                         let start = if b.cursor >= visible {
                             b.cursor - visible + 1
                         } else {
@@ -2584,7 +2598,7 @@ impl App {
 
     /// Show the exact change before making it.
     fn draw_bind_confirm(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
-        let rule = "─".repeat((width as usize).clamp(20, 200));
+        let rule = rule_line(width);
         let (target, key) = self.pending_bind.clone().expect("checked by caller");
         let plugin_id = self
             .detail_of
@@ -2625,7 +2639,7 @@ impl App {
         write!(
             out,
             "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m\x1b[1m[y]\x1b[0m write it  \
-             \x1b[1m[n / esc]\x1b[0m cancel\r",
+             \x1b[1m[n / esc]\x1b[0m cancel\r\n",
             footer_start_row(height),
             rule
         )?;
@@ -2639,7 +2653,7 @@ impl App {
         width: u16,
         height: u16,
     ) -> io::Result<()> {
-        let rule = "─".repeat((width as usize).clamp(20, 200));
+        let rule = rule_line(width);
         let action = self.pending_profile.expect("checked by caller");
         let profile_path = self
             .workspace_profile
@@ -2704,7 +2718,7 @@ impl App {
         write!(
             out,
             "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m\x1b[1m[y]\x1b[0m apply  \
-             \x1b[1m[n / esc]\x1b[0m cancel\r",
+             \x1b[1m[n / esc]\x1b[0m cancel\r\n",
             footer_start_row(height),
             rule
         )?;
@@ -2713,7 +2727,7 @@ impl App {
 
     /// Show the project-scoped diff and its safe, explicit actions.
     fn draw_profile(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
-        let rule = "─".repeat((width as usize).clamp(20, 200));
+        let rule = rule_line(width);
         write!(out, "\x1b[H\x1b[2J")?;
         writeln!(
             out,
@@ -2807,7 +2821,7 @@ impl App {
         }
 
         writeln!(out, " \x1b[1mdiff\x1b[0m\r")?;
-        let visible = (height as usize).saturating_sub(13).max(1);
+        let visible = (height as usize).saturating_sub(14).max(1);
         for line in lines.iter().take(visible) {
             writeln!(
                 out,
@@ -2840,7 +2854,7 @@ impl App {
         };
         write!(
             out,
-            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
+            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r\n",
             footer_start_row(height),
             rule,
             footer
@@ -2851,7 +2865,7 @@ impl App {
     /// Show the native herdr log response without leaving the manage pane.
     fn draw_logs(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
         let view = self.log_view.as_ref().expect("checked by caller");
-        let rule = "─".repeat((width as usize).clamp(20, 200));
+        let rule = rule_line(width);
         let content_width = (width as usize).saturating_sub(2).max(1);
         let visible = log_visible_lines(height, view.error.is_some());
         let lines = view.display_lines(content_width);
@@ -2897,7 +2911,7 @@ impl App {
         );
         write!(
             out,
-            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
+            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r\n",
             footer_start_row(height),
             rule,
             footer
@@ -2912,7 +2926,7 @@ impl App {
     /// answer — every manifest declares its actions, panes and events — so the pane can just
     /// show it, and run the actions too.
     fn draw_detail(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
-        let rule = "─".repeat((width as usize).clamp(20, 200));
+        let rule = rule_line(width);
         let idx = self.detail_of.expect("checked by caller");
         let Some(row) = self.rows.get(idx) else {
             return Ok(());
@@ -2933,7 +2947,7 @@ impl App {
                 .unwrap_or_else(|| "\x1b[2many key goes back\x1b[0m".to_string());
             write!(
                 out,
-                "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
+                "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r\n",
                 footer_start_row(height),
                 rule,
                 footer
@@ -3080,7 +3094,7 @@ impl App {
         };
         write!(
             out,
-            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
+            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r\n",
             footer_start_row(height),
             rule,
             footer
@@ -3094,7 +3108,7 @@ impl App {
     /// uppercase is everything. That rule is invisible in the footer, which has room for one
     /// of each pair at most, so it is spelled out here.
     fn draw_help(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
-        let rule = "─".repeat((width as usize).clamp(20, 200));
+        let rule = rule_line(width);
         write!(out, "\x1b[H\x1b[2J")?;
         // The one rule the whole keymap follows, stated before any of the keys.
         writeln!(
@@ -3225,7 +3239,7 @@ impl App {
 
         write!(
             out,
-            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m\x1b[2many key closes this\x1b[0m\r",
+            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m\x1b[2many key closes this\x1b[0m\r\n",
             footer_start_row(height),
             rule
         )?;
@@ -3235,7 +3249,7 @@ impl App {
     /// The marketplace overlay: a query line, matching plugins, and what each one is.
     fn draw_browser(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
         let b = self.browser.as_ref().expect("checked by caller");
-        let rule = "─".repeat((width as usize).clamp(20, 200));
+        let rule = rule_line(width);
         let results = b.results();
         let today = crate::registry::today_days();
 
@@ -3255,7 +3269,7 @@ impl App {
         )?;
         writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
 
-        let visible = (height as usize).saturating_sub(6).max(1);
+        let visible = (height as usize).saturating_sub(7).max(1);
         let start = if b.cursor >= visible {
             b.cursor - visible + 1
         } else {
@@ -3297,7 +3311,7 @@ impl App {
         };
         write!(
             out,
-            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
+            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r\n",
             footer_start_row(height),
             rule,
             footer
@@ -3307,7 +3321,7 @@ impl App {
 
     fn draw_extras(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
         let p = self.extras.as_ref().expect("checked by caller");
-        let rule = "─".repeat((width as usize).clamp(20, 200));
+        let rule = rule_line(width);
 
         write!(out, "\x1b[H\x1b[2J")?;
         writeln!(
@@ -3371,7 +3385,7 @@ impl App {
         };
         write!(
             out,
-            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
+            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r\n",
             footer_start_row(height),
             rule,
             footer
@@ -3386,7 +3400,7 @@ impl App {
         height: u16,
     ) -> io::Result<()> {
         let p = self.recommendations.as_ref().expect("checked by caller");
-        let rule = "─".repeat((width as usize).clamp(20, 200));
+        let rule = rule_line(width);
 
         write!(out, "\x1b[H\x1b[2J")?;
         writeln!(
@@ -3442,7 +3456,7 @@ impl App {
         };
         write!(
             out,
-            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
+            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r\n",
             footer_start_row(height),
             rule,
             footer
@@ -3452,7 +3466,7 @@ impl App {
 
     fn draw_adopt(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
         let a = self.adopt.as_ref().expect("checked by caller");
-        let rule = "─".repeat((width as usize).clamp(20, 200));
+        let rule = rule_line(width);
 
         write!(out, "\x1b[H\x1b[2J")?;
         if a.asking() {
@@ -3520,7 +3534,7 @@ impl App {
         };
         write!(
             out,
-            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
+            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r\n",
             footer_start_row(height),
             rule,
             footer
@@ -3535,7 +3549,7 @@ impl App {
             return self.draw_machine_detail(out, width, height);
         }
 
-        let rule = "─".repeat((width as usize).clamp(20, 200));
+        let rule = rule_line(width);
         let selected = view
             .entries
             .get(view.cursor)
@@ -3561,7 +3575,7 @@ impl App {
         )?;
 
         let visible = (height as usize)
-            .saturating_sub(MACHINE_LIST_TOP + 3)
+            .saturating_sub(MACHINE_LIST_TOP + 4)
             .max(1);
         let start = if view.cursor >= visible {
             view.cursor - visible + 1
@@ -3608,7 +3622,7 @@ impl App {
         };
         write!(
             out,
-            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
+            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r\n",
             footer_start_row(height),
             rule,
             footer
@@ -3622,7 +3636,7 @@ impl App {
         let Some(entry) = view.entries.get(index) else {
             return Ok(());
         };
-        let rule = "─".repeat((width as usize).clamp(20, 200));
+        let rule = rule_line(width);
         let (state, colour) = machine_connection_label(entry.health.connection);
         let version = entry
             .health
@@ -3727,7 +3741,7 @@ impl App {
         };
         write!(
             out,
-            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
+            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r\n",
             footer_start_row(height),
             rule,
             footer
@@ -3749,7 +3763,7 @@ impl App {
         let Some(entry) = view.entries.get(index) else {
             return Ok(());
         };
-        let rule = "─".repeat((width as usize).clamp(20, 200));
+        let rule = rule_line(width);
         let preview = machine_summary(entry);
 
         write!(out, "\x1b[H\x1b[2J")?;
@@ -3798,7 +3812,7 @@ impl App {
         write!(
             out,
             "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m\x1b[1m[y]\x1b[0m run on this target  \
-             \x1b[1m[n / esc]\x1b[0m cancel\r",
+             \x1b[1m[n / esc]\x1b[0m cancel\r\n",
             footer_start_row(height),
             rule
         )?;
@@ -3808,7 +3822,7 @@ impl App {
     fn draw_list(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
         // Rules span the pane. A fixed width looked deliberate at 80 columns and plainly
         // broken at 140, where the list ran well past the line meant to underline it.
-        let rule = "─".repeat((width as usize).clamp(20, 200));
+        let rule = rule_line(width);
         // Home the cursor and clear, rather than scrolling: redraw in place.
         write!(out, "\x1b[H\x1b[2J")?;
 
@@ -3917,7 +3931,7 @@ impl App {
         };
         write!(
             out,
-            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r",
+            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r\n",
             footer_start_row(height),
             rule,
             footer
@@ -4052,34 +4066,53 @@ pub(crate) fn run() -> io::Result<()> {
 
 fn event_loop(out: &mut impl Write) -> io::Result<()> {
     let mut app = App::load();
+    let mut last_size = None;
+    let mut redraw = true;
+    let mut startup_redraws = STARTUP_REDRAWS;
 
     loop {
         let (width, height) = terminal::size().unwrap_or((80, 24));
-        app.draw(out, width, height)?;
+        let size = (width, height);
+        if redraw || last_size != Some(size) || startup_redraws > 0 {
+            app.draw(out, width, height)?;
+            last_size = Some(size);
+            redraw = false;
+            startup_redraws = startup_redraws.saturating_sub(1);
+        }
 
-        let key = match event::read()? {
-            Event::Key(k) if k.kind == KeyEventKind::Press => k,
-            Event::Mouse(m) => {
-                if app.log_view.is_some() {
-                    use crossterm::event::MouseEventKind;
-                    let visible = app
-                        .log_view
-                        .as_ref()
-                        .map(|view| log_visible_lines(height, view.error.is_some()))
-                        .unwrap_or(1);
-                    let width = (width as usize).saturating_sub(2).max(1);
-                    match m.kind {
-                        MouseEventKind::ScrollDown => app.scroll_logs(1, visible, width),
-                        MouseEventKind::ScrollUp => app.scroll_logs(-1, visible, width),
-                        _ => {}
-                    }
-                } else {
-                    app.handle_mouse(m, height)?;
+        let key = match event::poll(Duration::from_millis(100))? {
+            false => continue,
+            true => match event::read()? {
+                Event::Key(k) if k.kind == KeyEventKind::Press => {
+                    redraw = true;
+                    k
                 }
-                continue;
-            }
-            Event::Resize(..) => continue,
-            _ => continue,
+                Event::Mouse(m) => {
+                    if app.log_view.is_some() {
+                        use crossterm::event::MouseEventKind;
+                        let visible = app
+                            .log_view
+                            .as_ref()
+                            .map(|view| log_visible_lines(height, view.error.is_some()))
+                            .unwrap_or(1);
+                        let width = (width as usize).saturating_sub(2).max(1);
+                        match m.kind {
+                            MouseEventKind::ScrollDown => app.scroll_logs(1, visible, width),
+                            MouseEventKind::ScrollUp => app.scroll_logs(-1, visible, width),
+                            _ => {}
+                        }
+                    } else {
+                        app.handle_mouse(m, height)?;
+                    }
+                    redraw = true;
+                    continue;
+                }
+                Event::Resize(..) => {
+                    redraw = true;
+                    continue;
+                }
+                _ => continue,
+            },
         };
 
         // Any keypress retires the previous result line.
@@ -4642,8 +4675,16 @@ mod tests {
 
     #[test]
     fn footer_leaves_the_host_owned_terminal_row_visible() {
-        assert_eq!(footer_start_row(50), 48);
+        assert_eq!(footer_start_row(50), 47);
         assert_eq!(footer_start_row(1), 0);
+    }
+
+    #[test]
+    fn rule_leaves_a_terminal_margin_for_crlf() {
+        assert_eq!(rule_line(80).chars().count(), 79);
+        assert_eq!(rule_line(200).chars().count(), 199);
+        assert_eq!(rule_line(240).chars().count(), 200);
+        assert!(rule_line(80).chars().count() < 80);
     }
 
     fn github(owner: &str, repo: &str, commit: &str, enabled: bool) -> Installed {
