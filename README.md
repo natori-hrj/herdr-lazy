@@ -31,9 +31,6 @@ If you already have a plugin list or want to open the pane directly:
 herdr plugin pane open --plugin herdr-lazy --entrypoint manage --focus
 ```
 
-On Windows, use the platform entrypoint `manage-windows`. The first-run bootstrap selects the
-right entrypoint automatically.
-
 The short version: start in the manage pane. `plugins.list` and `plugins.lock` stay underneath
 when you want to inspect, version, or reproduce the setup on another machine.
 
@@ -64,8 +61,9 @@ manage the *other* plugins.
 
 ## Install
 
-Requires herdr ≥ 0.7.5, which is where the `[[startup]]` hook the first run depends on
-arrives. Earlier versions used to install this and then quietly do nothing.
+Requires herdr ≥ 0.9.0. This is the first supported release that resolves relative plugin
+commands from the plugin root on Windows, so the manifest can use the same runtime entries on
+every platform.
 
 ```sh
 herdr plugin install natori-hrj/herdr-lazy
@@ -79,8 +77,9 @@ from source with [Rust](https://rustup.rs) (≥ 1.78). No toolchain is needed on
 built and the test suite runs on Linux in CI, but the install has not been exercised on a
 real Linux machine. Windows now has a prebuilt x86_64 binary and keeps a source-build
 fallback; x86_64 is also the Herdr-documented path for Windows ARM64 under emulation. The
-install, `probe`, and opening the manage pane have been verified on Windows 11 with herdr
-0.7.5-preview in Windows Terminal (ConPTY), but the pane's keymap and a real `sync --prune`
+Earlier install, `probe`, and manage-pane checks were done on Windows 11 with herdr
+0.7.5-preview in Windows Terminal (ConPTY). The current unified manifest requires herdr ≥
+0.9.0 and still needs a fresh Windows validation; the pane's keymap and a real `sync --prune`
 have not been exercised there. If you run Linux or Windows, reports are very welcome — see
 the open issues.
 
@@ -108,15 +107,8 @@ description = "manage plugins"
 ```
 
 Pick a key that is actually free — `prefix+l` is `focus_pane_right`, and `h`/`j`/`k`/`n`/`p`/
-`c`/`g` are taken too. `prefix+?` lists your active bindings.
-
-**On Windows** the config lives at `%APPDATA%\herdr\config.toml`, and the action to bind is
-`herdr-lazy.manage-windows`. herdr rejects duplicate action ids even when they are gated to
-platforms that cannot overlap, so the Windows entry needs its own id. Binding the plain
-`herdr-lazy.manage` there is accepted by the config parser and then refused at the keypress,
-where nobody sees it — so it reads as a key that does nothing. The first-run bootstrap binds
-whichever id herdr reports for the platform it is running on, which is the main reason not to
-write this by hand.
+`c`/`g` are taken too. `prefix+?` lists your active bindings. The first-run bootstrap binds
+`herdr-lazy.manage` on every supported platform.
 
 herdr has no command palette, so without a binding the only way in is the CLI:
 
@@ -124,7 +116,6 @@ herdr has no command palette, so without a binding the only way in is the CLI:
 herdr plugin pane open --plugin herdr-lazy --entrypoint manage --focus
 ```
 
-On Windows that entrypoint is `manage-windows`, for the same reason.
 
 ## Use
 

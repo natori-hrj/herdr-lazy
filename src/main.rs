@@ -7,7 +7,8 @@
 //! The whole thing is itself a herdr plugin: it drives the herdr CLI (via HERDR_BIN_PATH)
 //! to install/list/uninstall the *other* plugins.
 //!
-//! Verified against herdr 0.7.4 (see `probe`, and HANDOFF.md):
+//! The plugin manifest requires herdr 0.9.0. The CLI payloads below remain deliberately small
+//! and are checked against the live Herdr contract by `probe`.
 //!   - `plugin list --json` is the machine-readable contract; we never parse the human output.
 //!   - `plugin install --ref REF` gives native pinning, so a bundle entry is `owner/repo@ref`
 //!     and the lockfile is genuinely reproducible. (An earlier draft assumed no pinning
@@ -2187,11 +2188,14 @@ fn bootstrap_if_first_run() -> BootstrapResult {
     println!("  wrote {}", p.display());
     println!("{}", first_run_install_hint());
 
-    // The action id is read back from herdr rather than hardcoded — see `platform_variant`.
-    let action = installed
-        .iter()
-        .find(|p| is_self(p))
-        .and_then(|me| platform_variant(me.actions.iter().map(|(id, _)| id.as_str()), "manage"));
+    // Read the action id back from herdr so a missing or disabled registration is reported
+    // instead of writing a keybinding that cannot work.
+    let action = installed.iter().find(|p| is_self(p)).and_then(|me| {
+        me.actions
+            .iter()
+            .find(|(id, _)| id == "manage")
+            .map(|(id, _)| id.clone())
+    });
     let has_manage_action = action.is_some();
     let manage_step = match action {
         Some(id) => match bind_action(PLUGIN_ID, &BindTarget::Action(id), BOOTSTRAP_KEY) {
@@ -2203,10 +2207,10 @@ fn bootstrap_if_first_run() -> BootstrapResult {
             // there is no config.toml to write. Say what to press instead of dying quietly.
             Err(msg) => {
                 println!("  did not bind {}: {}", BOOTSTRAP_KEY, msg);
-                format!("open the pane with: {}", manage_pane_command(&installed))
+                format!("open the pane with: {}", manage_pane_command())
             }
         },
-        None => format!("open the pane with: {}", manage_pane_command(&installed)),
+        None => format!("open the pane with: {}", manage_pane_command()),
     };
     if !has_manage_action {
         println!(
@@ -2237,10 +2241,8 @@ fn current_platform() -> &'static str {
 ///
 /// `plugin list --json` reports every entry a plugin declares, including the ones gated to
 /// other platforms — herdr filters at *invocation* (`platform_unsupported`), not in the
-/// listing. Since a plugin that supports Windows has to declare separate entries with their
-/// own ids, an unfiltered listing shows the same action twice under the same title, half of
-/// which refuse to run. Filtering here means every reader of `Installed` — the details view,
-/// the bind menu, the first-run bootstrap — sees only what this machine can actually do.
+/// listing. Filtering here means every reader of `Installed` — the details view, the bind
+/// menu, the first-run bootstrap — sees only what this machine can actually do.
 ///
 /// No `platforms` means every platform, which is how most manifests are written.
 fn runs_here(entry: &json::Value) -> bool {
@@ -2253,64 +2255,17 @@ fn runs_here(entry: &json::Value) -> bool {
     }
 }
 
-/// The id herdr registered for one of our own entries on *this* platform.
-///
-/// Not a constant, because it is not the same everywhere. herdr rejects duplicate action and
-/// pane ids even when the entries are gated to platforms that cannot overlap, so a platform
-/// needing a differently-shaped command needs a differently-named entry too — `manage` on
-/// Unix, `manage-windows` on Windows. Binding the wrong one produces a key that reports
-/// success and does nothing, since the refusal (`platform_unsupported`) happens later, at a
-/// keypress, where nobody sees it.
-///
-/// The candidates come from `Installed`, which `runs_here` has already narrowed to this
-/// platform — so this only has to tolerate the naming, not decide the platform. An exact match
-/// wins; otherwise the first `<base>-<suffix>` variant.
-fn platform_variant<'a>(ids: impl Iterator<Item = &'a str>, base: &str) -> Option<String> {
-    let mut variant = None;
-    for id in ids {
-        if id == base {
-            return Some(id.to_string());
-        }
-        if id
-            .strip_prefix(base)
-            .is_some_and(|rest| rest.starts_with('-'))
-            && variant.is_none()
-        {
-            variant = Some(id.to_string());
-        }
-    }
-    variant
-}
-
 /// The command that opens our manage pane by hand, for a message telling someone to run it.
-fn manage_pane_command(installed: &[Installed]) -> String {
-    let id = installed
-        .iter()
-        .find(|p| is_self(p))
-        .and_then(|me| platform_variant(me.panes.iter().map(|(id, _, _)| id.as_str()), "manage"))
-        .unwrap_or_else(|| "manage".to_string());
+fn manage_pane_command() -> String {
     format!(
-        "herdr plugin pane open --plugin {} --entrypoint {} --focus",
-        PLUGIN_ID, id
+        "herdr plugin pane open --plugin {} --entrypoint manage --focus",
+        PLUGIN_ID
     )
 }
 
-/// The platform-specific entrypoint for the workspace starter pane.
+/// The entrypoint for the workspace starter pane.
 pub(crate) fn starter_pane_entrypoint() -> String {
-    installed_plugins()
-        .ok()
-        .and_then(|installed| {
-            installed.iter().find(|p| is_self(p)).and_then(|me| {
-                platform_variant(me.panes.iter().map(|(id, _, _)| id.as_str()), "starter")
-            })
-        })
-        .unwrap_or_else(|| {
-            if cfg!(windows) {
-                "starter-windows".to_string()
-            } else {
-                "starter".to_string()
-            }
-        })
+    "starter".to_string()
 }
 
 pub(crate) fn starter_pane_hint() -> String {
@@ -2325,28 +2280,48 @@ pub(crate) fn starter_pane_hint() -> String {
 /// when Herdr chooses an existing pane for the same entrypoint.
 pub(crate) fn open_starter_pane() -> String {
     let entrypoint = starter_pane_entrypoint();
-    match run_herdr(&[
+    match open_pane_for_action(&entrypoint) {
+        Ok(()) => format!("opened {} ({})", entrypoint, PLUGIN_ID),
+        Err(e) => e.to_string(),
+    }
+}
+
+/// The same, for a caller that has not already asked herdr what is installed.
+pub(crate) fn manage_pane_hint() -> String {
+    manage_pane_command()
+}
+
+/// Ask herdr to open one of this plugin's declared panes. Actions do not receive a PTY, so the
+/// action launches this small bridge and lets herdr create the real pane with a terminal.
+fn open_pane_for_action(entrypoint: &str) -> io::Result<()> {
+    let (success, out, err) = run_herdr(&[
         "plugin",
         "pane",
         "open",
         "--plugin",
         PLUGIN_ID,
         "--entrypoint",
-        entrypoint.as_str(),
+        entrypoint,
         "--focus",
-    ]) {
-        Ok((true, _, _)) => format!("opened {} ({})", entrypoint, PLUGIN_ID),
-        Ok((false, out, err)) => {
-            let msg = if err.trim().is_empty() { out } else { err };
-            format!("could not open {}: {}", entrypoint, msg.trim())
-        }
-        Err(e) => format!("could not run herdr: {}", e),
+    ])?;
+    if success {
+        return Ok(());
     }
+    let message = if err.trim().is_empty() { out } else { err };
+    Err(io::Error::other(format!(
+        "could not open {entrypoint}: {}",
+        message.trim()
+    )))
 }
 
-/// The same, for a caller that has not already asked herdr what is installed.
-pub(crate) fn manage_pane_hint() -> String {
-    manage_pane_command(&installed_plugins().unwrap_or_default())
+fn cmd_open_pane(entrypoint: &str) -> io::Result<()> {
+    if !matches!(entrypoint, "manage" | "starter") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "usage: herdr-lazy open-pane <manage|starter>",
+        ));
+    }
+    open_pane_for_action(entrypoint)
 }
 
 const DONE_MARKER: &str = "herdr-lazy set this machine up once; delete this file to redo it\n";
@@ -3493,6 +3468,7 @@ fn print_help() {
     println!("                    --previous uses the newest saved lockfile");
     println!("  ui                open the manage pane (also `manage`)");
     println!("  starter           open the workspace starter pane");
+    println!("  open-pane <name>  open a declared pane from an action");
     println!("  add <owner/repo>  add a plugin to the bundle");
     println!("  remove <owner/repo>  remove a plugin from the bundle");
     println!("  lock              write the lockfile from the current bundle");
@@ -3531,6 +3507,13 @@ fn main() {
         }
         "ui" | "manage" => ui::run(),
         "starter" => starter_ui::run(),
+        "open-pane" => match rest.first() {
+            Some(entrypoint) => cmd_open_pane(entrypoint),
+            None => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "usage: herdr-lazy open-pane <manage|starter>",
+            )),
+        },
         "restore" => {
             let previous = rest.contains(&"--previous");
             let targets: Vec<&str> = rest
@@ -4422,9 +4405,8 @@ command = "something.else"
     /// including the ones gated elsewhere, and each carries its own `platforms`.
     const WINDOWS_TWINS: &str = r#"{"id":"cli:plugin","result":{"plugins":[{"plugin_id":"herdr-lazy","name":"herdr-lazy","enabled":true,"source":{"kind":"github","owner":"natori-hrj","repo":"herdr-lazy"},"actions":[{"id":"probe","title":"Lazy: probe CLI bridge","platforms":["linux","macos"],"command":["./target/release/herdr-lazy","probe"]},{"id":"probe-windows","title":"Lazy: probe CLI bridge","platforms":["windows"],"command":["powershell","-Command","probe"]},{"id":"everywhere","title":"No platforms declared"}],"panes":[{"id":"manage","title":"herdr-lazy","placement":"overlay","platforms":["linux","macos"]},{"id":"manage-windows","title":"herdr-lazy","placement":"overlay","platforms":["windows"]}]}],"type":"plugin_list"}}"#;
 
-    /// The listing is not filtered by herdr, so it is filtered here. Without this, a plugin
-    /// that supports Windows shows every action twice under the same title on macOS, and half
-    /// of them refuse to run (`platform_unsupported`).
+    /// The listing is not filtered by herdr, so it is filtered here. Other plugins may still
+    /// declare platform-specific entries, and half of those refuse to run elsewhere.
     #[test]
     fn entries_for_other_platforms_are_not_shown() {
         let ps = parse_plugin_list(WINDOWS_TWINS).expect("payload should parse");
@@ -4440,28 +4422,6 @@ command = "something.else"
             assert_eq!(ids, vec!["probe", "everywhere"]);
             assert_eq!(panes, vec!["manage"]);
         }
-    }
-
-    /// The listing is filtered before this sees it, so exactly one `manage` survives — but its
-    /// id still differs by platform, which is what this resolves.
-    #[test]
-    fn an_ids_platform_variant_is_found_and_an_exact_match_wins() {
-        assert_eq!(
-            platform_variant(["probe", "init", "manage"].into_iter(), "manage"),
-            Some("manage".to_string())
-        );
-        assert_eq!(
-            platform_variant(["probe-windows", "manage-windows"].into_iter(), "manage"),
-            Some("manage-windows".to_string())
-        );
-        // An exact match wins wherever it sits, so a platform registering both is not a toss-up.
-        assert_eq!(
-            platform_variant(["manage-windows", "manage"].into_iter(), "manage"),
-            Some("manage".to_string())
-        );
-        // A name that merely starts with the base is not a variant of it.
-        assert_eq!(platform_variant(["managed"].into_iter(), "manage"), None);
-        assert_eq!(platform_variant([].into_iter(), "manage"), None);
     }
 
     /// `init` and the first-run bootstrap write the same file, so a new machine and an explicit
@@ -4655,10 +4615,8 @@ command = "something.else"
     }
 
     /// Every Windows-reachable command must name something the Windows launcher can spawn.
-    /// The manifest keeps the PowerShell forms for compatibility with its 0.7.5 floor; a
-    /// bare Unix path or `/bin/sh` would still be an install-time/runtime failure on older
-    /// Windows Herdr versions. Herdr 0.9.0 also resolves relative plugin-pane paths, but
-    /// retaining the explicit forms keeps all command kinds on one compatibility path.
+    /// Since the manifest floor includes Herdr 0.9.0, relative commands are resolved from the
+    /// plugin root. The only platform-specific command left is the PowerShell build step.
     #[test]
     fn every_windows_reachable_command_names_a_program_windows_can_spawn() {
         for e in manifest_entries(include_str!("../herdr-plugin.toml")) {
@@ -4667,14 +4625,29 @@ command = "something.else"
             }
             let (table, program) = (&e.table, &e.program);
             assert!(
-                !program.starts_with("./"),
-                "[[{table}]] command `{program}` is relative; CreateProcessW will not resolve it"
-            );
-            assert!(
                 !program.starts_with('/'),
                 "[[{table}]] command `{program}` is a POSIX absolute path that Windows cannot run"
             );
         }
+    }
+
+    #[test]
+    fn runtime_manifest_entries_are_shared_across_platforms() {
+        let entries = manifest_entries(include_str!("../herdr-plugin.toml"));
+
+        for table in ["startup", "events", "actions", "panes"] {
+            assert!(
+                entries
+                    .iter()
+                    .filter(|entry| entry.table == table)
+                    .all(ManifestEntry::everywhere),
+                "[[{table}]] should not need platform twins"
+            );
+        }
+        assert!(
+            entries.iter().all(|entry| !entry.id.ends_with("-windows")),
+            "runtime entry ids should not carry a Windows suffix"
+        );
     }
 
     #[test]
@@ -4964,11 +4937,6 @@ command = "something.else"
     }
 
     /// The floor herdr enforces and the floor the README promises have to be the same number.
-    ///
-    /// They disagreed once already — the manifest said 0.7.0 while the first-run setup needed
-    /// the 0.7.5 startup hook — and the failure mode was silent: herdr-lazy installed on an
-    /// older herdr and then did nothing, with no way to say why, because the missing hook is
-    /// the thing that would have printed the message.
     #[test]
     fn the_readme_and_the_manifest_agree_on_the_herdr_floor() {
         let floor = include_str!("../herdr-plugin.toml")
@@ -4982,54 +4950,5 @@ command = "something.else"
             "README does not say `{}`",
             promised
         );
-    }
-
-    /// Actions and panes are declared twice — once for Unix, once for Windows under a
-    /// `-windows` id — because their commands need different argv forms. Nothing stops
-    /// someone adding only one half, and nothing would fail: the test above only checks that
-    /// what *is* declared can be spawned, so a feature silently missing on one platform is
-    /// green CI. This guard keeps the platform variants paired.
-    #[test]
-    fn platform_split_entries_come_in_pairs() {
-        const SUFFIX: &str = "-windows";
-        let entries = manifest_entries(include_str!("../herdr-plugin.toml"));
-
-        for table in ["actions", "panes"] {
-            let of_table = || entries.iter().filter(|e| e.table == table);
-            let windows: Vec<&str> = of_table()
-                .filter(|e| e.declares("windows"))
-                .map(|e| e.id.as_str())
-                .collect();
-            let unix: Vec<&str> = of_table()
-                .filter(|e| !e.everywhere() && !e.declares("windows"))
-                .map(|e| e.id.as_str())
-                .collect();
-
-            for id in &unix {
-                let twin = format!("{id}{SUFFIX}");
-                assert!(
-                    windows.contains(&twin.as_str()),
-                    "[[{table}]] `{id}` has no `{twin}` — it would be missing on Windows"
-                );
-            }
-            for id in &windows {
-                let stem = id.strip_suffix(SUFFIX).unwrap_or(id);
-                assert!(
-                    unix.contains(&stem),
-                    "[[{table}]] `{id}` has no `{stem}` — it would be missing on Unix"
-                );
-            }
-        }
-
-        // `[[startup]]` has no id to pair on, so the check is coverage: every platform this
-        // plugin claims to support must have a startup hook, or the first-run bootstrap and
-        // auto-sync simply never fire there.
-        let startup = || entries.iter().filter(|e| e.table == "startup");
-        for platform in ["linux", "macos", "windows"] {
-            assert!(
-                startup().any(|e| e.everywhere() || e.declares(platform)),
-                "no [[startup]] entry runs on {platform}"
-            );
-        }
     }
 }
