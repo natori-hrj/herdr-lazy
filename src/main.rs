@@ -1142,15 +1142,26 @@ fn is_entry_line(l: &str) -> bool {
 ///
 /// This is the check that stops a fetched HTML error page, or a file that happens to live at
 /// that path and is not a plugin list, from being written over someone's list.
-fn looks_like_entry(l: &str) -> bool {
-    let repo = Spec::parse(l).repo;
+pub(crate) fn looks_like_entry(l: &str) -> bool {
+    let spec = Spec::parse(l);
+    let repo = &spec.repo;
     !repo.is_empty()
         && repo.contains('/')
         && !repo.starts_with('/')
+        && !repo.starts_with('-')
         && !repo.ends_with('/')
+        && !repo
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
         && repo
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "._-/".contains(c))
+        && spec.reference.as_deref().map_or(true, |reference| {
+            !reference.is_empty()
+                && !reference
+                    .chars()
+                    .any(|c| c.is_whitespace() || c.is_control())
+        })
 }
 
 /// Fetch someone else's `plugins.list`: the file as written, and the entries in it.
@@ -2441,6 +2452,12 @@ fn converge_with_installed_at(
     installed: Vec<Installed>,
 ) -> io::Result<()> {
     let all: Vec<Spec> = all.to_vec();
+    if let Some(invalid) = all.iter().find(|spec| !looks_like_entry(&spec.display())) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid plugin list entry `{}`", invalid.display()),
+        ));
+    }
     let desired: Vec<Spec> = if targets.is_empty() {
         all.clone()
     } else {
@@ -2991,6 +3008,15 @@ pub(crate) fn update_specs_to(
         println!("nothing to update.");
         return Ok(());
     }
+    if let Some(invalid) = desired
+        .iter()
+        .find(|spec| !looks_like_entry(&spec.display()))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid plugin list entry `{}`", invalid.display()),
+        ));
+    }
 
     // Restrict to named plugins, if any were given.
     let selected: Vec<&Spec> = if targets.is_empty() {
@@ -3177,6 +3203,12 @@ fn write_lock_at(p: &Path, desired: &[Spec], installed: &[Installed]) -> io::Res
 /// Returns a message rather than printing, because the manage pane calls this while it owns
 /// the screen — a stray `println!` there corrupts the display.
 pub(crate) fn add_to_list(spec: &str) -> io::Result<String> {
+    if !looks_like_entry(spec) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("`{}` is not an owner/repo entry", spec),
+        ));
+    }
     let p = bundle_path();
     if read_lines(&p).iter().any(|l| l.as_str() == spec) {
         return Ok(format!("{} is already in your list", spec));
@@ -4672,7 +4704,17 @@ command = "something.else"
         assert!(!looks_like_entry("just-a-name"));
         assert!(!looks_like_entry("/leading"));
         assert!(!looks_like_entry("trailing/"));
+        assert!(!looks_like_entry("--config/repo"));
+        assert!(!looks_like_entry("owner//repo"));
+        assert!(!looks_like_entry("owner/../repo"));
+        assert!(!looks_like_entry("owner/repo@bad ref"));
         assert!(!looks_like_entry(""));
+    }
+
+    #[test]
+    fn add_rejects_an_option_shaped_repository_before_touching_the_list() {
+        let error = add_to_list("--config/repo").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]

@@ -528,6 +528,11 @@ fn sanitize_log_output(input: &str) -> String {
     output
 }
 
+fn valid_repository_url(entry: &crate::registry::Entry) -> bool {
+    let expected = format!("https://github.com/{}", entry.full_name);
+    entry.url == expected || entry.url == format!("{}.git", expected)
+}
+
 const MAX_LOG_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_LOG_DISPLAY_LINES: usize = 10_000;
 const LOG_TRUNCATION_MARKER: &str = "[… log output truncated …]";
@@ -2321,8 +2326,11 @@ impl App {
         let Some(entry) = b.selected() else {
             return;
         };
-        if entry.url.is_empty() {
-            self.flash = Some(format!("{} has no repository URL", entry.full_name));
+        if !valid_repository_url(entry) {
+            self.flash = Some(format!(
+                "{} has an invalid repository URL",
+                sanitize_log_output(&entry.full_name)
+            ));
             return;
         }
         let url = entry.url.clone();
@@ -3296,9 +3304,12 @@ impl App {
                 pointer,
                 mark,
                 e.stars,
-                truncate(&e.full_name, 38),
+                truncate(&sanitize_log_output(&e.full_name), 38),
                 age,
-                truncate(&e.description, width.saturating_sub(58) as usize)
+                truncate(
+                    &sanitize_log_output(&e.description),
+                    width.saturating_sub(58) as usize
+                )
             )?;
         }
 
@@ -5336,6 +5347,34 @@ mod tests {
             full_name: name.to_string(),
             pushed_at: pushed_at.to_string(),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn marketplace_text_cannot_write_terminal_controls() {
+        assert_eq!(sanitize_log_output("safe\x1b[2Jname"), "safename");
+        assert_eq!(
+            sanitize_log_output("safe\x1b]8;;https://evil.example\x07name"),
+            "safename"
+        );
+    }
+
+    #[test]
+    fn repository_urls_must_match_the_selected_github_repository() {
+        let mut entry = market("owner/repo", "");
+        entry.url = "https://github.com/owner/repo".to_string();
+        assert!(valid_repository_url(&entry));
+        entry.url.push_str(".git");
+        assert!(valid_repository_url(&entry));
+
+        for url in [
+            "http://github.com/owner/repo",
+            "https://evil.example/owner/repo",
+            "--help",
+            "file:///tmp/repo",
+        ] {
+            entry.url = url.to_string();
+            assert!(!valid_repository_url(&entry), "accepted {url}");
         }
     }
 
