@@ -26,6 +26,13 @@ const INDEX_URL: &str = "https://assets.herdr.dev/plugins/index.json";
 /// path and refreshing is explicit (`r` in the browser, or a stale cache).
 const CACHE_SECONDS: u64 = 6 * 60 * 60;
 
+fn clean_external_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect()
+}
+
 /// One plugin as the marketplace describes it.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct Entry {
@@ -262,12 +269,12 @@ pub(crate) fn parse_index(body: &str) -> Result<Vec<Entry>, String> {
     let mut out = Vec::with_capacity(plugins.len());
     for p in plugins {
         let full_name = p.str_field("fullName").unwrap_or_default().to_string();
-        if full_name.is_empty() {
-            continue; // nothing we could install
+        if !crate::looks_like_entry(&full_name) || full_name.matches('/').count() != 1 {
+            continue; // malformed marketplace data must never become a CLI argument
         }
         out.push(Entry {
             full_name,
-            description: p.str_field("description").unwrap_or_default().to_string(),
+            description: clean_external_text(p.str_field("description").unwrap_or_default()),
             stars: p
                 .get("stars")
                 .and_then(|s| match s {
@@ -275,15 +282,15 @@ pub(crate) fn parse_index(body: &str) -> Result<Vec<Entry>, String> {
                     _ => None,
                 })
                 .unwrap_or(0),
-            language: p.str_field("language").unwrap_or_default().to_string(),
-            url: p.str_field("url").unwrap_or_default().to_string(),
-            pushed_at: p.str_field("pushedAt").unwrap_or_default().to_string(),
+            language: clean_external_text(p.str_field("language").unwrap_or_default()),
+            url: clean_external_text(p.str_field("url").unwrap_or_default()),
+            pushed_at: clean_external_text(p.str_field("pushedAt").unwrap_or_default()),
             topics: p
                 .get("topics")
                 .and_then(|t| t.as_array())
                 .map(|a| {
                     a.iter()
-                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .filter_map(|x| x.as_str().map(clean_external_text))
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -534,6 +541,29 @@ mod tests {
         let e = parse_index(r#"{"plugins":[{"stars":9},{"fullName":"a/b"}]}"#).unwrap();
         assert_eq!(e.len(), 1);
         assert_eq!(e[0].full_name, "a/b");
+    }
+
+    #[test]
+    fn malformed_names_are_dropped_before_they_can_become_cli_arguments() {
+        let e = parse_index(
+            r#"{"plugins":[
+                {"fullName":"--config/repo"},
+                {"fullName":"owner//repo"},
+                {"fullName":"owner/repo"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].full_name, "owner/repo");
+    }
+
+    #[test]
+    fn control_characters_are_removed_from_marketplace_text() {
+        let e = parse_index(
+            r#"{"plugins":[{"fullName":"owner/repo","description":"safe\u001b[2Jtext"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(e[0].description, "safe[2Jtext");
     }
 
     #[test]
