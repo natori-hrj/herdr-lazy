@@ -562,9 +562,12 @@ a file pane is a worse default than one.
 | [persiyanov/herdr-reviewr](https://github.com/persiyanov/herdr-reviewr) | review an agent's diff line by line and send comments back to it |
 | [razajamil/herdr-plugin-workspace-manager](https://github.com/razajamil/herdr-plugin-workspace-manager) | per-workspace tab/pane layouts, applied automatically |
 
-The first entry is this tool. `update` and the pane's `u` only act on what your list names, so
-leaving it out made herdr-lazy the one plugin herdr-lazy could not update. Removing it from the
-list does not endanger it: `--prune` refuses to uninstall it by identity, not by membership.
+The first entry is this tool. `herdr-lazy update` and the pane's `u` only act on what your list
+names, and record the resolved commits in the lockfile. Herdr's `herdr plugin update` can also
+update GitHub-managed plugins independently, using their recorded refs. Keeping herdr-lazy in
+the bundle lets its own update flow manage and lock its version alongside the other entries.
+Removing it from the list does not endanger it: `--prune` refuses to uninstall it by identity,
+not by membership.
 
 There is one more criterion, and it outranks the rest: somebody has to actually use these.
 Popularity is evidence of that, not a substitute — an earlier version of this set kept a plugin
