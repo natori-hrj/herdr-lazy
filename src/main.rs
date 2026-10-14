@@ -75,10 +75,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const SELF_REPO: &str = "natori-hrj/herdr-lazy";
 
 const DEFAULT_BUNDLE: &[&str] = &[
-    // Listed so the tool can be updated by the tool. `u` in the pane, and `update` on the
-    // command line, only act on entries in the list — leaving herdr-lazy out meant the one
-    // plugin you could not update with herdr-lazy was herdr-lazy. `--prune` never removes it
-    // either way; that is handled by identity, not by membership.
+    // Listed so `u` in the pane and `herdr-lazy update` can update this tool along with the
+    // bundle. Those actions only act on entries in the list; Herdr's `plugin update` can also
+    // update GitHub-managed plugins independently. `--prune` never removes herdr-lazy either
+    // way; that is handled by identity, not by membership.
     //
     // Updating it replaces the binary of the running process. That is fine on Unix, where the
     // open inode outlives the rename, and it has been done on Windows too (see #2) — but it is
@@ -2975,9 +2975,10 @@ where
 
 /// Re-resolve unpinned bundle entries to their latest commit.
 ///
-/// herdr has no `plugin update`; re-running `plugin install` is the update path — it reports
-/// `replaces: <id> from github:owner/repo@<old sha>` and keeps the plugin's config dir. So
-/// "update" is: install again without `--ref`, then diff the resolved commits.
+/// Herdr's `plugin update` refreshes GitHub-managed plugins from their recorded refs. This
+/// command instead re-resolves unpinned bundle entries to their latest commits, then records
+/// the result in herdr-lazy's lockfile. Re-running `plugin install` without `--ref` provides
+/// that resolution and keeps the plugin's config directory; we then diff the resolved commits.
 ///
 /// Pinned entries (`owner/repo@ref`) are skipped by design. A pin is a statement that this
 /// commit is the one you want; silently moving it would make the lockfile a lie. To move a
