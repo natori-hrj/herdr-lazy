@@ -1694,6 +1694,100 @@ impl CheckItem {
     }
 }
 
+fn json_string(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn check_item_json(item: &CheckItem) -> String {
+    let drifted = item
+        .drifted
+        .as_deref()
+        .map(json_string)
+        .unwrap_or_else(|| "null".to_string());
+    let update = match &item.update {
+        UpdateStatus::NotApplicable => "{\"status\":\"not_applicable\"}".to_string(),
+        UpdateStatus::Current => "{\"status\":\"current\"}".to_string(),
+        UpdateStatus::MaybeAvailable => "{\"status\":\"maybe_available\"}".to_string(),
+        UpdateStatus::Unknown(reason) => format!(
+            "{{\"status\":\"unknown\",\"reason\":{}}}",
+            json_string(reason)
+        ),
+    };
+    let maintenance = match &item.maintenance {
+        registry::MaintenanceStatus::Known { age, quiet } => format!(
+            "{{\"status\":\"known\",\"age\":{},\"quiet\":{}}}",
+            json_string(age),
+            quiet
+        ),
+        registry::MaintenanceStatus::Unknown(reason) => format!(
+            "{{\"status\":\"unknown\",\"reason\":{}}}",
+            json_string(reason)
+        ),
+    };
+    format!(
+        "{{\"spec\":{},\"missing\":{},\"drifted\":{},\"pin_unverifiable\":{},\"disabled\":{},\"weak_match\":{},\"update\":{},\"maintenance\":{}}}",
+        json_string(&item.spec.display()), item.missing, drifted, item.pin_unverifiable,
+        item.disabled, item.weak_match, update, maintenance
+    )
+}
+
+fn unlisted_plugins<'a>(desired: &[Spec], installed: &'a [Installed]) -> Vec<&'a Installed> {
+    installed
+        .iter()
+        .filter(|plugin| {
+            !desired
+                .iter()
+                .any(|spec| plugin.matches(spec) == Match::Strong)
+        })
+        .collect()
+}
+
+fn print_check_json(items: &[CheckItem], unlisted: &[&Installed]) {
+    let entries = items
+        .iter()
+        .map(check_item_json)
+        .collect::<Vec<_>>()
+        .join(",");
+    let extra =
+        unlisted
+            .iter()
+            .map(|plugin| {
+                format!(
+        "{{\"plugin_id\":{},\"name\":{},\"source_kind\":{},\"slug\":{},\"enabled\":{}}}",
+        json_string(&plugin.plugin_id), json_string(&plugin.name),
+        json_string(&plugin.source_kind),
+        plugin.slug.as_deref().map(json_string).unwrap_or_else(|| "null".to_string()),
+        plugin.enabled
+    )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+    println!(
+        "{{\"plugins\":[{}],\"installed_not_listed\":[{}]}}",
+        entries, extra
+    );
+}
+
+fn print_check_error_json(message: &str) {
+    println!(
+        "{{\"status\":\"unknown\",\"error\":{}}}",
+        json_string(message)
+    );
+}
+
 fn market_entry_for<'a>(
     spec: &Spec,
     installed: Option<&Installed>,
@@ -1908,7 +2002,12 @@ fn print_check_item(item: &CheckItem) {
     println!("  {} {} — {}", marker, item.spec.display(), detail);
 }
 
-fn print_check_report(items: &[CheckItem], market_note: &str, market_confident: bool) {
+fn print_check_report(
+    items: &[CheckItem],
+    unlisted: &[&Installed],
+    market_note: &str,
+    market_confident: bool,
+) {
     let healthy = items.iter().filter(|item| item.healthy()).count();
     let missing = items.iter().filter(|item| item.missing).count();
     let drifted = items.iter().filter(|item| item.drifted.is_some()).count();
@@ -1936,6 +2035,9 @@ fn print_check_report(items: &[CheckItem], market_note: &str, market_confident: 
             summary.push_str(&format!(" · {} {}", count, label));
         }
     }
+    if !unlisted.is_empty() {
+        summary.push_str(&format!(" · {} installed but not listed", unlisted.len()));
+    }
     println!("{}", summary);
     if market_confident {
         println!("update information: {}", market_note);
@@ -1950,6 +2052,17 @@ fn print_check_report(items: &[CheckItem], market_note: &str, market_confident: 
     for item in items {
         print_check_item(item);
     }
+    for plugin in unlisted {
+        println!(
+            "  ! {} — installed but not in the plugin list{}",
+            plugin.plugin_id,
+            plugin
+                .slug
+                .as_deref()
+                .map(|slug| format!(" ({})", slug))
+                .unwrap_or_default()
+        );
+    }
     println!("read-only: no plugin state, plugins.list, or plugins.lock was changed.");
 }
 
@@ -1957,7 +2070,7 @@ fn print_check_report(items: &[CheckItem], market_note: &str, market_confident: 
 ///
 /// Marketplace data is refreshed only because the user explicitly asked to run this command.
 /// A failed refresh never becomes a false current result: all update statuses remain uncertain.
-fn cmd_check() -> io::Result<()> {
+fn cmd_check(fail_on_problem: bool, json: bool) -> io::Result<()> {
     // Do not call desired_plugins here: its legacy migration is intentionally useful for
     // mutating commands, but a read-only check must not create or copy a list file.
     let configured_list_path = bundle_path();
@@ -1966,19 +2079,52 @@ fn cmd_check() -> io::Result<()> {
     let (desired, list_path) =
         match read_check_specs(&configured_list_path, legacy_list_path.as_deref()) {
             Ok((specs, path)) if specs.is_empty() => {
-                println!("no plugin list at {} — nothing to check.", path.display());
+                if json {
+                    print_check_error_json(&format!("no plugin list at {}", path.display()));
+                } else {
+                    println!("no plugin list at {} — nothing to check.", path.display());
+                }
+                if fail_on_problem {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "plugin list is empty",
+                    ));
+                }
                 return Ok(());
             }
             Ok((specs, path)) => (specs, path),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                println!(
-                    "no plugin list at {} — nothing to check.",
-                    configured_list_path.display()
-                );
+                if json {
+                    print_check_error_json(&format!(
+                        "no plugin list at {}",
+                        configured_list_path.display()
+                    ));
+                } else {
+                    println!(
+                        "no plugin list at {} — nothing to check.",
+                        configured_list_path.display()
+                    );
+                }
+                if fail_on_problem {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "plugin list is missing",
+                    ));
+                }
                 return Ok(());
             }
             Err(e) => {
-                println!("check: plugin list is unknown — {}", e);
+                if json {
+                    print_check_error_json(&format!("plugin list is unknown: {}", e));
+                } else {
+                    println!("check: plugin list is unknown — {}", e);
+                }
+                if fail_on_problem {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("plugin list is unknown: {}", e),
+                    ));
+                }
                 return Ok(());
             }
         };
@@ -1992,7 +2138,17 @@ fn cmd_check() -> io::Result<()> {
     let installed = match installed_plugins() {
         Ok(v) => v,
         Err(e) => {
-            println!("check: installed plugin state is unknown — {}", e);
+            if json {
+                print_check_error_json(&format!("installed plugin state is unknown: {}", e));
+            } else {
+                println!("check: installed plugin state is unknown — {}", e);
+            }
+            if fail_on_problem {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("installed plugin state is unknown: {}", e),
+                ));
+            }
             return Ok(());
         }
     };
@@ -2005,7 +2161,30 @@ fn cmd_check() -> io::Result<()> {
         Err(e) => (Vec::new(), format!("unavailable — {}", e), false),
     };
     let items = check_items(&desired, &installed, &market, market_confident);
-    print_check_report(&items, &market_note, market_confident);
+    let unlisted = unlisted_plugins(&desired, &installed);
+    if json {
+        print_check_json(&items, &unlisted);
+    } else {
+        print_check_report(&items, &unlisted, &market_note, market_confident);
+    }
+    if fail_on_problem {
+        if items
+            .iter()
+            .any(|item| item.pin_unverifiable || item.weak_match)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "plugin state is unverifiable",
+            ));
+        }
+        if items
+            .iter()
+            .any(|item| item.missing || item.drifted.is_some() || item.disabled)
+            || !unlisted.is_empty()
+        {
+            return Err(io::Error::other("plugin setup has problems"));
+        }
+    }
     Ok(())
 }
 
@@ -2572,9 +2751,11 @@ fn converge_with_installed_at(
 
     // Prune compares against the WHOLE list, never the filtered subset: an entry that was
     // filtered out is still wanted, and pruning against the subset would uninstall it.
-    if prune {
-        prune_extras(&all, &installed);
-    }
+    let prune_failed = if prune {
+        prune_extras(&all, &installed)
+    } else {
+        0
+    };
 
     println!(
         "\nsummary: {} present, {} installed, {} failed, {} desired total",
@@ -2592,6 +2773,12 @@ fn converge_with_installed_at(
         });
         write_lock_at(lock_destination, &all, &after)?;
     }
+    if failed > 0 || prune_failed > 0 {
+        return Err(io::Error::other(format!(
+            "{} install/uninstall operation(s) failed",
+            failed + prune_failed
+        )));
+    }
     Ok(())
 }
 
@@ -2601,9 +2788,10 @@ fn converge_with_installed_at(
 /// A missed removal is an annoyance the user can finish by hand; a wrong removal destroys a
 /// plugin they wanted. Skipped here are locally-linked plugins (herdr-lazy itself is usually
 /// one, and `uninstall` is the wrong verb for them anyway) and weak name-only matches.
-fn prune_extras(desired: &[Spec], installed: &[Installed]) {
+fn prune_extras(desired: &[Spec], installed: &[Installed]) -> usize {
     println!("\n-- prune --");
     let mut removed = 0;
+    let mut failed = 0;
     let mut kept = Vec::new();
 
     for p in installed {
@@ -2648,8 +2836,14 @@ fn prune_extras(desired: &[Spec], installed: &[Installed]) {
                 removed += 1;
                 println!("  ok");
             }
-            Ok((false, _, err)) => println!("  FAILED: {}", err.trim()),
-            Err(e) => println!("  could not run herdr: {}", e),
+            Ok((false, _, err)) => {
+                failed += 1;
+                println!("  FAILED: {}", err.trim());
+            }
+            Err(e) => {
+                failed += 1;
+                println!("  could not run herdr: {}", e);
+            }
         }
     }
 
@@ -2660,6 +2854,7 @@ fn prune_extras(desired: &[Spec], installed: &[Installed]) {
         }
     }
     println!("pruned {} plugin(s)", removed);
+    failed
 }
 
 /// Is this installed plugin herdr-lazy itself?
@@ -3113,6 +3308,12 @@ pub(crate) fn update_specs_to(
 
     let after = installed_plugins().unwrap_or(before);
     write_lock_at(lock_destination, desired, &after)?;
+    if failed > 0 {
+        return Err(io::Error::other(format!(
+            "{} update operation(s) failed",
+            failed
+        )));
+    }
     Ok(())
 }
 
@@ -3492,7 +3693,7 @@ fn print_help() {
     println!("                    write the default bundle, or adopt someone else's list");
     println!("  extras            list the opt-in extras you can pass to `init --extras`");
     println!("  doctor            check that every entry in your list still resolves");
-    println!("  check             report plugin state without changing anything");
+    println!("  check [--fail] [--json]  report plugin state without changing anything");
     println!("  list              show desired plugins");
     println!("  install [<repo>…] install what is missing, restore drifted pins");
     println!("  sync [--prune]    the same, plus --prune to remove what is not listed");
@@ -3526,7 +3727,7 @@ fn main() {
         ),
         "extras" => cmd_extras(),
         "doctor" => cmd_doctor(),
-        "check" => cmd_check(),
+        "check" => cmd_check(rest.contains(&"--fail"), rest.contains(&"--json")),
         "list" => cmd_list(),
         // `install` is what people look for; `sync` is what the operation is. Both, rather
         // than choosing and leaving the other as a dead end.
@@ -3598,7 +3799,12 @@ fn main() {
 
     if let Err(e) = result {
         eprintln!("error: {}", e);
-        std::process::exit(1);
+        let code = if cmd == "check" && e.kind() == io::ErrorKind::InvalidData {
+            2
+        } else {
+            1
+        };
+        std::process::exit(code);
     }
 }
 
