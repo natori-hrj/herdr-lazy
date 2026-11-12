@@ -140,6 +140,8 @@ herdr-lazy() {
 herdr-lazy init          # write the curated default list
 herdr-lazy list          # show what the list asks for
 herdr-lazy check         # inspect local state, update hints, and maintenance age without changing plugins
+herdr-lazy check --fail  # exit nonzero if plugins are missing, drifted, disabled, or unlisted
+herdr-lazy check --json  # print the report as JSON for scripts
 herdr-lazy sync          # install what is missing
 herdr-lazy update        # move unpinned entries to their latest commit
 herdr-lazy starter       # preview and start the current workspace
@@ -245,7 +247,7 @@ herdr-lazy update smarzban/herdr-file-viewer
 | `lock` | write the lockfile from the current bundle |
 | `auto-sync [on\|off]` | install missing plugins automatically when herdr starts |
 | `doctor` | check that every entry in your list still resolves |
-| `check` | report missing, drifted, disabled, and possibly stale plugins without changing plugin state |
+| `check [--fail] [--json]` | report plugin state and installed plugins absent from the list; automation flags are optional |
 | `probe [--raw]` | check the herdr bridge and show the resolved paths; `--raw` adds the full payloads |
 
 ### Already using herdr?
@@ -269,6 +271,13 @@ The marketplace check is intentionally honest about uncertainty. If refreshing i
 only stale cache data is available, update status is shown as unknown rather than current.
 `doctor` checks whether repositories resolve; `check` checks whether your local setup needs
 attention.
+
+For automation, `check --fail` exits 1 when a plugin is missing, drifted, disabled, or
+installed but absent from the list; it exits 2 when the list or Herdr state cannot be checked,
+or a pin cannot be verified. Possible updates and marketplace availability remain informational.
+`check --json` prints the same per-plugin fields as JSON, with `installed_not_listed` for
+plugins outside the declared list. `install`, `sync`, `restore`, and `update` exit 1 if an
+install or update operation fails.
 
 The same report includes each repository's last known push age. A repository with no push for
 180 days is marked `quiet`; this is a factual maintenance signal, not a claim that the plugin is
