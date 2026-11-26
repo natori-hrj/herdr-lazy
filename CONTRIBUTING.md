@@ -22,6 +22,8 @@ change to the matcher or to `--prune` can delete work.
 - CI runs `cargo fmt --check`, `cargo check --locked --all-targets`,
   `cargo clippy --locked --all-targets -- -D warnings`, and `cargo test --locked`.
   It also tests the declared minimum Rust version.
+- RustSec checks `Cargo.lock` on pull requests, pushes to `main`, daily, and before
+  releases. A known vulnerability fails the audit.
 - New behaviour comes with a test. Bug fixes come with a test that fails without the fix.
 - Comments explain *why*, not what. If a line looks redundant and is not, say why — the
   leading `./` in `herdr-plugin.toml` is the standing example.
