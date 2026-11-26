@@ -138,8 +138,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if ! draft=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            --json isDraft --jq .isDraft); then
+          if release=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,assets --jq '.isDraft, (.assets[].name)'); then
+            draft=${release%%$'\n'*}
+          else
             gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
               --title "$GITHUB_REF_NAME" --generate-notes --verify-tag --draft
             draft=true
@@ -148,6 +150,16 @@ jobs:
             gh release upload "$GITHUB_REF_NAME" assets/*.tar.gz assets/*.tar.gz.sha256 \
               --repo "$GITHUB_REPOSITORY" --clobber
             gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+          else
+            missing=()
+            for asset in assets/*.tar.gz assets/*.tar.gz.sha256; do
+              if ! grep -Fxq -- "${asset##*/}" <<< "$release"; then
+                missing+=("$asset")
+              fi
+            done
+            if [ "${#missing[@]}" -gt 0 ]; then
+              gh release upload "$GITHUB_REF_NAME" "${missing[@]}" --repo "$GITHUB_REPOSITORY"
+            fi
           fi
       - name: Verify download URLs
         run: |
