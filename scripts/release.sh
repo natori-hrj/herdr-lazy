@@ -63,7 +63,8 @@ echo
 
 step "checking the build is green first"
 run cargo fmt --check
-run cargo clippy --all-targets -- -D warnings
+run cargo check --locked --all-targets
+run cargo clippy --locked --all-targets -- -D warnings
 run cargo test --locked
 
 step "bumping the version in herdr-plugin.toml and Cargo.toml"

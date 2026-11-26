@@ -19,8 +19,9 @@ change to the matcher or to `--prune` can delete work.
 
 ## The bar for a pull request
 
-- `cargo test`, `cargo fmt --check`, and `cargo clippy --all-targets -- -D warnings` pass.
-  CI runs these plus the MSRV build; it must be green.
+- CI runs `cargo fmt --check`, `cargo check --locked --all-targets`,
+  `cargo clippy --locked --all-targets -- -D warnings`, and `cargo test --locked`.
+  It also tests the declared minimum Rust version.
 - New behaviour comes with a test. Bug fixes come with a test that fails without the fix.
 - Comments explain *why*, not what. If a line looks redundant and is not, say why — the
   leading `./` in `herdr-plugin.toml` is the standing example.
