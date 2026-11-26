@@ -151,10 +151,30 @@ jobs:
               --repo "$GITHUB_REPOSITORY" --clobber
             gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
           else
+            download_asset() {
+              gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+                --pattern "$1" --output -
+            }
+
             missing=()
-            for asset in assets/*.tar.gz assets/*.tar.gz.sha256; do
-              if ! grep -Fxq -- "${asset##*/}" <<< "$release"; then
-                missing+=("$asset")
+            for archive in assets/*.tar.gz; do
+              name=${archive##*/}
+              checksum="$archive.sha256"
+              if grep -Fxq -- "$name" <<< "$release"; then
+                if ! grep -Fxq -- "$name.sha256" <<< "$release"; then
+                  digest=$(download_asset "$name" | sha256sum)
+                  printf '%s\n' "${digest%% *}" > "$checksum"
+                  missing+=("$checksum")
+                fi
+              elif grep -Fxq -- "$name.sha256" <<< "$release"; then
+                published_digest=$(download_asset "$name.sha256")
+                if [ "$published_digest" != "$(cat "$checksum")" ]; then
+                  echo "::error::$name does not match the published checksum" >&2
+                  exit 1
+                fi
+                missing+=("$archive")
+              else
+                missing+=("$archive" "$checksum")
               fi
             done
             if [ "${#missing[@]}" -gt 0 ]; then
