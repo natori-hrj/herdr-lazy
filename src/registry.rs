@@ -13,11 +13,12 @@
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::json;
 
 const INDEX_URL: &str = "https://assets.herdr.dev/plugins/index.json";
+const MAX_INDEX_BYTES: u64 = 2 * 1024 * 1024;
 
 /// How long a cached copy is considered good.
 ///
@@ -229,11 +230,24 @@ fn cache_age_seconds() -> Option<u64> {
 /// install script use curl.
 fn download() -> Result<String, String> {
     let attempt = |prog: &str, args: &[&str]| -> Option<String> {
-        let out = Command::new(prog).args(args).output().ok()?;
-        if !out.status.success() {
+        let mut child = Command::new(prog)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let body = match crate::read_limited(child.stdout.take()?, MAX_INDEX_BYTES) {
+            Ok(Some(body)) => body,
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        };
+        if !child.wait().ok()?.success() {
             return None;
         }
-        let body = String::from_utf8_lossy(&out.stdout).to_string();
+        let body = String::from_utf8_lossy(&body).to_string();
         if body.trim().is_empty() {
             None
         } else {
