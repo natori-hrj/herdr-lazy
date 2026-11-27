@@ -456,13 +456,20 @@ pane also shows stars and the time since the repository's last push, such as `3d
 Press `ctrl+o` to open the repository before installing it.
 
 Search terms are ANDed and each may match the name, description or topics, so `worktree fzf`
-finds a worktree plugin whose description mentions fzf.
+finds a worktree plugin whose description mentions fzf. When no literal result passes the
+active filters, a single abbreviation of 3–12 ASCII letters or digits can match prefixes
+of repository name parts, such as `wti` for `worktree-tool-inspector`.
 
 `tab` narrows to a category — worktree, notifications, agents, and so on — for when you want
 to see what exists rather than search for something you can already name. It cycles back to
 `all`, and works alongside the query. Categories come from keywords matched against the name,
 description and topics, because GitHub topics alone miss more than half the plugins; anything
 that matches nothing lands in `other` rather than disappearing.
+
+`ctrl+f` cycles through any, installed, and not installed. The filter uses Herdr's installed
+plugins independently of your list. `ctrl+n` toggles between the default stars order and
+alphabetical order by repository slug. The header shows the result count and catalog size.
+`ctrl+l` clears the query and filters, restores stars order, and selects the first result.
 
 Enter adds to your list rather than installing outright: one keystroke on a fuzzy match
 should not run a stranger's build script. The list is where intent is recorded.
