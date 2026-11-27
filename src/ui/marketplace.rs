@@ -105,7 +105,7 @@ fn search_line(
     let query = query_tail(&browser.query, available - controls.len());
     write!(
         out,
-        "\x1b[1m{prefix}{query}\x1b[0m\x1b[7m \x1b[0m\x1b[2m{controls}\x1b[0m"
+        "\x1b[1m{prefix}\x1b[0m\x1b[1m{query}\x1b[0m\x1b[7m \x1b[0m\x1b[2m{controls}\x1b[0m"
     )?;
     Ok(divider_controls)
 }
@@ -378,6 +378,7 @@ mod tests {
         browser.query = "unmatched".into();
         let empty = frame(&app, 80, 24, false);
         let danger = app.theme.color(Role::Danger);
+        assert!(empty.contains("\x1b[1mSearch \x1b[0m\x1b[1munmatched\x1b[0m\x1b[7m "));
         assert!(empty.contains(&format!("  {danger}refresh failed: offline")));
         assert!(empty.contains("\x1b[22;1H[Enter] Add"));
     }
