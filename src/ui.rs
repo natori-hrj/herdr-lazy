@@ -14,8 +14,14 @@
 
 use std::{
     io::{self, Write},
+    sync::mpsc::{self, Receiver, TryRecvError},
     time::Duration,
 };
+
+mod managed_list;
+mod plugin_detail;
+
+use crate::theme::{Color, Role, Theme};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
@@ -60,16 +66,14 @@ impl Status {
         }
     }
 
-    /// ANSI colour. Written directly rather than via crossterm's style API — one escape code
-    /// is simpler to read here than a builder chain.
-    fn colour(&self) -> &'static str {
+    fn role(&self) -> Role {
         match self {
-            Status::Ok => "\x1b[32m",                               // green
-            Status::Missing | Status::Drifted { .. } => "\x1b[33m", // yellow
-            Status::Unverifiable | Status::Disabled => "\x1b[36m",  // cyan
-            Status::Extra => "\x1b[31m",                            // red
-            Status::ExtraLocal => "\x1b[35m",                       // magenta
-            Status::SelfEntry => "\x1b[34m",                        // blue
+            Status::Ok => Role::Success,
+            Status::Missing | Status::Drifted { .. } => Role::Warning,
+            Status::Unverifiable | Status::Disabled => Role::Accent,
+            Status::Extra => Role::Danger,
+            Status::ExtraLocal => Role::Local,
+            Status::SelfEntry => Role::Info,
         }
     }
 
@@ -147,11 +151,11 @@ impl Row {
         }
     }
 
-    fn colour(&self) -> &'static str {
+    fn color(&self, theme: Theme) -> Color {
         if self.herdr_warning.is_some() {
-            "\x1b[33m"
+            theme.color(Role::Warning)
         } else {
-            self.status.colour()
+            theme.color(self.status.role())
         }
     }
 
@@ -739,7 +743,7 @@ fn rows_with_herdr_version(
 
 /// Screen row where the list starts, in both views.
 ///
-/// The header is two lines (title + rule) in the list view and three in the browser (title,
+/// The standard header is two lines (title + rule) in Manage and three in the browser (title,
 /// query, rule). Click handling and drawing must agree on this, so it lives in one place
 /// rather than being counted twice.
 const LIST_TOP: usize = 2;
@@ -1162,10 +1166,13 @@ impl AdoptPicker {
     }
 }
 
+type MarketplaceResult = Result<(Vec<crate::registry::Entry>, String), String>;
+
 /// `Default` so tests can build one from just the rows they care about; this struct grows a
 /// field per view, and every fixture should not have to know about all of them.
 #[derive(Default)]
 struct App {
+    theme: Theme,
     rows: Vec<Row>,
     /// The point-in-time workspace in which Herdr opened this pane, when available.
     workspace_context: Option<crate::context::PluginContext>,
@@ -1184,6 +1191,7 @@ struct App {
     last_event: Option<crate::context::PluginEvent>,
     /// Present while the marketplace browser is open; the pane draws that instead of the list.
     browser: Option<crate::browse::Browser>,
+    marketplace_refresh: Option<Receiver<MarketplaceResult>>,
     /// Present while the extras picker is open, for the same reason.
     extras: Option<ExtrasPicker>,
     /// Present while the focused-agent recommendations are open.
@@ -1191,11 +1199,12 @@ struct App {
     /// Present while reading someone else's list.
     adopt: Option<AdoptPicker>,
     /// `?` — the full keymap. The footer only has room for the common half.
-    help: bool,
+    help: Option<usize>,
     /// Open details for the row at this index: what the plugin does and how to reach it.
     detail_of: Option<usize>,
     /// Which action is highlighted in the details view.
     detail_cursor: usize,
+    detail_scroll: usize,
     /// Changes fetched for the currently open details, and which row they belong to. Keyed by
     /// row so reopening the same plugin does not re-hit the network, and a stale result for a
     /// different plugin never shows.
@@ -1234,7 +1243,7 @@ enum ProfileAction {
 }
 
 impl App {
-    fn load() -> App {
+    fn load(theme: Theme) -> App {
         let context = crate::context::read_context_from_env();
         let last_event = context
             .context
@@ -1259,6 +1268,7 @@ impl App {
         let market = crate::registry::cached_entries();
         match installed_plugins() {
             Ok(installed) => App {
+                theme,
                 rows: rows_with_herdr_version(&desired, &installed, &market, herdr_version),
                 workspace_context: workspace_context.clone(),
                 workspace_profile: workspace_profile.clone(),
@@ -1268,12 +1278,14 @@ impl App {
                 context_warning: context_warning.clone(),
                 last_event: last_event.clone(),
                 browser: None,
+                marketplace_refresh: None,
                 extras: None,
                 recommendations: None,
                 adopt: None,
-                help: false,
+                help: None,
                 detail_of: None,
                 detail_cursor: 0,
+                detail_scroll: 0,
                 detail_changes: None,
                 log_view: None,
                 machine_view: None,
@@ -1285,6 +1297,7 @@ impl App {
                 flash: None,
             },
             Err(e) => App {
+                theme,
                 rows: Vec::new(),
                 workspace_context,
                 workspace_profile,
@@ -1294,12 +1307,14 @@ impl App {
                 context_warning,
                 last_event,
                 browser: None,
+                marketplace_refresh: None,
                 extras: None,
                 recommendations: None,
                 adopt: None,
-                help: false,
+                help: None,
                 detail_of: None,
                 detail_cursor: 0,
+                detail_scroll: 0,
                 detail_changes: None,
                 log_view: None,
                 machine_view: None,
@@ -1316,6 +1331,7 @@ impl App {
     fn refresh(&mut self) {
         let (cursor, flash) = (self.cursor, self.flash.take());
         let (browser, help) = (self.browser.take(), self.help);
+        let marketplace_refresh = self.marketplace_refresh.take();
         let profile_open = self.profile_open;
         let pending_profile = self.pending_profile;
         let extras = self.extras.take();
@@ -1323,8 +1339,9 @@ impl App {
         let adopt = self.adopt.take();
         let changes = self.detail_changes.take();
         let logs = self.log_view.take();
-        *self = App::load();
+        *self = App::load(self.theme);
         self.browser = browser;
+        self.marketplace_refresh = marketplace_refresh;
         self.profile_open = profile_open;
         self.pending_profile = pending_profile;
         self.extras = extras;
@@ -1522,9 +1539,9 @@ impl App {
 
     fn profile_suffix(&self) -> String {
         if self.workspace_profile.is_some() {
-            " · \x1b[36m[p] project profile\x1b[2m".to_string()
+            " · [p] project profile".to_string()
         } else if self.profile_error.is_some() {
-            " · \x1b[31m[p] invalid project profile\x1b[2m".to_string()
+            " · [p] invalid project profile".to_string()
         } else {
             String::new()
         }
@@ -1554,12 +1571,16 @@ impl App {
         } else {
             "recommendations"
         };
-        format!(
-            " · \x1b[36m[n] {} {} for {}\x1b[2m",
-            count,
-            noun,
-            agent.label()
-        )
+        format!(" · [n] {} {} for {}", count, noun, agent.label())
+    }
+
+    fn help_context(&self) -> String {
+        [
+            self.context_suffix(),
+            self.profile_suffix(),
+            self.recommendation_suffix(),
+        ]
+        .concat()
     }
 
     fn global_specs(&self) -> Vec<Spec> {
@@ -1736,28 +1757,23 @@ impl App {
 
     /// How many rows fit, and which one is at the top. Used by both drawing and clicking.
     fn list_window(&self, height: u16) -> (usize, usize) {
-        let visible = (height as usize).saturating_sub(6).max(1);
-        let start = if self.cursor >= visible {
-            self.cursor - visible + 1
-        } else {
-            0
-        };
+        let top = managed_list::list_top(height);
+        let visible = usize::from(footer_start_row(height))
+            .saturating_sub(top + 1)
+            .max(1);
+        let start = self.cursor.saturating_sub(visible - 1);
         (visible, start)
     }
 
     /// Which row is under this screen line, if any.
     fn row_at(&self, screen_row: u16, height: u16) -> Option<usize> {
+        if self.error.is_some() || height == 0 {
+            return None;
+        }
         let (visible, start) = self.list_window(height);
-        let y = screen_row as usize;
-        if y < LIST_TOP {
-            return None; // header
-        }
-        let idx = start + (y - LIST_TOP);
-        if y - LIST_TOP < visible && idx < self.rows.len() {
-            Some(idx)
-        } else {
-            None
-        }
+        let offset = usize::from(screen_row).checked_sub(managed_list::list_top(height))?;
+        let idx = start + offset;
+        (offset < visible && idx < self.rows.len()).then_some(idx)
     }
 
     fn open_detail(&mut self) {
@@ -1766,6 +1782,7 @@ impl App {
         };
         self.detail_of = Some(self.cursor);
         self.detail_cursor = 0;
+        self.detail_scroll = 0;
         self.flash = None;
 
         // Fetch only for a plugin the offline marker already flagged. Opening the details of
@@ -2235,20 +2252,72 @@ impl App {
         Ok(())
     }
 
-    /// `/` — open the marketplace browser.
+    /// Open immediately from disk, refreshing in the background if needed.
     fn open_browser(&mut self, force_refresh: bool) {
-        match crate::registry::load(force_refresh) {
-            Ok((entries, note)) => {
-                let listed: Vec<String> = crate::desired_plugins()
-                    .iter()
-                    .map(|l| crate::Spec::parse(l).repo)
-                    .collect();
-                self.browser = Some(crate::browse::Browser::new(entries, note, listed));
-                self.flash = None;
+        self.flash = None;
+        if self.browser.is_none() {
+            let listed = crate::desired_plugins()
+                .iter()
+                .map(|line| crate::Spec::parse(line).repo)
+                .collect();
+            let (entries, note, fresh) = match crate::registry::browser_cache() {
+                Some(cache) => (cache.entries, cache.note, cache.fresh),
+                None => (Vec::new(), String::new(), false),
+            };
+            self.browser = Some(crate::browse::Browser::new(entries, note, listed));
+            if fresh && !force_refresh {
+                return;
             }
-            // Browsing is a convenience over someone else's undocumented endpoint; failing to
-            // reach it must not look like herdr-lazy is broken.
-            Err(e) => self.flash = Some(format!("marketplace unavailable — {}", e)),
+        }
+        self.start_marketplace_refresh(move || crate::registry::load(force_refresh));
+    }
+
+    fn start_marketplace_refresh(
+        &mut self,
+        load: impl FnOnce() -> MarketplaceResult + Send + 'static,
+    ) {
+        if self.marketplace_refresh.is_some() {
+            return;
+        }
+        let (send, receive) = mpsc::channel();
+        match std::thread::Builder::new()
+            .name("marketplace".to_string())
+            .spawn(move || {
+                let _ = send.send(load());
+            }) {
+            Ok(_) => self.marketplace_refresh = Some(receive),
+            Err(error) => self.apply_marketplace_result(Err(error.to_string())),
+        }
+    }
+
+    fn poll_marketplace(&mut self) -> bool {
+        let Some(receive) = self.marketplace_refresh.as_ref() else {
+            return false;
+        };
+        let result = match receive.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => Err("refresh worker stopped".to_string()),
+        };
+        self.marketplace_refresh = None;
+        // Esc cancels delivery to the browser. Keep one worker slot until completion so
+        // reopening or holding Ctrl+R cannot fan out more requests.
+        if self.browser.is_none() {
+            return false;
+        }
+        self.apply_marketplace_result(result);
+        true
+    }
+
+    fn apply_marketplace_result(&mut self, result: MarketplaceResult) {
+        let Some(browser) = self.browser.as_mut() else {
+            return;
+        };
+        match result {
+            Ok((entries, note)) => browser.replace_entries(entries, note),
+            Err(error) => {
+                browser.source_note = format!("refresh failed: {}", sanitize_log_output(&error));
+            }
         }
     }
 
@@ -2565,8 +2634,8 @@ impl App {
     }
 
     fn draw(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
-        if self.help {
-            return self.draw_help(out, width, height);
+        if let Some(offset) = self.help {
+            return draw_help(out, width, height, offset, &self.help_context());
         }
         if self.pending_bind.is_some() {
             return self.draw_bind_confirm(out, width, height);
@@ -2581,7 +2650,7 @@ impl App {
             return self.draw_logs(out, width, height);
         }
         if self.detail_of.is_some() {
-            return self.draw_detail(out, width, height);
+            return plugin_detail::draw(self, out, width, height);
         }
         if self.browser.is_some() {
             return self.draw_browser(out, width, height);
@@ -2606,6 +2675,7 @@ impl App {
 
     /// Show the exact change before making it.
     fn draw_bind_confirm(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        let success = self.theme.color(Role::Success);
         let rule = rule_line(width);
         let (target, key) = self.pending_bind.clone().expect("checked by caller");
         let plugin_id = self
@@ -2631,7 +2701,7 @@ impl App {
             format!("type = \"{}\"", kind),
             format!("command = \"{}\"", command),
         ] {
-            writeln!(out, "   \x1b[32m{}\x1b[0m\r", line)?;
+            writeln!(out, "   {success}{}\x1b[0m\r", line)?;
         }
         writeln!(out, "\r")?;
         writeln!(
@@ -2661,6 +2731,7 @@ impl App {
         width: u16,
         height: u16,
     ) -> io::Result<()> {
+        let warning = self.theme.color(Role::Warning);
         let rule = rule_line(width);
         let action = self.pending_profile.expect("checked by caller");
         let profile_path = self
@@ -2672,7 +2743,7 @@ impl App {
         write!(out, "\x1b[H\x1b[2J")?;
         writeln!(
             out,
-            "\x1b[1m workspace profile\x1b[0m  \x1b[33mconfirm\x1b[0m\r"
+            "\x1b[1m workspace profile\x1b[0m  {warning}confirm\x1b[0m\r"
         )?;
         writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
         writeln!(
@@ -2735,16 +2806,18 @@ impl App {
 
     /// Show the project-scoped diff and its safe, explicit actions.
     fn draw_profile(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        let danger = self.theme.color(Role::Danger);
+        let accent = self.theme.color(Role::Accent);
         let rule = rule_line(width);
         write!(out, "\x1b[H\x1b[2J")?;
         writeln!(
             out,
-            "\x1b[1m workspace profile\x1b[0m  \x1b[36mproject-scoped\x1b[0m\r"
+            "\x1b[1m workspace profile\x1b[0m  {accent}project-scoped\x1b[0m\r"
         )?;
         writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
 
         let Some(profile) = self.workspace_profile.as_ref() else {
-            writeln!(out, " \x1b[31mprofile is unavailable:\x1b[0m\r")?;
+            writeln!(out, " {danger}profile is unavailable:\x1b[0m\r")?;
             writeln!(
                 out,
                 "   {}\r",
@@ -2854,8 +2927,9 @@ impl App {
         height: u16,
         rule: &str,
     ) -> io::Result<()> {
+        let accent = self.theme.color(Role::Accent);
         let footer = match &self.flash {
-            Some(message) => format!("\x1b[36m{}\x1b[0m", message),
+            Some(message) => format!("{accent}{}\x1b[0m", message),
             None => "\x1b[1m[s]\x1b[0m sync  \x1b[1m[r]\x1b[0m restore lock  \
                      \x1b[1m[m]\x1b[0m merge into global  \x1b[1m[esc/q]\x1b[0m back"
                 .to_string(),
@@ -2872,6 +2946,7 @@ impl App {
 
     /// Show the native herdr log response without leaving the manage pane.
     fn draw_logs(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        let danger = self.theme.color(Role::Danger);
         let view = self.log_view.as_ref().expect("checked by caller");
         let rule = rule_line(width);
         let content_width = (width as usize).saturating_sub(2).max(1);
@@ -2890,7 +2965,7 @@ impl App {
         writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
 
         if view.error.is_some() {
-            writeln!(out, " \x1b[31mcould not read plugin logs:\x1b[0m\r")?;
+            writeln!(out, " {danger}could not read plugin logs:\x1b[0m\r")?;
             for line in lines.iter().skip(start).take(visible) {
                 writeln!(out, "   {}\r", line)?;
             }
@@ -2927,335 +3002,10 @@ impl App {
         out.flush()
     }
 
-    /// What this plugin does, and how to actually use it.
-    ///
-    /// A distro that installs seven plugins in one go leaves the user holding seven things
-    /// they did not choose individually and cannot obviously operate. herdr already knows the
-    /// answer — every manifest declares its actions, panes and events — so the pane can just
-    /// show it, and run the actions too.
-    fn draw_detail(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
-        let rule = rule_line(width);
-        let idx = self.detail_of.expect("checked by caller");
-        let Some(row) = self.rows.get(idx) else {
-            return Ok(());
-        };
-        write!(out, "\x1b[H\x1b[2J")?;
-        writeln!(out, "\x1b[1m {}\x1b[0m\r", row.label)?;
-        writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
-
-        let Some(d) = row.detail.as_ref() else {
-            writeln!(
-                out,
-                " \x1b[2mnot installed yet — press i to install, then look again\x1b[0m\r"
-            )?;
-            let footer = self
-                .flash
-                .as_deref()
-                .map(|message| format!("\x1b[36m{}\x1b[0m", message))
-                .unwrap_or_else(|| "\x1b[2many key goes back\x1b[0m".to_string());
-            write!(
-                out,
-                "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r\n",
-                footer_start_row(height),
-                rule,
-                footer
-            )?;
-            return out.flush();
-        };
-
-        let items = Self::bindable(d);
-
-        if !d.description.is_empty() {
-            for line in wrap(&d.description, (width as usize).saturating_sub(3)) {
-                writeln!(out, " {}\r", line)?;
-            }
-            writeln!(out, "\r")?;
-        }
-
-        if let Some(maintenance) = row.maintenance.as_ref() {
-            if let Some(age) = maintenance.age() {
-                let quiet = if maintenance.is_quiet() {
-                    " · quiet (fact only)"
-                } else {
-                    ""
-                };
-                writeln!(out, " maintenance: last pushed {} ago{}\r", age, quiet)?;
-            }
-        }
-
-        if items.is_empty() && d.events.is_empty() {
-            writeln!(
-                out,
-                " \x1b[2mthis plugin declares no actions, panes or events — it may work \
-                 entirely on its own\x1b[0m\r"
-            )?;
-        }
-
-        // Actions and panes in one list, because `enter` and `b` treat them the same way and
-        // the cursor indexes into it. Two separate sections would mean two things claiming to
-        // be "the highlighted one".
-        if !items.is_empty() {
-            writeln!(
-                out,
-                " \x1b[1mthings you can run\x1b[0m  \x1b[2m(enter runs it · b binds it to a key)\x1b[0m\r"
-            )?;
-            for (i, (target, label)) in items.iter().enumerate() {
-                let sel = if i == self.detail_cursor {
-                    "\x1b[7m>"
-                } else {
-                    " "
-                };
-                let kind = match target {
-                    crate::BindTarget::Action(_) => "action",
-                    crate::BindTarget::Pane(_) => "pane",
-                };
-                writeln!(
-                    out,
-                    "{}\x1b[0m  {:<44} \x1b[2m{:<7}{}\x1b[0m\r",
-                    sel,
-                    truncate(label, 44),
-                    kind,
-                    target.id()
-                )?;
-            }
-            writeln!(out, "\r")?;
-        }
-
-        if !d.events.is_empty() {
-            writeln!(
-                out,
-                " \x1b[1mruns by itself on\x1b[0m  \x1b[2m{}\x1b[0m\r",
-                d.events.join(", ")
-            )?;
-            writeln!(out, "\r")?;
-        }
-
-        // What changed since install — the point of the whole feature. Only present when this
-        // plugin was flagged and the fetch happened on open; a plugin with no marker shows
-        // nothing here, which is correct.
-        if let Some((row_idx, changes)) = &self.detail_changes {
-            if *row_idx == idx {
-                use crate::github::Changes;
-                match changes {
-                    Changes::Commits(cs) if !cs.is_empty() => {
-                        writeln!(
-                            out,
-                            " \x1b[1m\x1b[33m{} new commit(s) since you installed\x1b[0m  \
-                             \x1b[2m(press u to update)\x1b[0m\r",
-                            cs.len()
-                        )?;
-                        for subject in cs.iter().take(8) {
-                            writeln!(
-                                out,
-                                "   \x1b[2m·\x1b[0m {}\r",
-                                truncate(subject, width.saturating_sub(6) as usize)
-                            )?;
-                        }
-                        if cs.len() > 8 {
-                            writeln!(out, "   \x1b[2m… and {} more\x1b[0m\r", cs.len() - 8)?;
-                        }
-                        writeln!(out, "\r")?;
-                    }
-                    Changes::Commits(_) => {} // marker was stale; nothing actually newer
-                    Changes::ManyPlus(n) => {
-                        writeln!(
-                            out,
-                            " \x1b[33m{}+ commits behind\x1b[0m \x1b[2m— more than one page; \
-                             press u to catch up\x1b[0m\r\r",
-                            n
-                        )?;
-                    }
-                    Changes::Unknown(why) => {
-                        writeln!(
-                            out,
-                            " \x1b[2mcould not check for changes: {}\x1b[0m\r\r",
-                            why
-                        )?;
-                    }
-                }
-            }
-        }
-
-        if let Some((target, _)) = items.get(self.detail_cursor) {
-            // Show the lines that `b` would actually write, not a fixed example — panes and
-            // actions produce different `type` values, and a wrong example here would send
-            // someone to hand-write a binding herdr ignores.
-            let (kind, command) = crate::bind_toml_fields(target, &d.plugin_id);
-            writeln!(
-                out,
-                " \x1b[2mb binds the highlighted one:  type = \"{}\"  command = \"{}\"\x1b[0m\r",
-                kind, command
-            )?;
-        }
-
-        let footer = if self.awaiting_bind {
-            "\x1b[33mpress a letter to bind this to prefix+shift+<letter>, or esc\x1b[0m"
-                .to_string()
-        } else {
-            match &self.flash {
-                Some(m) => format!("\x1b[36m{}\x1b[0m", m),
-                None => "\x1b[1m[enter]\x1b[0m run  \x1b[1m[b]\x1b[0m bind to a key  \
-                         \x1b[1m[L]\x1b[0m logs  \x1b[1m[j/k]\x1b[0m move  \
-                         \x1b[1m[esc]\x1b[0m back"
-                    .to_string(),
-            }
-        };
-        write!(
-            out,
-            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r\n",
-            footer_start_row(height),
-            rule,
-            footer
-        )?;
-        out.flush()
-    }
-
-    /// Every key, grouped by what it acts on.
-    ///
-    /// The list's keys are deliberately paired: lowercase is the row under the cursor,
-    /// uppercase is everything. That rule is invisible in the footer, which has room for one
-    /// of each pair at most, so it is spelled out here.
-    fn draw_help(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
-        let rule = rule_line(width);
-        write!(out, "\x1b[H\x1b[2J")?;
-        // The one rule the whole keymap follows, stated before any of the keys.
-        writeln!(
-            out,
-            "\x1b[1m keys\x1b[0m   \x1b[2mlowercase acts on the selected row ·              UPPERCASE means bulk or special actions\x1b[0m\r"
-        )?;
-        writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
-
-        let optional_status = [
-            self.context_suffix(),
-            self.profile_suffix(),
-            self.recommendation_suffix(),
-        ]
-        .into_iter()
-        .filter(|status| !status.is_empty())
-        .collect::<String>();
-        if !optional_status.is_empty() {
-            writeln!(out, " \x1b[2moptional context{}\x1b[0m\r", optional_status)?;
-        }
-
-        let section = |out: &mut dyn Write, title: &str, keys: &[(&str, &str)]| -> io::Result<()> {
-            writeln!(out, " \x1b[1m{}\x1b[0m\r", title)?;
-            for (k, desc) in keys {
-                writeln!(out, "   \x1b[1m{:<12}\x1b[0m {}\r", k, desc)?;
-            }
-            writeln!(out, "\r")
-        };
-
-        section(
-            out,
-            "choosing what to act on",
-            &[
-                ("space", "tick or untick this row (click does the same)"),
-                ("esc", "clear the selection"),
-                (
-                    "",
-                    "with nothing ticked, every action below uses the cursor row",
-                ),
-            ],
-        )?;
-        section(
-            out,
-            "acting on it",
-            &[
-                (
-                    "i / I",
-                    "install what is missing, and put drifted pins back",
-                ),
-                (
-                    "u / U",
-                    "update to the latest commit (pinned entries are skipped)",
-                ),
-                ("x / X", "uninstall — X removes everything not in your list"),
-                ("r / R", "restore to the commits recorded in the lockfile"),
-                ("E", "enable selected installed plugin(s)"),
-                (
-                    "D",
-                    "disable selected installed plugin(s) — herdr-lazy is protected",
-                ),
-                (
-                    "L",
-                    "show the selected installed plugin's recent command logs",
-                ),
-            ],
-        )?;
-        section(
-            out,
-            "optional tools and your list",
-            &[
-                ("a", "add the selected installed plugin(s) to your list"),
-                ("d", "remove this entry (does not uninstall)"),
-                (
-                    "/",
-                    "search the marketplace — enter adds, ctrl+o opens the repo",
-                ),
-                (
-                    "e",
-                    "extras — opt-in picks, ticked with space and added with enter",
-                ),
-                (
-                    "f",
-                    "read someone else's list — tick what you want, enter takes it",
-                ),
-                (
-                    "p",
-                    "review the workspace profile — sync, restore its lock, or merge explicitly",
-                ),
-                (
-                    "w",
-                    "open the workspace starter — preview, sync, then launch declared targets",
-                ),
-                (
-                    "n",
-                    "show recommendations for the focused agent — add to the review list only",
-                ),
-                (
-                    "m",
-                    "inspect plugin health on the local and saved SSH machines",
-                ),
-            ],
-        )?;
-        section(
-            out,
-            "finding your way",
-            &[
-                (
-                    "l / →",
-                    "what this plugin does — its actions, and (if ↑) what changed since install",
-                ),
-                (
-                    "↑",
-                    "beside a commit: the repo moved since you installed; open with l",
-                ),
-                (
-                    "L",
-                    "open the selected plugin's logs; j/k scroll and r reloads",
-                ),
-                ("j / k", "down / up  (arrows and the wheel work too)"),
-                ("g / G", "first / last row"),
-                (
-                    "A",
-                    "toggle auto-sync: install missing plugins when herdr starts",
-                ),
-                ("ctrl+r", "re-read the list and what is installed"),
-                ("? / q", "close this help / quit"),
-            ],
-        )?;
-
-        write!(
-            out,
-            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m\x1b[2many key closes this\x1b[0m\r\n",
-            footer_start_row(height),
-            rule
-        )?;
-        out.flush()
-    }
-
-    /// The marketplace overlay: a query line, matching plugins, and what each one is.
     fn draw_browser(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        let success = self.theme.color(Role::Success);
+        let warning = self.theme.color(Role::Warning);
+        let accent = self.theme.color(Role::Accent);
         let b = self.browser.as_ref().expect("checked by caller");
         let rule = rule_line(width);
         let results = b.results();
@@ -3267,7 +3017,11 @@ impl App {
             "\x1b[1m marketplace\x1b[0m  \x1b[2m{} of {} · {}\x1b[0m\r",
             results.len(),
             b.all.len(),
-            b.source_note
+            if self.marketplace_refresh.is_some() {
+                "refreshing…"
+            } else {
+                &b.source_note
+            }
         )?;
         writeln!(
             out,
@@ -3284,25 +3038,30 @@ impl App {
             0
         };
         if results.is_empty() {
-            writeln!(out, " \x1b[2mnothing matches\x1b[0m\r")?;
+            let message = if self.marketplace_refresh.is_some() && b.all.is_empty() {
+                "loading marketplace…"
+            } else if b.all.is_empty() {
+                "no plugins available · ctrl+r retries"
+            } else {
+                "nothing matches"
+            };
+            writeln!(out, " \x1b[2m{}\x1b[0m\r", message)?;
         }
         for (i, e) in results.iter().enumerate().skip(start).take(visible) {
             let selected = i == b.cursor;
             let pointer = if selected { "\x1b[7m>\x1b[0m" } else { " " };
             // Already in the list is worth knowing before you add it a second time.
-            let mark = if b.is_listed(e) {
-                "\x1b[32m✔\x1b[0m"
+            let (listed_color, mark) = if b.is_listed(e) {
+                (success, "✔")
             } else {
-                " "
+                (Color::Plain, " ")
             };
             // Last push, not stars, is what says whether a plugin still works. Four columns
             // is enough for "3d" / "2w" / "5mo" and costs almost nothing.
             let age = crate::registry::age_label(&e.pushed_at, today);
             writeln!(
                 out,
-                "{} {} \x1b[33m{:>4}★\x1b[0m {:<38} \x1b[2m{:<5}{}\x1b[0m\r",
-                pointer,
-                mark,
+                "{pointer} {listed_color}{mark}\x1b[0m {warning}{:>4}★\x1b[0m {:<38} \x1b[2m{:<5}{}\x1b[0m\r",
                 e.stars,
                 truncate(&sanitize_log_output(&e.full_name), 38),
                 age,
@@ -3314,7 +3073,7 @@ impl App {
         }
 
         let footer = match &self.flash {
-            Some(msg) => format!("\x1b[36m{}\x1b[0m", msg),
+            Some(msg) => format!("{accent}{}\x1b[0m", msg),
             None => "\x1b[1m[enter]\x1b[0m add to your list  \x1b[1m[tab]\x1b[0m category  \
                      \x1b[1m[ctrl+o]\x1b[0m open repo  \x1b[1m[↑↓]\x1b[0m move  \
                      \x1b[1m[ctrl+r]\x1b[0m refresh  \x1b[1m[esc]\x1b[0m back"
@@ -3331,6 +3090,8 @@ impl App {
     }
 
     fn draw_extras(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        let success = self.theme.color(Role::Success);
+        let accent = self.theme.color(Role::Accent);
         let p = self.extras.as_ref().expect("checked by caller");
         let rule = rule_line(width);
 
@@ -3368,7 +3129,11 @@ impl App {
                     } else {
                         "[ ]"
                     };
-                    let mark = if it.listed { "\x1b[32m✔\x1b[0m" } else { " " };
+                    let (listed_color, mark) = if it.listed {
+                        (success, "✔")
+                    } else {
+                        (Color::Plain, " ")
+                    };
                     // One of yours reads differently from one that shipped with the tool.
                     let id = if it.extra.source == crate::extras::Source::Local {
                         format!("{}*", truncate(&it.extra.id, 11))
@@ -3377,10 +3142,7 @@ impl App {
                     };
                     writeln!(
                         out,
-                        "{} {} {} {:<12} \x1b[2m{}\x1b[0m\r",
-                        pointer,
-                        tick,
-                        mark,
+                        "{pointer} {tick} {listed_color}{mark}\x1b[0m {:<12} \x1b[2m{}\x1b[0m\r",
                         id,
                         truncate(&it.extra.description, width.saturating_sub(24) as usize)
                     )?;
@@ -3389,7 +3151,7 @@ impl App {
         }
 
         let footer = match &self.flash {
-            Some(msg) => format!("\x1b[36m{}\x1b[0m", msg),
+            Some(msg) => format!("{accent}{}\x1b[0m", msg),
             None => "\x1b[1m[space]\x1b[0m tick  \x1b[1m[enter]\x1b[0m add to your list  \
                      \x1b[1m[↑↓]\x1b[0m move  \x1b[1m[esc]\x1b[0m back"
                 .to_string(),
@@ -3410,6 +3172,8 @@ impl App {
         width: u16,
         height: u16,
     ) -> io::Result<()> {
+        let success = self.theme.color(Role::Success);
+        let accent = self.theme.color(Role::Accent);
         let p = self.recommendations.as_ref().expect("checked by caller");
         let rule = rule_line(width);
 
@@ -3441,14 +3205,14 @@ impl App {
             } else {
                 "[ ]"
             };
-            let mark = if item.listed {
-                "\x1b[32m✔\x1b[0m"
+            let (listed_color, mark) = if item.listed {
+                (success, "✔")
             } else {
-                " "
+                (Color::Plain, " ")
             };
             writeln!(
                 out,
-                "{} {} {} {:<14} \x1b[2m{} — {}\x1b[0m\r",
+                "{} {} {listed_color}{}\x1b[0m {:<14} \x1b[2m{} — {}\x1b[0m\r",
                 pointer,
                 tick,
                 mark,
@@ -3459,7 +3223,7 @@ impl App {
         }
 
         let footer = match &self.flash {
-            Some(msg) => format!("\x1b[36m{}\x1b[0m", msg),
+            Some(msg) => format!("{accent}{}\x1b[0m", msg),
             None => "\x1b[1m[space]\x1b[0m tick  \x1b[1m[enter]\x1b[0m add to review list  \
                      \x1b[1m[d]\x1b[0m dismiss  \x1b[1m[↑↓]\x1b[0m move  \
                      \x1b[1m[esc]\x1b[0m back"
@@ -3476,6 +3240,10 @@ impl App {
     }
 
     fn draw_adopt(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        let danger = self.theme.color(Role::Danger);
+        let success = self.theme.color(Role::Success);
+        let warning = self.theme.color(Role::Warning);
+        let accent = self.theme.color(Role::Accent);
         let a = self.adopt.as_ref().expect("checked by caller");
         let rule = rule_line(width);
 
@@ -3489,7 +3257,7 @@ impl App {
             writeln!(out, " from: \x1b[1m{}\x1b[0m\x1b[7m \x1b[0m\r", a.spec)?;
             writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
             if let Some(e) = &a.error {
-                writeln!(out, " \x1b[31m{}\x1b[0m\r", e)?;
+                writeln!(out, " {danger}{}\x1b[0m\r", e)?;
             } else {
                 writeln!(
                     out,
@@ -3517,25 +3285,21 @@ impl App {
                 };
                 let tick = if r.picked { "\x1b[1m[x]\x1b[0m" } else { "[ ]" };
                 // What your machine already says about it, so "taking" means something.
-                let (mark, note) = match r.held {
-                    Held::Listed => ("\x1b[32m✔\x1b[0m", "already in your list"),
-                    Held::Installed => ("\x1b[33m·\x1b[0m", "installed, not in your list"),
-                    Held::Fresh => (" ", ""),
+                let (listed_color, mark, note) = match r.held {
+                    Held::Listed => (success, "✔", "already in your list"),
+                    Held::Installed => (warning, "·", "installed, not in your list"),
+                    Held::Fresh => (Color::Plain, " ", ""),
                 };
                 writeln!(
                     out,
-                    "{} {} {} {:<44} \x1b[2m{}\x1b[0m\r",
-                    pointer,
-                    tick,
-                    mark,
+                    "{pointer} {tick} {listed_color}{mark}\x1b[0m {:<44} \x1b[2m{note}\x1b[0m\r",
                     truncate(&r.entry, 44),
-                    note
                 )?;
             }
         }
 
         let footer = match &self.flash {
-            Some(msg) => format!("\x1b[36m{}\x1b[0m", msg),
+            Some(msg) => format!("{accent}{}\x1b[0m", msg),
             None if a.asking() => {
                 "\x1b[1m[enter]\x1b[0m read it  \x1b[1m[esc]\x1b[0m back".to_string()
             }
@@ -3555,6 +3319,8 @@ impl App {
 
     /// Show the machine picker or the selected machine's plugin health snapshot.
     fn draw_machines(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        let warning = self.theme.color(Role::Warning);
+        let accent = self.theme.color(Role::Accent);
         let view = self.machine_view.as_ref().expect("checked by caller");
         if view.detail_of.is_some() {
             return self.draw_machine_detail(out, width, height);
@@ -3579,7 +3345,7 @@ impl App {
             " {}\r",
             view.notice
                 .as_deref()
-                .map(|notice| format!("\x1b[33m{}\x1b[0m", notice))
+                .map(|notice| format!("{warning}{}\x1b[0m", notice))
                 .unwrap_or_else(|| {
                     "\x1b[2mread-only status; Enter inspects the selected target\x1b[0m".to_string()
                 })
@@ -3626,7 +3392,7 @@ impl App {
         }
 
         let footer = match &self.flash {
-            Some(message) => format!("\x1b[36m{}\x1b[0m", message),
+            Some(message) => format!("{accent}{}\x1b[0m", message),
             None => "\x1b[1m[enter]\x1b[0m inspect  \x1b[1m[j/k]\x1b[0m target  \
                      \x1b[1m[r]\x1b[0m refresh  \x1b[1m[esc/q]\x1b[0m back"
                 .to_string(),
@@ -3642,6 +3408,9 @@ impl App {
     }
 
     fn draw_machine_detail(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        let danger = self.theme.color(Role::Danger);
+        let warning = self.theme.color(Role::Warning);
+        let accent = self.theme.color(Role::Accent);
         let view = self.machine_view.as_ref().expect("checked by caller");
         let index = view.detail_of.expect("detail view has a target");
         let Some(entry) = view.entries.get(index) else {
@@ -3692,7 +3461,7 @@ impl App {
         if let Some(error) = entry.health.error.as_deref() {
             writeln!(
                 out,
-                " \x1b[33mnote:\x1b[0m {}\r",
+                " {warning}note:\x1b[0m {}\r",
                 truncate(error, width.saturating_sub(10) as usize)
             )?;
         } else {
@@ -3708,7 +3477,7 @@ impl App {
         if !entry.health.plugin_list_available {
             writeln!(
                 out,
-                " \x1b[31mplugin state unavailable for this target\x1b[0m\r"
+                " {danger}plugin state unavailable for this target\x1b[0m\r"
             )?;
             writeln!(
                 out,
@@ -3735,7 +3504,7 @@ impl App {
                     out,
                     "{}\x1b[0m {}{}\x1b[0m {:<44} \x1b[2m{:<12}\x1b[0m {}\r",
                     pointer,
-                    row.colour(),
+                    row.color(self.theme),
                     row.marker(),
                     truncate(&row.label, 44),
                     commit,
@@ -3745,7 +3514,7 @@ impl App {
         }
 
         let footer = match &self.flash {
-            Some(message) => format!("\x1b[36m{}\x1b[0m", message),
+            Some(message) => format!("{accent}{}\x1b[0m", message),
             None => "\x1b[1m[i]\x1b[0m sync this target  \x1b[1m[u]\x1b[0m update this target  \
                      \x1b[1m[r]\x1b[0m refresh  \x1b[1m[esc/q]\x1b[0m back"
                 .to_string(),
@@ -3766,6 +3535,7 @@ impl App {
         width: u16,
         height: u16,
     ) -> io::Result<()> {
+        let warning = self.theme.color(Role::Warning);
         let view = self
             .machine_view
             .as_ref()
@@ -3780,7 +3550,7 @@ impl App {
         write!(out, "\x1b[H\x1b[2J")?;
         writeln!(
             out,
-            "\x1b[1m machine {}\x1b[0m  \x1b[33mconfirm\x1b[0m\r",
+            "\x1b[1m machine {}\x1b[0m  {warning}confirm\x1b[0m\r",
             action.label()
         )?;
         writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
@@ -3831,134 +3601,208 @@ impl App {
     }
 
     fn draw_list(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
-        // Rules span the pane. A fixed width looked deliberate at 80 columns and plainly
-        // broken at 140, where the list ran well past the line meant to underline it.
-        let rule = rule_line(width);
-        // Home the cursor and clear, rather than scrolling: redraw in place.
-        write!(out, "\x1b[H\x1b[2J")?;
-
-        let installed = self
-            .rows
-            .iter()
-            .filter(|r| r.status != Status::Missing)
-            .count();
-        let to_sync = self
-            .rows
-            .iter()
-            .filter(|r| matches!(r.status, Status::Missing | Status::Drifted { .. }))
-            .count();
-        let updates = self.rows.iter().filter(|r| r.maybe_stale).count();
-        writeln!(
-            out,
-            "\x1b[1m herdr-lazy\x1b[0m  \x1b[2m{} installed · {} to sync · {} updates\x1b[0m\r",
-            installed, to_sync, updates
-        )?;
-        writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
-
-        if let Some(e) = &self.error {
-            writeln!(out, " \x1b[31mcannot read plugin list:\x1b[0m {}\r", e)?;
-        } else if self.rows.is_empty() {
-            writeln!(
-                out,
-                " \x1b[2mno plugins yet — press / to browse, or run `herdr-lazy init`\x1b[0m\r"
-            )?;
-        }
-
-        // Reserve the header (2), footer (2) and a spare line.
-        let (visible, start) = self.list_window(height);
-
-        for (i, row) in self.rows.iter().enumerate().skip(start).take(visible) {
-            let selected = i == self.cursor;
-            let pointer = if selected { "\x1b[7m>" } else { " " };
-            // A checkbox only when something is ticked: an always-visible column of empty
-            // boxes implies every row needs a decision, when the common case is acting on
-            // the one row under the cursor.
-            let box_ = if self.any_picked() {
-                if row.picked {
-                    "\x1b[32m[x]\x1b[0m "
-                } else {
-                    "\x1b[2m[ ]\x1b[0m "
-                }
-            } else {
-                ""
-            };
-            let commit = row
-                .commit
-                .as_deref()
-                .map(crate::short)
-                .unwrap_or_else(|| "-".to_string());
-            // `↑` next to the commit rather than a column of its own: it qualifies the commit
-            // that is shown, and the row is already wide.
-            let up = if row.maybe_stale {
-                "\x1b[33m↑\x1b[0m"
-            } else {
-                " "
-            };
-            // Point at `l`, not `u`. The whole point of this feature is reading the change
-            // before applying it — telling the user to update straight away skips the review
-            // it exists to offer. `l` opens the details, which fetch and show what changed;
-            // `u` is the step after they have decided.
-            let note = row.trailing_text();
-            // The trailing text gets whatever width is left, so a narrow pane truncates the
-            // description rather than wrapping or pushing the row off-screen.
-            let trailing_width = (width as usize).saturating_sub(66);
-            writeln!(
-                out,
-                "{} {}{}{}\x1b[0m {:<44} \x1b[2m{:<12}\x1b[0m{} {}\x1b[0m\r",
-                pointer,
-                box_,
-                row.colour(),
-                row.marker(),
-                truncate(&row.label, 44),
-                commit,
-                up,
-                if note.is_empty() {
-                    String::new()
-                } else {
-                    format!("\x1b[2m{}\x1b[0m", truncate(&note, trailing_width))
-                },
-            )?;
-        }
-
-        // Keys are shown as `[s] sync`, not `sync` with a bold "s".
-        //
-        // Bolding the first letter reads as a hint only if you already know the convention,
-        // and it disappears entirely on a terminal that renders bold faintly — leaving a row
-        // of words with no visible connection to any key. Brackets survive any theme.
-        let legend = [
-            ("i", "install"),
-            ("u", "update"),
-            ("x", "remove"),
-            ("/", "search"),
-            ("?", "more"),
-        ]
-        .iter()
-        .map(|(k, label)| format!("\x1b[1m[{}]\x1b[0m {}", k, label))
-        .collect::<Vec<_>>()
-        .join("  ");
-        let footer = match &self.flash {
-            Some(msg) => format!("\x1b[36m{}\x1b[0m", msg),
-            None => legend,
-        };
-        write!(
-            out,
-            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r\n",
-            footer_start_row(height),
-            rule,
-            footer
-        )?;
-        out.flush()
+        managed_list::draw(self, out, width, height)
     }
 }
 
-/// Cut a label to `max` *characters*.
-///
-/// Not display columns: a CJK or emoji label counts as one char per glyph while occupying two
-/// terminal cells, so such a row's trailing columns drift right. Plugin slugs are ASCII in
-/// practice, and the alternative is a unicode-width dependency for a cosmetic case.
+fn add_help_line(lines: &mut Vec<(bool, String)>, bold: bool, text: &str, columns: usize) {
+    for line in wrap(text, columns) {
+        let chars: Vec<char> = line.chars().collect();
+        lines.extend(
+            chars
+                .chunks(columns)
+                .map(|chunk| (bold, chunk.iter().collect())),
+        );
+    }
+}
+
+fn help_lines(columns: usize, context: &str) -> Vec<(bool, String)> {
+    let mut lines = Vec::new();
+    add_help_line(
+        &mut lines,
+        false,
+        "Lowercase acts on the selected row. UPPERCASE means bulk or special actions.",
+        columns,
+    );
+    if !context.is_empty() {
+        // Workspace labels can contain full-width characters.
+        let columns = (columns / 2).max(1);
+        add_help_line(
+            &mut lines,
+            false,
+            &format!("Optional context{context}"),
+            columns,
+        );
+    }
+    let mut section = |title: &str, keys: &[(&str, &str)]| {
+        add_help_line(&mut lines, true, title, columns);
+        for (key, description) in keys {
+            if key.is_empty() {
+                add_help_line(&mut lines, false, description, columns);
+            } else {
+                add_help_line(&mut lines, false, &format!("{key}  {description}"), columns);
+            }
+        }
+    };
+    section(
+        "choosing what to act on",
+        &[
+            ("space", "tick or untick this row (click does the same)"),
+            ("esc", "clear the selection"),
+            (
+                "",
+                "with nothing ticked, every action below uses the cursor row",
+            ),
+        ],
+    );
+    section(
+        "acting on it",
+        &[
+            (
+                "i / I",
+                "install what is missing, and put drifted pins back",
+            ),
+            (
+                "u / U",
+                "update to the latest commit (pinned entries are skipped)",
+            ),
+            ("x / X", "uninstall — X removes everything not in your list"),
+            ("r / R", "restore to the commits recorded in the lockfile"),
+            ("E", "enable selected installed plugin(s)"),
+            (
+                "D",
+                "disable selected installed plugin(s) — herdr-lazy is protected",
+            ),
+        ],
+    );
+    section(
+        "optional tools and your list",
+        &[
+            ("a", "add the selected installed plugin(s) to your list"),
+            ("d", "remove this entry (does not uninstall)"),
+            (
+                "/",
+                "search the marketplace — enter adds, ctrl+o opens the repo",
+            ),
+            (
+                "e",
+                "extras — opt-in picks, ticked with space and added with enter",
+            ),
+            (
+                "f",
+                "read someone else's list — tick what you want, enter takes it",
+            ),
+            (
+                "p",
+                "review the workspace profile — sync, restore its lock, or merge explicitly",
+            ),
+            (
+                "w",
+                "open the workspace starter — preview, sync, then launch declared targets",
+            ),
+            (
+                "n",
+                "show recommendations for the focused agent — add to the review list only",
+            ),
+            (
+                "m",
+                "inspect plugin health on the local and saved SSH machines",
+            ),
+        ],
+    );
+    section(
+        "finding your way",
+        &[
+            (
+                "l / →",
+                "what this plugin does — its actions, and (if ↑) what changed since install",
+            ),
+            (
+                "↑",
+                "beside a commit: the repo moved since you installed; open with l",
+            ),
+            (
+                "L",
+                "open the selected plugin's logs; j/k scroll and r reloads",
+            ),
+            ("j / k", "down / up  (arrows and the wheel work too)"),
+            ("g / G", "first / last row"),
+            (
+                "A",
+                "toggle auto-sync: install missing plugins when herdr starts",
+            ),
+            ("ctrl+r", "re-read the list and what is installed"),
+            ("q", "quit from the plugin list"),
+        ],
+    );
+
+    lines
+}
+
+fn help_viewport(width: u16, height: u16) -> (usize, usize, u16) {
+    let columns = usize::from(width.saturating_sub(1)).max(1);
+    let footer = footer_start_row(height);
+    let first_row = if footer >= 3 { 2 } else { 1 };
+    let visible = usize::from(footer.saturating_sub(first_row)).max(1);
+    (columns, visible, first_row)
+}
+
+fn draw_help(
+    out: &mut impl Write,
+    width: u16,
+    height: u16,
+    offset: usize,
+    context: &str,
+) -> io::Result<()> {
+    write!(out, "\x1b[H\x1b[2J")?;
+    if width < 2 || height == 0 {
+        return out.flush();
+    }
+    let (columns, visible, first_row) = help_viewport(width, height);
+    let lines = help_lines(columns, context);
+    let start = offset.min(lines.len().saturating_sub(visible));
+    if first_row == 2 {
+        write!(
+            out,
+            "\x1b[1m{}\x1b[0m",
+            truncate("Keyboard shortcuts", columns)
+        )?;
+    }
+    for (index, (bold, line)) in lines.iter().skip(start).take(visible).enumerate() {
+        let row = index + usize::from(first_row);
+        if *bold {
+            write!(out, "\x1b[{row};1H\x1b[1m{line}\x1b[0m")?;
+        } else {
+            write!(out, "\x1b[{row};1H{line}")?;
+        }
+    }
+    let footer = footer_start_row(height);
+    if footer > first_row {
+        let end = (start + visible).min(lines.len());
+        let hint = format!("Esc close · ↑↓ scroll · {end}/{}", lines.len());
+        write!(out, "\x1b[{footer};1H{}", truncate(&hint, columns))?;
+    }
+    out.flush()
+}
+
+fn help_scroll(offset: usize, key: KeyCode, width: u16, height: u16, context: &str) -> usize {
+    let (columns, visible, _) = help_viewport(width, height);
+    let last = help_lines(columns, context).len().saturating_sub(visible);
+    let offset = offset.min(last);
+    match key {
+        KeyCode::Up | KeyCode::Char('k') => offset.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => offset.saturating_add(1).min(last),
+        KeyCode::PageUp => offset.saturating_sub(visible),
+        KeyCode::PageDown => offset.saturating_add(visible).min(last),
+        KeyCode::Home | KeyCode::Char('g') => 0,
+        KeyCode::End | KeyCode::Char('G') => last,
+        _ => offset,
+    }
+}
+
 /// Break text to a width, on spaces where possible.
 fn wrap(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(20);
+    let width = width.max(1);
     let mut out = Vec::new();
     let mut line = String::new();
     for word in text.split_whitespace() {
@@ -3976,6 +3820,9 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     out
 }
 
+/// Cut a label to `max` *characters*.
+///
+/// This character limit is used for panes that do not align on terminal display columns.
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -4076,12 +3923,17 @@ pub(crate) fn run() -> io::Result<()> {
 }
 
 fn event_loop(out: &mut impl Write) -> io::Result<()> {
-    let mut app = App::load();
+    let (theme, theme_error) = Theme::configured();
+    let mut app = App::load(theme);
+    if let Some(error) = theme_error {
+        app.flash = Some(format!("Using terminal theme: {error}"));
+    }
     let mut last_size = None;
     let mut redraw = true;
     let mut startup_redraws = STARTUP_REDRAWS;
 
     loop {
+        redraw |= app.poll_marketplace();
         let (width, height) = terminal::size().unwrap_or((80, 24));
         let size = (width, height);
         if redraw || last_size != Some(size) || startup_redraws > 0 {
@@ -4091,7 +3943,14 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             startup_redraws = startup_redraws.saturating_sub(1);
         }
 
-        let key = match event::poll(Duration::from_millis(100))? {
+        // Terminal input wakes the poll immediately. Only a visible refresh result
+        // needs a shorter timeout so its completion reaches the screen sooner.
+        let poll_timeout = if app.browser.is_some() && app.marketplace_refresh.is_some() {
+            Duration::from_millis(25)
+        } else {
+            Duration::from_millis(100)
+        };
+        let key = match event::poll(poll_timeout)? {
             false => continue,
             true => match event::read()? {
                 Event::Key(k) if k.kind == KeyEventKind::Press => {
@@ -4099,8 +3958,18 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                     k
                 }
                 Event::Mouse(m) => {
-                    if app.log_view.is_some() {
-                        use crossterm::event::MouseEventKind;
+                    use crossterm::event::MouseEventKind;
+                    if let Some(offset) = app.help {
+                        let key = match m.kind {
+                            MouseEventKind::ScrollUp => Some(KeyCode::Up),
+                            MouseEventKind::ScrollDown => Some(KeyCode::Down),
+                            _ => None,
+                        };
+                        if let Some(key) = key {
+                            app.help =
+                                Some(help_scroll(offset, key, width, height, &app.help_context()));
+                        }
+                    } else if app.log_view.is_some() {
                         let visible = app
                             .log_view
                             .as_ref()
@@ -4111,6 +3980,19 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                             MouseEventKind::ScrollDown => app.scroll_logs(1, visible, width),
                             MouseEventKind::ScrollUp => app.scroll_logs(-1, visible, width),
                             _ => {}
+                        }
+                    } else if app.detail_of.is_some() {
+                        use crossterm::event::MouseEventKind;
+                        if !app.awaiting_bind && app.pending_bind.is_none() {
+                            match m.kind {
+                                MouseEventKind::ScrollDown => {
+                                    plugin_detail::scroll_rows(&mut app, width, height, 1);
+                                }
+                                MouseEventKind::ScrollUp => {
+                                    plugin_detail::scroll_rows(&mut app, width, height, -1);
+                                }
+                                _ => {}
+                            }
                         }
                     } else {
                         app.handle_mouse(m, height)?;
@@ -4135,9 +4017,19 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
         // pty sends Ctrl+D at end of input — which silently ran "drop from list" on whatever
         // the cursor happened to be on. Destructive actions must not be reachable by a
         // modifier chord the user did not intend.
-        // Help is modal and closes on anything, so it is checked before every other keymap.
-        if app.help {
-            app.help = false;
+        if let Some(offset) = app.help {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                return Ok(());
+            }
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
+                app.help = match key.code {
+                    KeyCode::Esc | KeyCode::Char('?' | 'q') => None,
+                    key => Some(help_scroll(offset, key, width, height, &app.help_context())),
+                };
+            }
             continue;
         }
 
@@ -4292,7 +4184,7 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                 KeyCode::Char('i') if detail => app.request_machine_action(MachineAction::Sync),
                 KeyCode::Char('u') if detail => app.request_machine_action(MachineAction::Update),
                 KeyCode::Char('r') => app.reload_machine_view(),
-                KeyCode::Char('?') => app.help = true,
+                KeyCode::Char('?') => app.help = Some(0),
                 _ => {}
             }
             continue;
@@ -4309,7 +4201,11 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             // later arm would never see it.
             if key.modifiers.contains(KeyModifiers::CONTROL) {
                 match key.code {
-                    KeyCode::Char('j') | KeyCode::Char('m') => app.run_detail_action(),
+                    KeyCode::Char('j') | KeyCode::Char('m') if !app.awaiting_bind => {
+                        if plugin_detail::confirm_selection_visible(&mut app, width, height) {
+                            app.run_detail_action();
+                        }
+                    }
                     KeyCode::Char('c') => return Ok(()),
                     _ => {}
                 }
@@ -4319,7 +4215,11 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             if app.awaiting_bind {
                 app.awaiting_bind = false;
                 match key.code {
-                    KeyCode::Char(c) if c.is_ascii_alphabetic() => app.bind_selected(c),
+                    KeyCode::Char(c) if c.is_ascii_alphabetic() => {
+                        if plugin_detail::confirm_selection_visible(&mut app, width, height) {
+                            app.bind_selected(c);
+                        }
+                    }
                     KeyCode::Esc => app.flash = Some("not bound".to_string()),
                     _ => app.flash = Some("that is not a letter — nothing bound".to_string()),
                 }
@@ -4328,15 +4228,7 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
 
             match key.code {
                 KeyCode::Char('b') => {
-                    if app
-                        .rows
-                        .get(idx)
-                        .and_then(|r| r.detail.as_ref())
-                        .map(|d| App::bindable(d).is_empty())
-                        .unwrap_or(true)
-                    {
-                        app.flash = Some("no actions to bind".to_string());
-                    } else {
+                    if plugin_detail::confirm_selection_visible(&mut app, width, height) {
                         app.awaiting_bind = true;
                         app.flash = None;
                     }
@@ -4348,12 +4240,20 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                 KeyCode::Char('j') | KeyCode::Down => {
                     if app.detail_cursor + 1 < n {
                         app.detail_cursor += 1;
+                        plugin_detail::reveal_selection(&mut app, width, height);
                     }
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    app.detail_cursor = app.detail_cursor.saturating_sub(1)
+                    app.detail_cursor = app.detail_cursor.saturating_sub(1);
+                    plugin_detail::reveal_selection(&mut app, width, height);
                 }
-                KeyCode::Enter => app.run_detail_action(),
+                KeyCode::PageDown => plugin_detail::scroll_page(&mut app, width, height, true),
+                KeyCode::PageUp => plugin_detail::scroll_page(&mut app, width, height, false),
+                KeyCode::Enter => {
+                    if plugin_detail::confirm_selection_visible(&mut app, width, height) {
+                        app.run_detail_action();
+                    }
+                }
                 KeyCode::Char('L') => app.open_logs_for(idx),
                 _ => {}
             }
@@ -4659,7 +4559,7 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                 app.flash = Some(crate::open_starter_pane());
             }
             KeyCode::Char('n') => app.open_recommendations(),
-            KeyCode::Char('?') => app.help = true,
+            KeyCode::Char('?') => app.help = Some(0),
 
             // Keys lazy.nvim has that this does not. Rather than doing nothing — which reads
             // as "the pane is broken" to someone whose fingers know lazy — say where the
@@ -4684,6 +4584,95 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    fn marketplace_entry(name: &str) -> crate::registry::Entry {
+        crate::registry::Entry {
+            full_name: name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn marketplace_completion_keeps_query_and_selected_plugin() {
+        let (send, receive) = mpsc::channel();
+        let mut app = App {
+            browser: Some(crate::browse::Browser::new(
+                vec![
+                    marketplace_entry("owner/worktree-one"),
+                    marketplace_entry("owner/worktree-two"),
+                ],
+                "cached".to_string(),
+                Vec::new(),
+            )),
+            marketplace_refresh: Some(receive),
+            ..Default::default()
+        };
+        let browser = app.browser.as_mut().unwrap();
+        browser.query = "worktree".to_string();
+        browser.category = Some("worktree");
+        browser.move_down();
+
+        assert!(!app.poll_marketplace());
+        send.send(Ok((
+            vec![
+                marketplace_entry("owner/worktree-two"),
+                marketplace_entry("owner/note"),
+            ],
+            "just refreshed".to_string(),
+        )))
+        .unwrap();
+        assert!(app.poll_marketplace());
+        let browser = app.browser.as_ref().unwrap();
+        assert_eq!(browser.query, "worktree");
+        assert_eq!(browser.category, Some("worktree"));
+        assert_eq!(browser.selected().unwrap().full_name, "owner/worktree-two");
+        assert_eq!(browser.source_note, "just refreshed");
+        assert!(!app.poll_marketplace());
+    }
+
+    #[test]
+    fn marketplace_ignores_duplicate_requests_and_completion_after_close() {
+        let (send, receive) = mpsc::channel();
+        let mut app = App {
+            marketplace_refresh: Some(receive),
+            ..Default::default()
+        };
+        app.start_marketplace_refresh(|| unreachable!("another request is already running"));
+        send.send(Ok((Vec::new(), "just refreshed".to_string())))
+            .unwrap();
+
+        assert!(!app.poll_marketplace());
+        assert!(app.browser.is_none());
+        assert!(app.marketplace_refresh.is_none());
+    }
+
+    #[test]
+    fn marketplace_distinguishes_loading_and_refresh_failure_from_no_match() {
+        let (send, receive) = mpsc::channel();
+        let mut app = App {
+            browser: Some(crate::browse::Browser::new(
+                Vec::new(),
+                String::new(),
+                Vec::new(),
+            )),
+            marketplace_refresh: Some(receive),
+            ..Default::default()
+        };
+        let mut loading = Vec::new();
+        app.draw_browser(&mut loading, 80, 24).unwrap();
+        assert!(String::from_utf8(loading)
+            .unwrap()
+            .contains("loading marketplace"));
+
+        send.send(Err("offline".to_string())).unwrap();
+        assert!(app.poll_marketplace());
+        let mut failed = Vec::new();
+        app.draw_browser(&mut failed, 80, 24).unwrap();
+        let failed = String::from_utf8(failed).unwrap();
+        assert!(failed.contains("refresh failed: offline"));
+        assert!(failed.contains("ctrl+r retries"));
+        assert!(!failed.contains("nothing matches"));
+    }
+
     #[test]
     fn footer_leaves_the_host_owned_terminal_row_visible() {
         assert_eq!(footer_start_row(50), 47);
@@ -4696,6 +4685,57 @@ mod tests {
         assert_eq!(rule_line(200).chars().count(), 199);
         assert_eq!(rule_line(240).chars().count(), 200);
         assert!(rule_line(80).chars().count() < 80);
+    }
+
+    #[test]
+    fn help_layout_fits_short_panes_and_reaches_the_final_shortcut() {
+        let (width, height) = (40, 9);
+        let (columns, _, _) = help_viewport(width, height);
+        assert!(help_lines(columns, "")
+            .iter()
+            .all(|(_, line)| line.chars().count() <= columns));
+
+        let frame = |offset| {
+            let mut output = Vec::new();
+            draw_help(&mut output, width, height, offset, "").unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert!(!output.contains('\n'));
+            for movement in output
+                .split("\x1b[")
+                .filter(|part| part.starts_with(|c: char| c.is_ascii_digit()))
+            {
+                if let Some((row, _)) = movement.split_once(";1H") {
+                    assert!(row.parse::<u16>().unwrap() <= footer_start_row(height));
+                }
+            }
+            output
+        };
+        let first = frame(0);
+        assert!(first.contains("Keyboard shortcuts"));
+        assert!(first.contains("Lowercase acts"));
+        assert!(!first.contains("quit from the plugin list"));
+        let last = help_scroll(0, KeyCode::End, width, height, "");
+        assert!(frame(last).contains("quit from the plugin list"));
+        assert_eq!(frame(usize::MAX), frame(last));
+    }
+
+    #[test]
+    fn help_navigation_clamps_after_page_and_terminal_resize() {
+        let (width, height) = (24, 10);
+        let (_, visible, _) = help_viewport(width, height);
+        let page = help_scroll(0, KeyCode::PageDown, width, height, "");
+        assert_eq!(page, visible);
+        assert_eq!(help_scroll(page, KeyCode::PageUp, width, height, ""), 0);
+        assert_eq!(help_scroll(0, KeyCode::Up, width, height, ""), 0);
+
+        let narrow_end = help_scroll(0, KeyCode::End, width, height, "");
+        let wide_end = help_scroll(0, KeyCode::End, 80, 24, "");
+        assert!(narrow_end > wide_end);
+        assert_eq!(
+            help_scroll(narrow_end, KeyCode::Up, 80, 24, ""),
+            wide_end - 1
+        );
+        assert_eq!(help_scroll(narrow_end, KeyCode::Home, 80, 24, ""), 0);
     }
 
     fn github(owner: &str, repo: &str, commit: &str, enabled: bool) -> Installed {
@@ -4820,7 +4860,7 @@ mod tests {
         let r = rows_with_herdr_version(&desired, &[p], &[], Some(version("0.7.4")));
         assert_eq!(r[0].status, Status::Ok);
         assert_eq!(r[0].marker(), "⚠");
-        assert_eq!(r[0].colour(), "\x1b[33m");
+        assert_eq!(r[0].color(Theme::default()).to_string(), "\x1b[33m");
         assert_eq!(r[0].trailing_text(), "needs herdr 0.8.0, running 0.7.4");
     }
 
@@ -5213,7 +5253,7 @@ mod tests {
         let (visible, start) = app.list_window(4); // tiny pane: 1 visible row
         assert_eq!(visible, 1);
         assert_eq!(start, 4);
-        assert_eq!(app.row_at(LIST_TOP as u16, 4), Some(4));
+        assert_eq!(app.row_at(0, 4), Some(4));
     }
 
     /// A single click must never install or remove anything — it only moves the cursor. The
@@ -5432,11 +5472,16 @@ mod tests {
         let out = String::from_utf8(buf).unwrap();
 
         assert!(out.contains("0 installed · 1 to sync · 0 updates"));
-        assert!(out.contains("[i]") && out.contains("install"));
-        assert!(out.contains("[u]") && out.contains("update"));
-        assert!(out.contains("[x]") && out.contains("remove"));
-        assert!(out.contains("[/]") && out.contains("search"));
-        assert!(out.contains("[?]") && out.contains("more"));
+        for hint in [
+            "[i] Install",
+            "[u] Update",
+            "[x] Remove",
+            "[/] Browse",
+            "[?] Help",
+            "[l] Detail",
+        ] {
+            assert!(out.contains(hint), "missing {hint}");
+        }
         assert!(!out.contains("[m] machines"));
         assert!(!out.contains("[p] profile"));
     }
@@ -5853,7 +5898,10 @@ mod tests {
             Status::ExtraLocal,
         ] {
             assert!(!s.marker().is_empty());
-            assert!(s.colour().starts_with("\x1b["));
+            assert!(Theme::default()
+                .color(s.role())
+                .to_string()
+                .starts_with("\x1b["));
         }
     }
 

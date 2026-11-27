@@ -124,7 +124,8 @@ herdr plugin pane open --plugin herdr-lazy --entrypoint manage --focus
 ## Use
 
 Everything below is also in the manage pane, which is the normal way to use this: open it and
-press `?` for the keymap. The CLI exists for scripting and for things you would rather not do
+press `?` for the keymap. Scroll it with the arrow keys, `j` / `k`, Page Up / Page Down,
+or the mouse wheel. Home / End jump to the first / last page, and Esc closes it. The CLI exists for scripting and for things you would rather not do
 interactively.
 
 **`herdr-lazy` is not on your PATH.** It lives inside herdr's plugin directory, whose name
@@ -139,6 +140,13 @@ herdr-lazy() {
   "$root/target/release/herdr-lazy" "$@"
 }
 ```
+
+The Manage list keeps status visible in narrow panes and shows commit and detail columns
+when there is room. A `>` points to the focused plugin, `[x]` marks a bulk selection,
+`^` flags repository activity since install, and `!` flags a newer Herdr requirement.
+Press `l` for the focused plugin's details. In very narrow panes, the status labels
+shorten to `OK` (installed), `MIS` (missing), `DRF` (drifted), `UNV` (unverified),
+`OFF` (disabled), `EXT` (unlisted), `LNK` (local link), or `MGR` (herdr-lazy).
 
 ```sh
 herdr-lazy init          # write the curated default list
@@ -155,6 +163,23 @@ herdr-lazy extras                    # list the opt-in extras
 herdr-lazy init --extras worktrunk   # defaults plus a chosen extra
 herdr-lazy init --from owner/repo    # start from someone else's list instead
 ```
+
+### Terminal themes
+
+The Manage and Workspace Starter panes use your terminal's ANSI colors by default.
+Set `HERDR_LAZY_THEME` in the environment that starts the pane to select a truecolor
+palette. Available values are `terminal`, `catppuccin` (Mocha), `tokyo-night`, `gruvbox`,
+and `nord`. The palettes change status and accent colors while keeping the terminal's
+background and main text. They are designed for dark backgrounds.
+
+```sh
+HERDR_LAZY_THEME=nord herdr-lazy ui
+HERDR_LAZY_THEME='success=#80c7a2,warning=#f3bc78' herdr-lazy ui
+```
+
+A custom palette accepts any combination of `danger`, `success`, `warning`, `info`,
+`local`, and `accent` with six-digit `#RRGGBB` values. Omitted roles use ANSI colors.
+Invalid settings use the terminal palette and show a message when the pane opens.
 
 ### Workspace context
 
@@ -703,9 +728,8 @@ the rest still needs design.
 
 - **Rust, and nearly dependency-free.** The manager is orchestration — shelling out to
   the herdr CLI — which std covers, including a small hand-written JSON reader for
-  `plugin list --json`. The one dependency is `crossterm`, because std cannot put a
-  terminal into raw mode and the manage pane needs it. Not ratatui: the UI is a list
-  with a status column, and ratatui costs 70 crates against crossterm's 19.
+  `plugin list --json`. The UI uses `crossterm` for terminal input and `unicode-width`
+  to keep CJK names and emoji within the visible Manage columns.
 - **Never parse human output.** All state comes from `herdr plugin list --json`.
 - **Long operations leave the TUI** rather than being redrawn as in-pane progress, so
   a failing plugin build shows you its actual output.
