@@ -21,6 +21,7 @@ use std::{
 mod command_palette;
 mod managed_list;
 mod plugin_detail;
+mod theme_picker;
 
 use command_palette::{ManageCommand, Palette, PaletteAction};
 
@@ -1177,6 +1178,7 @@ type MarketplaceResult = Result<(Vec<crate::registry::Entry>, String), String>;
 struct App {
     theme: Theme,
     palette: Option<Palette>,
+    theme_picker: Option<theme_picker::Picker>,
     rows: Vec<Row>,
     /// The point-in-time workspace in which Herdr opened this pane, when available.
     workspace_context: Option<crate::context::PluginContext>,
@@ -1274,6 +1276,7 @@ impl App {
             Ok(installed) => App {
                 theme,
                 palette: None,
+                theme_picker: None,
                 rows: rows_with_herdr_version(&desired, &installed, &market, herdr_version),
                 workspace_context: workspace_context.clone(),
                 workspace_profile: workspace_profile.clone(),
@@ -1304,6 +1307,7 @@ impl App {
             Err(e) => App {
                 theme,
                 palette: None,
+                theme_picker: None,
                 rows: Vec::new(),
                 workspace_context,
                 workspace_profile,
@@ -2662,6 +2666,9 @@ impl App {
         if let Some(palette) = &self.palette {
             return palette.draw(out, width, height, self.theme);
         }
+        if let Some(picker) = &self.theme_picker {
+            return picker.draw(out, width, height);
+        }
         if let Some(offset) = self.help {
             return draw_help(out, width, height, offset, &self.help_context());
         }
@@ -3761,6 +3768,7 @@ fn help_lines(columns: usize, context: &str) -> Vec<(bool, String)> {
                 "toggle auto-sync: install missing plugins when herdr starts",
             ),
             ("ctrl+r", "re-read the list and what is installed"),
+            ("T", "preview and save a terminal theme"),
             ("q", "quit from the plugin list"),
         ],
     );
@@ -3938,17 +3946,15 @@ pub(crate) fn run() -> io::Result<()> {
     // level: with capture on, the terminal stops doing its own selection, so anyone who wants
     // to copy text with the mouse would be blocked. SGR mode (1006) is enabled alongside 1000
     // so clicks past column 95 still report correctly.
-    write!(out, "\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h")?;
-    out.flush()?;
+    let result = write!(out, "\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h")
+        .and_then(|()| out.flush())
+        .and_then(|()| event_loop(&mut out));
 
-    let result = event_loop(&mut out);
-
-    // Restore unconditionally, even if the loop failed: leaving a pane in raw mode with no
-    // cursor would wedge the terminal.
-    write!(out, "\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l")?;
-    out.flush()?;
-    terminal::disable_raw_mode()?;
-    result
+    // Restore both the screen and raw mode even if writing to the terminal fails.
+    let restore_screen =
+        write!(out, "\x1b[0m\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l").and_then(|()| out.flush());
+    let restore_mode = terminal::disable_raw_mode();
+    result.and(restore_screen).and(restore_mode)
 }
 
 fn event_loop(out: &mut impl Write) -> io::Result<()> {
@@ -3992,6 +3998,12 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                         match m.kind {
                             MouseEventKind::ScrollDown => palette.move_cursor(true),
                             MouseEventKind::ScrollUp => palette.move_cursor(false),
+                            _ => {}
+                        }
+                    } else if let Some(picker) = &mut app.theme_picker {
+                        match m.kind {
+                            MouseEventKind::ScrollDown => picker.move_to(true),
+                            MouseEventKind::ScrollUp => picker.move_to(false),
                             _ => {}
                         }
                     } else if let Some(offset) = app.help {
@@ -4042,6 +4054,32 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                 _ => continue,
             },
         };
+
+        if let Some(picker) = &mut app.theme_picker {
+            if classify(&key) == Action::Quit {
+                return Ok(());
+            }
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
+                match picker.key(key.code, width, height) {
+                    theme_picker::Action::Continue => {}
+                    theme_picker::Action::Cancel => app.theme_picker = None,
+                    theme_picker::Action::Apply { value, theme } => {
+                        match crate::theme::save(&value) {
+                            Ok(()) => {
+                                app.theme = theme;
+                                app.theme_picker = None;
+                                app.flash = Some("Theme saved".to_string());
+                            }
+                            Err(error) => picker.save_error(error),
+                        }
+                    }
+                }
+            }
+            continue;
+        }
 
         // Any keypress retires the previous result line.
         app.flash = None;
@@ -4598,6 +4636,12 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                 })
             }
             KeyCode::Char('d') => app.drop_selected(),
+            KeyCode::Char('T') => {
+                app.theme_picker = Some(theme_picker::Picker::new(
+                    app.theme,
+                    std::env::var_os(crate::theme::ENV_KEY).is_some(),
+                ));
+            }
 
             // Keys lazy.nvim has that this does not. Rather than doing nothing — which reads
             // as "the pane is broken" to someone whose fingers know lazy — say where the

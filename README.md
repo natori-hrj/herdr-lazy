@@ -186,6 +186,16 @@ A custom palette accepts any combination of `danger`, `success`, `warning`, `inf
 `local`, and `accent` with six-digit `#RRGGBB` values. Omitted roles use ANSI colors.
 Invalid settings use the terminal palette and show a message when the pane opens.
 
+Press `T` in Manage to preview themes. Use the arrow keys or `j` / `k` to move and
+Enter to save the highlighted theme. Select **Custom** and press Enter to edit the same
+comma-separated color assignments, then Enter to save a valid palette. Delete clears the
+editor and Esc cancels.
+
+The saved choice is shared by Manage and Workspace Starter and is stored in the
+`theme` file in herdr-lazy's plugin configuration directory. `HERDR_LAZY_THEME` takes
+precedence over this file. While the variable is set, the picker lets you preview
+other choices and keeps the environment's theme active.
+
 ### Workspace context
 
 When Herdr opens the manage pane, herdr-lazy reads the point-in-time
