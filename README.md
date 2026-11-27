@@ -41,10 +41,15 @@ when you want to inspect, version, or reproduce the setup on another machine.
 | If you want to… | Use… |
 | --- | --- |
 | Find and add a plugin | `/`, then `Enter` |
+| Find a Manage command | `Ctrl+P` |
 | Install what is selected | `i` |
 | Update installed plugins | `u` |
 | Remove a plugin | `x` |
 | Reproduce a setup elsewhere | `plugins.list` + `plugins.lock` |
+
+Press `Ctrl+P` in the Manage list and type a command name or abbreviation. Use the arrows
+to choose a result, `Enter` to open it, and `Esc` to return. The palette opens views and
+reloads the list. Install, update, remove, and restore use their existing shortcuts.
 
 ## What it gives you
 

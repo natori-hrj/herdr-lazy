@@ -18,8 +18,11 @@ use std::{
     time::Duration,
 };
 
+mod command_palette;
 mod managed_list;
 mod plugin_detail;
+
+use command_palette::{ManageCommand, Palette, PaletteAction};
 
 use crate::theme::{Color, Role, Theme};
 
@@ -1173,6 +1176,7 @@ type MarketplaceResult = Result<(Vec<crate::registry::Entry>, String), String>;
 #[derive(Default)]
 struct App {
     theme: Theme,
+    palette: Option<Palette>,
     rows: Vec<Row>,
     /// The point-in-time workspace in which Herdr opened this pane, when available.
     workspace_context: Option<crate::context::PluginContext>,
@@ -1269,6 +1273,7 @@ impl App {
         match installed_plugins() {
             Ok(installed) => App {
                 theme,
+                palette: None,
                 rows: rows_with_herdr_version(&desired, &installed, &market, herdr_version),
                 workspace_context: workspace_context.clone(),
                 workspace_profile: workspace_profile.clone(),
@@ -1298,6 +1303,7 @@ impl App {
             },
             Err(e) => App {
                 theme,
+                palette: None,
                 rows: Vec::new(),
                 workspace_context,
                 workspace_profile,
@@ -2633,7 +2639,29 @@ impl App {
         self.refresh();
     }
 
+    fn run_manage_command(&mut self, command: ManageCommand) {
+        match command {
+            ManageCommand::Browse => self.open_browser(false),
+            ManageCommand::Detail => self.open_detail(),
+            ManageCommand::Logs => self.open_logs(),
+            ManageCommand::Extras => self.open_extras(),
+            ManageCommand::Recommendations => self.open_recommendations(),
+            ManageCommand::Profile => self.open_profile(),
+            ManageCommand::Machines => self.open_machine_view(),
+            ManageCommand::SharedBundle => self.open_adopt(),
+            ManageCommand::Starter => self.flash = Some(crate::open_starter_pane()),
+            ManageCommand::Refresh => {
+                self.refresh();
+                self.flash = Some("re-read your list and what is installed".to_string());
+            }
+            ManageCommand::Help => self.help = Some(0),
+        }
+    }
+
     fn draw(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        if let Some(palette) = &self.palette {
+            return palette.draw(out, width, height, self.theme);
+        }
         if let Some(offset) = self.help {
             return draw_help(out, width, height, offset, &self.help_context());
         }
@@ -3649,6 +3677,7 @@ fn help_lines(columns: usize, context: &str) -> Vec<(bool, String)> {
         &[
             ("space", "tick or untick this row (click does the same)"),
             ("esc", "clear the selection"),
+            ("ctrl+p", "find Manage commands by name"),
             (
                 "",
                 "with nothing ticked, every action below uses the cursor row",
@@ -3959,7 +3988,13 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                 }
                 Event::Mouse(m) => {
                     use crossterm::event::MouseEventKind;
-                    if let Some(offset) = app.help {
+                    if let Some(palette) = app.palette.as_mut() {
+                        match m.kind {
+                            MouseEventKind::ScrollDown => palette.move_cursor(true),
+                            MouseEventKind::ScrollUp => palette.move_cursor(false),
+                            _ => {}
+                        }
+                    } else if let Some(offset) = app.help {
                         let key = match m.kind {
                             MouseEventKind::ScrollUp => Some(KeyCode::Up),
                             MouseEventKind::ScrollDown => Some(KeyCode::Down),
@@ -4017,6 +4052,18 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
         // pty sends Ctrl+D at end of input — which silently ran "drop from list" on whatever
         // the cursor happened to be on. Destructive actions must not be reachable by a
         // modifier chord the user did not intend.
+        if let Some(palette) = app.palette.as_mut() {
+            match palette.handle_key(key, width, height) {
+                PaletteAction::Continue => {}
+                PaletteAction::Close => app.palette = None,
+                PaletteAction::Quit => return Ok(()),
+                PaletteAction::Run(command) => {
+                    app.palette = None;
+                    app.run_manage_command(command);
+                }
+            }
+            continue;
+        }
         if let Some(offset) = app.help {
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                 return Ok(());
@@ -4465,11 +4512,13 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             continue;
         }
 
-        // Ctrl+R re-reads state in both views: the list here, the marketplace index in the
-        // browser. Plain `r` is restore, following lazy.nvim.
-        if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            app.refresh();
-            app.flash = Some("re-read your list and what is installed".to_string());
+        if command_palette::is_open_key(key) {
+            app.palette = Some(Palette::new(&app));
+            continue;
+        }
+
+        if let Some(command) = ManageCommand::for_key(key) {
+            app.run_manage_command(command);
             continue;
         }
 
@@ -4511,7 +4560,6 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             // is the wrong thing to inherit. See the `S` arm below.
             // Space / Enter tick the row; every bulk action then applies to what is ticked.
             KeyCode::Char(' ') | KeyCode::Enter => app.toggle_pick(),
-            KeyCode::Char('l') | KeyCode::Right => app.open_detail(),
             KeyCode::Char('i') => app.install_targets()?,
             KeyCode::Char('I') => {
                 suspended(|| {
@@ -4550,16 +4598,6 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                 })
             }
             KeyCode::Char('d') => app.drop_selected(),
-            KeyCode::Char('/') => app.open_browser(false),
-            KeyCode::Char('e') => app.open_extras(),
-            KeyCode::Char('f') => app.open_adopt(),
-            KeyCode::Char('p') => app.open_profile(),
-            KeyCode::Char('m') => app.open_machine_view(),
-            KeyCode::Char('w') => {
-                app.flash = Some(crate::open_starter_pane());
-            }
-            KeyCode::Char('n') => app.open_recommendations(),
-            KeyCode::Char('?') => app.help = Some(0),
 
             // Keys lazy.nvim has that this does not. Rather than doing nothing — which reads
             // as "the pane is broken" to someone whose fingers know lazy — say where the
@@ -4574,7 +4612,6 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             KeyCode::Char('C') | KeyCode::Char('c') => {
                 app.flash = Some("no check yet — [U] updates and reports what moved".to_string())
             }
-            KeyCode::Char('L') => app.open_logs(),
             _ => {}
         }
     }

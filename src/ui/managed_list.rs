@@ -210,6 +210,7 @@ pub(super) fn draw(app: &App, out: &mut impl Write, width: u16, height: u16) -> 
             for hint in [
                 "[/] Browse",
                 "[?] Help",
+                "[Ctrl+P] Commands",
                 "[l] Detail",
                 "[i] Install",
                 "[u] Update",
