@@ -56,9 +56,66 @@ impl fmt::Display for Color {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum Selection {
+    Ansi(u8),
+    Rgb(u32),
+}
+
+impl fmt::Display for Selection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Ansi(code) => write!(f, "\x1b[{code}m"),
+            Self::Rgb(rgb) => write!(
+                f,
+                "\x1b[48;2;{};{};{}m",
+                rgb >> 16,
+                (rgb >> 8) & 0xff,
+                rgb & 0xff
+            ),
+        }
+    }
+}
+
+impl Selection {
+    pub(crate) fn foreground(self) -> Color {
+        match self {
+            Self::Ansi(_) => Color::Ansi(39),
+            Self::Rgb(rgb) if luminance(rgb) >= 0.179 => Color::Rgb(0x000000),
+            Self::Rgb(_) => Color::Rgb(0xffffff),
+        }
+    }
+
+    pub(crate) fn status_color(self, color: Color) -> Color {
+        if let (Self::Rgb(background), Color::Rgb(foreground)) = (self, color) {
+            let background = luminance(background);
+            let foreground = luminance(foreground);
+            let contrast =
+                (background.max(foreground) + 0.05) / (background.min(foreground) + 0.05);
+            if contrast < 4.5 {
+                return self.foreground();
+            }
+        }
+        color
+    }
+}
+
+fn luminance(rgb: u32) -> f64 {
+    let linear = |shift| {
+        let value = f64::from((rgb >> shift) & 0xff_u32) / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * linear(16) + 0.7152 * linear(8) + 0.0722 * linear(0)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Theme {
     colors: [Color; 6],
+    selection_background: Option<u32>,
     custom: bool,
 }
 
@@ -74,7 +131,7 @@ pub(crate) struct Preset {
     pub(crate) palette: Theme,
 }
 
-const fn rgb(colors: [u32; 6]) -> Theme {
+const fn rgb(colors: [u32; 6], selection_background: u32) -> Theme {
     let [danger, success, warning, info, local, accent] = colors;
     Theme {
         colors: [
@@ -85,6 +142,7 @@ const fn rgb(colors: [u32; 6]) -> Theme {
             Color::Rgb(local),
             Color::Rgb(accent),
         ],
+        selection_background: Some(selection_background),
         custom: false,
     }
 }
@@ -102,28 +160,41 @@ pub(crate) const PRESETS: [Preset; 5] = [
                 Color::Ansi(35),
                 Color::Ansi(36),
             ],
+            selection_background: None,
             custom: false,
         },
     },
     Preset {
         id: "catppuccin",
         label: "Catppuccin Mocha",
-        palette: rgb([0xf38ba8, 0xa6e3a1, 0xf9e2af, 0x89b4fa, 0xcba6f7, 0x94e2d5]),
+        palette: rgb(
+            [0xf38ba8, 0xa6e3a1, 0xf9e2af, 0x89b4fa, 0xcba6f7, 0x94e2d5],
+            0x313244,
+        ),
     },
     Preset {
         id: "tokyo-night",
         label: "Tokyo Night",
-        palette: rgb([0xf7768e, 0x9ece6a, 0xe0af68, 0x7aa2f7, 0xbb9af7, 0x7dcfff]),
+        palette: rgb(
+            [0xf7768e, 0x9ece6a, 0xe0af68, 0x7aa2f7, 0xbb9af7, 0x7dcfff],
+            0x292e42,
+        ),
     },
     Preset {
         id: "gruvbox",
         label: "Gruvbox",
-        palette: rgb([0xfb4934, 0xb8bb26, 0xfabd2f, 0x83a598, 0xd3869b, 0x8ec07c]),
+        palette: rgb(
+            [0xfb4934, 0xb8bb26, 0xfabd2f, 0x83a598, 0xd3869b, 0x8ec07c],
+            0x3c3836,
+        ),
     },
     Preset {
         id: "nord",
         label: "Nord",
-        palette: rgb([0xbf616a, 0xa3be8c, 0xebcb8b, 0x81a1c1, 0xb48ead, 0x88c0d0]),
+        palette: rgb(
+            [0xbf616a, 0xa3be8c, 0xebcb8b, 0x81a1c1, 0xb48ead, 0x88c0d0],
+            0x242932,
+        ),
     },
 ];
 
@@ -136,6 +207,20 @@ impl Theme {
 
     pub(crate) fn color(self, role: Role) -> Color {
         self.colors[role as usize]
+    }
+
+    pub(crate) fn selection(self) -> Selection {
+        if let Some(background) = self.selection_background {
+            return Selection::Rgb(background);
+        }
+        let colors = std::env::var("COLORFGBG").unwrap_or_default();
+        match (self.custom, colors.rsplit_once(';')) {
+            (true, Some((_, "7" | "15"))) => Selection::Rgb(0xeeeeee),
+            (true, _) => Selection::Rgb(0x303030),
+            (false, Some((_, "7"))) => Selection::Ansi(107),
+            (false, Some((_, "15"))) => Selection::Ansi(47),
+            (false, _) => Selection::Ansi(100),
+        }
     }
 
     pub(crate) fn is_custom(self) -> bool {

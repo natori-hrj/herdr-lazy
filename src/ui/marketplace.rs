@@ -2,9 +2,9 @@ use std::io::{self, Write};
 
 use crate::browse::Browser;
 use crate::registry::{age_label, today_days, Entry};
-use crate::theme::{Color, Role, Theme};
+use crate::theme::{Color, Role, Selection, Theme};
 
-use super::terminal_text::{cell_width, clip};
+use super::terminal_text::{cell_width, clip, finish_selection, start_selection};
 use super::{footer_start_row, rule_line, App};
 
 pub(super) struct Window {
@@ -94,12 +94,13 @@ struct Presence {
 fn result_line(
     out: &mut impl Write,
     entry: &Entry,
-    focused: bool,
+    selection: Option<Selection>,
     presence: Presence,
     columns: usize,
     theme: Theme,
     today: i64,
 ) -> io::Result<()> {
+    let focused = selection.is_some();
     let point = if focused { ">" } else { " " };
     if columns == 1 {
         return write!(out, "{point}");
@@ -127,7 +128,8 @@ fn result_line(
     };
     let (name, cells) = clip(&entry.full_name, name_width);
     let emphasize = if focused { "\x1b[1m" } else { "" };
-    write!(out, "{point} {emphasize}{name}\x1b[0m")?;
+    let dim = if focused { "" } else { "\x1b[2m" };
+    write!(out, "{point} {emphasize}{name}\x1b[22m")?;
     if status_width > 0 {
         let pad = name_width - cells + 2;
         let color = if status.is_empty() {
@@ -135,17 +137,19 @@ fn result_line(
         } else {
             theme.color(Role::Success)
         };
-        write!(out, "{:pad$}{color}{status:<status_width$}\x1b[0m", "")?;
+        let foreground = selection.map_or(Color::Ansi(39), Selection::foreground);
+        let color = selection.map_or(color, |selection| selection.status_color(color));
+        write!(out, "{:pad$}{color}{status:<status_width$}{foreground}", "")?;
     }
     if metrics_width > 0 {
         let metrics = format!("{} · {}★", age_label(&entry.pushed_at, today), entry.stars);
         let (metrics, cells) = clip(&metrics, metrics_width - 4);
-        write!(out, "  \x1b[2m{metrics}\x1b[0m")?;
+        write!(out, "  {dim}{metrics}\x1b[22m")?;
         let description_width = available - name_width;
         if description_width > 0 {
             let pad = metrics_width - 2 - cells;
             let (description, _) = clip(&entry.description, description_width);
-            write!(out, "{:pad$}\x1b[2m{description}\x1b[0m", "")?;
+            write!(out, "{:pad$}{dim}{description}\x1b[22m", "")?;
         }
     }
     Ok(())
@@ -232,7 +236,8 @@ pub(super) fn draw(
             .take(window.visible)
             .enumerate()
         {
-            let focused = window.start + offset == browser.cursor;
+            let selection =
+                (window.start + offset == browser.cursor).then(|| app.theme.selection());
             let installed = app.rows.iter().any(|row| {
                 row.installed.is_some()
                     && row
@@ -241,10 +246,13 @@ pub(super) fn draw(
                         .is_some_and(|slug| slug.eq_ignore_ascii_case(&entry.full_name))
             });
             write!(out, "\x1b[{};1H", window.top + offset + 1)?;
+            if let Some(selection) = selection {
+                start_selection(out, selection, columns)?;
+            }
             result_line(
                 out,
                 entry,
-                focused,
+                selection,
                 Presence {
                     installed,
                     listed: browser.is_listed(entry),
@@ -253,6 +261,9 @@ pub(super) fn draw(
                 app.theme,
                 today,
             )?;
+            if selection.is_some() {
+                finish_selection(out)?;
+            }
         }
     }
 
@@ -334,7 +345,7 @@ mod tests {
                             .char_indices()
                             .find(|(_, ch)| ('@'..='~').contains(ch))
                             .unwrap();
-                        if final_char == 'H' {
+                        if matches!(final_char, 'H' | 'G') {
                             cells = 0;
                             if let Some((row, _)) = sequence[..index].split_once(';') {
                                 assert!(row.parse::<u16>().unwrap() <= height);

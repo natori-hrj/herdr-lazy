@@ -4583,6 +4583,211 @@ mod tests {
         }
     }
 
+    fn draw_list_frame(app: &App, width: u16) -> String {
+        let mut output = Vec::new();
+        app.draw(&mut output, width, 14).unwrap();
+        String::from_utf8(output).unwrap()
+    }
+
+    fn list_frame_row(frame: &str, row: usize) -> &str {
+        let (_, row) = frame.split_once(&format!("\x1b[{row};1H")).unwrap();
+        let end = row
+            .match_indices("\x1b[")
+            .find_map(|(start, _)| {
+                let command = row[start + 2..].chars().find(|ch| ('@'..='~').contains(ch));
+                (command == Some('H')).then_some(start)
+            })
+            .unwrap_or(row.len());
+        &row[..end]
+    }
+
+    fn list_row_text(row: &str) -> String {
+        let mut segments = row.split("\x1b[");
+        let mut text = segments.next().unwrap().to_string();
+        for segment in segments {
+            let end = segment.find(|ch| ('@'..='~').contains(&ch)).unwrap();
+            text.push_str(&segment[end + 1..]);
+        }
+        text
+    }
+
+    #[test]
+    fn selection_surface_keeps_custom_status_and_metadata_readable() {
+        use crate::browse::Browser;
+        use crate::theme::Color;
+
+        let colors = std::env::var("COLORFGBG").unwrap_or_default();
+        let light = matches!(colors.rsplit_once(';'), Some((_, "7" | "15")));
+        let (low_contrast, foreground, distinct) = if light {
+            (0xffffff, 0x000000, 0x206b37)
+        } else {
+            (0x000000, 0xffffff, 0xa6e3a1)
+        };
+        let theme = Theme::parse_custom(&format!(
+            "warning=#{low_contrast:06x},success=#{distinct:06x}"
+        ))
+        .unwrap();
+        let mut app = App {
+            rows: rows(&[Spec::parse("owner/a"), Spec::parse("owner/b")], &[]),
+            theme,
+            ..App::default()
+        };
+        app.rows[0].commit = Some("af06d0ad3fd9".into());
+        let frame = draw_list_frame(&app, 120);
+        let managed = list_frame_row(&frame, LIST_TOP + 1);
+        let foreground = Color::Rgb(foreground);
+        assert!(
+            managed.contains(&format!("{foreground}Missing")),
+            "{managed:?}"
+        );
+        assert!(managed.contains("af06d0ad3fd9") && !managed.contains("\x1b[2m"));
+        assert!(list_frame_row(&frame, LIST_TOP + 2)
+            .contains(&format!("{}Missing", Color::Rgb(low_contrast))));
+
+        app.browser = Some(Browser::new(
+            vec![marketplace_entry("owner/a")],
+            "cached".into(),
+            vec!["owner/a".into()],
+        ));
+        let frame = draw_list_frame(&app, 120);
+        let marketplace = list_frame_row(&frame, 4);
+        assert!(marketplace.contains(&format!("{}Listed", Color::Rgb(distinct))));
+        assert!(!marketplace.contains("\x1b[2m"));
+    }
+
+    #[test]
+    fn selection_surface_reserves_the_last_column_of_picked_manage_rows() {
+        let mut app = App {
+            rows: rows(&[Spec::parse("owner/a"), Spec::parse("owner/b")], &[]),
+            ..App::default()
+        };
+        app.rows[0].picked = true;
+        for width in 12..=15 {
+            let frame = draw_list_frame(&app, width);
+            for index in 0..=1 {
+                let row = list_frame_row(&frame, LIST_TOP + 1 + index);
+                for pass in row.split("\x1b[1G") {
+                    let text = list_row_text(pass);
+                    let cells = text.chars().map(terminal_text::cell_width).sum::<usize>();
+                    assert!(cells < usize::from(width), "width {width}: {text:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selection_surface_reaches_the_last_usable_cell_with_joined_emoji() {
+        use unicode_width::UnicodeWidthStr;
+
+        let mut entry = marketplace_entry("owner/editor");
+        entry.description = "👩‍💻".into();
+        let app = App {
+            browser: Some(crate::browse::Browser::new(
+                vec![entry],
+                "cached".into(),
+                Vec::new(),
+            )),
+            ..App::default()
+        };
+        let frame = draw_list_frame(&app, 120);
+        let row = list_frame_row(&frame, 4);
+        assert!(row.contains("👩‍💻"));
+        let painted = row
+            .split("\x1b[1G")
+            .map(|pass| list_row_text(pass).width())
+            .max()
+            .unwrap();
+        assert_eq!(painted, 119, "{row:?}");
+    }
+
+    #[test]
+    fn focused_list_rows_keep_the_background_through_status_and_padding() {
+        use crate::browse::Browser;
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let terminal_background = match std::env::var("COLORFGBG")
+            .unwrap_or_default()
+            .rsplit_once(';')
+        {
+            Some((_, "7")) => "\x1b[107m",
+            Some((_, "15")) => "\x1b[47m",
+            _ => "\x1b[100m",
+        };
+        let (custom_colors, custom_background) = if terminal_background == "\x1b[100m" {
+            ("warning=#f9e2af,success=#a6e3a1", "\x1b[48;2;48;48;48m")
+        } else {
+            ("warning=#825400,success=#206b37", "\x1b[48;2;238;238;238m")
+        };
+        for (theme, background) in [
+            (Theme::default(), terminal_background),
+            (crate::theme::PRESETS[1].palette, "\x1b[48;2;49;50;68m"),
+            (
+                Theme::parse_custom(custom_colors).unwrap(),
+                custom_background,
+            ),
+        ] {
+            for browser_open in [false, true] {
+                let mut app = App {
+                    rows: rows(&[Spec::parse("owner/a"), Spec::parse("owner/二")], &[]),
+                    browser: browser_open.then(|| {
+                        Browser::new(
+                            vec![marketplace_entry("owner/a"), marketplace_entry("owner/b")],
+                            "cached".into(),
+                            vec!["owner/a".into(), "owner/b".into()],
+                        )
+                    }),
+                    theme,
+                    ..App::default()
+                };
+                let top = if browser_open { 3 } else { LIST_TOP } as u16;
+                let (role, status) = if browser_open {
+                    (Role::Success, "Listed")
+                } else {
+                    (Role::Warning, "Missing")
+                };
+                for offset in 0..=1 {
+                    if offset == 1 {
+                        app.handle_mouse(
+                            MouseEvent {
+                                kind: MouseEventKind::Down(MouseButton::Left),
+                                column: 0,
+                                row: top + offset,
+                                modifiers: KeyModifiers::NONE,
+                            },
+                            14,
+                        )
+                        .unwrap();
+                    }
+                    for width in [2, 40, 80, 120] {
+                        let mut output = Vec::new();
+                        app.draw(&mut output, width, 14).unwrap();
+                        let frame = String::from_utf8(output).unwrap();
+                        assert_eq!(frame.matches(background).count(), 1);
+                        let (before, highlighted) = frame.split_once(background).unwrap();
+                        assert!(before.ends_with(&format!("\x1b[{};1H", top + offset + 1)));
+                        let (fill, highlighted) = highlighted.split_once("\x1b[1G").unwrap();
+                        assert_eq!(fill, " ".repeat(usize::from(width - 1)));
+                        let (row, after) = highlighted.split_once("\x1b[49m").unwrap();
+                        let pointer = if !browser_open && offset == 1 && width == 2 {
+                            '+'
+                        } else {
+                            '>'
+                        };
+                        let text = list_row_text(row);
+                        assert!(text.starts_with(pointer));
+                        if width >= 40 {
+                            assert!(row.contains(&format!("{}{status}", theme.color(role))));
+                        }
+                        assert!(!row.contains("\x1b[0m"));
+                        assert!(after.starts_with("\x1b[") && !after.contains("\x1b[49m"));
+                        let cells = text.chars().map(terminal_text::cell_width).sum::<usize>();
+                        assert!(cells <= usize::from(width - 1));
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn marketplace_completion_keeps_query_and_selected_plugin() {
         let (send, receive) = mpsc::channel();

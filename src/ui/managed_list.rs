@@ -1,5 +1,7 @@
-use super::terminal_text::clip;
+use super::terminal_text::{clip, finish_selection, start_selection};
 use std::io::{self, Write};
+
+use crate::theme::{Color, Selection};
 
 use super::{footer_start_row, rule_line, App, Role, Row, Status, Theme, LIST_TOP};
 
@@ -32,30 +34,32 @@ fn status_label(status: &Status, compact: bool) -> &'static str {
 fn row_line(
     out: &mut impl Write,
     row: &Row,
-    focused: bool,
+    selection: Option<Selection>,
     picked: bool,
     columns: usize,
     theme: Theme,
 ) -> io::Result<()> {
+    let focused = selection.is_some();
     let pointer = if focused { "> " } else { "  " };
-    if columns < 12 {
-        let prefix = match (focused, row.picked) {
-            (true, true) => "+",
-            (true, false) => ">",
-            (false, true) => "*",
-            (false, false) => " ",
-        };
-        let (label, _) = clip(&row.label, columns.saturating_sub(1));
-        return write!(out, "{prefix}{label}");
-    }
     let compact = columns < 23;
     let checkbox = match (picked, row.picked) {
         (true, true) => "[x] ",
         (true, false) => "[ ] ",
         _ => "",
     };
-    let status = status_label(&row.status, compact);
     let status_width = if compact { 3 } else { 10 };
+    let prefix_width = pointer.len() + checkbox.len() + status_width + 4;
+    if columns < 12 || columns <= prefix_width {
+        let prefix = match (focused, row.picked) {
+            (true, true) => "+",
+            (true, false) => ">",
+            (false, true) => "*",
+            (false, false) => " ",
+        };
+        let (label, _) = clip(&row.label, columns - 1);
+        return write!(out, "{prefix}{label}");
+    }
+    let status = status_label(&row.status, compact);
     let warning = if row.herdr_warning.is_some() {
         '!'
     } else {
@@ -68,8 +72,7 @@ fn row_line(
     };
     let update = if row.maybe_stale { '^' } else { ' ' };
     let commit_width = if columns >= 64 { 16 } else { 0 };
-    let available =
-        columns.saturating_sub(pointer.len() + checkbox.len() + status_width + 4 + commit_width);
+    let available = columns - prefix_width - commit_width;
     let name_width = if columns >= 96 {
         available.min(40)
     } else {
@@ -77,10 +80,13 @@ fn row_line(
     };
     let (name, name_cells) = clip(&row.label, name_width);
     let emphasized = if focused { "\x1b[1m" } else { "" };
+    let dim = if focused { "" } else { "\x1b[2m" };
+    let foreground = selection.map_or(Color::Ansi(39), Selection::foreground);
+    let color = theme.color(row.status.role());
+    let color = selection.map_or(color, |selection| selection.status_color(color));
     write!(
         out,
-        "{pointer}{checkbox}{}{status:<status_width$}\x1b[0m{warning}{disabled}{update} {emphasized}{name}\x1b[0m",
-        theme.color(row.status.role())
+        "{pointer}{checkbox}{color}{status:<status_width$}{foreground}{warning}{disabled}{update} {emphasized}{name}\x1b[22m"
     )?;
 
     if commit_width > 0 {
@@ -91,12 +97,12 @@ fn row_line(
             .unwrap_or_else(|| "-".to_string());
         let (commit, cells) = clip(&commit, commit_width - 4);
         let pad = name_width - name_cells + 2;
-        write!(out, "{:pad$}\x1b[2m{commit}\x1b[0m", "")?;
+        write!(out, "{:pad$}{dim}{commit}\x1b[22m", "")?;
         let notes_width = available.saturating_sub(name_width);
         if notes_width > 0 {
             let (note, _) = clip(&row.trailing_text(), notes_width);
             let pad = commit_width - 2 - cells;
-            write!(out, "{:pad$}\x1b[2m{note}\x1b[0m", "")?;
+            write!(out, "{:pad$}{dim}{note}\x1b[22m", "")?;
         }
     }
     Ok(())
@@ -153,14 +159,14 @@ pub(super) fn draw(app: &App, out: &mut impl Write, width: u16, height: u16) -> 
         let (visible, start) = app.list_window(height);
         for (offset, row) in app.rows.iter().skip(start).take(visible).enumerate() {
             write!(out, "\x1b[{};1H", top + offset + 1)?;
-            row_line(
-                out,
-                row,
-                start + offset == app.cursor,
-                picked,
-                columns,
-                app.theme,
-            )?;
+            let selection = (start + offset == app.cursor).then(|| app.theme.selection());
+            if let Some(selection) = selection {
+                start_selection(out, selection, columns)?;
+            }
+            row_line(out, row, selection, picked, columns, app.theme)?;
+            if selection.is_some() {
+                finish_selection(out)?;
+            }
         }
     }
 
@@ -230,7 +236,16 @@ mod tests {
         row.picked = true;
         for columns in [1, 10, 16, 24, 39, 63, 64, 95, 96, 132] {
             let mut output = Vec::new();
-            row_line(&mut output, &row, true, true, columns, Theme::default()).unwrap();
+            let theme = Theme::default();
+            row_line(
+                &mut output,
+                &row,
+                Some(theme.selection()),
+                true,
+                columns,
+                theme,
+            )
+            .unwrap();
             let output = String::from_utf8(output).unwrap();
             let mut segments = output.split("\x1b[");
             let mut visible = segments.next().unwrap().to_string();
