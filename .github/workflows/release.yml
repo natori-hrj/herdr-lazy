@@ -15,6 +15,9 @@ permissions:
   contents: write
 
 jobs:
+  audit:
+    uses: ./.github/workflows/audit.yml
+
   # The release is created exactly once, before anything uploads to it.
   #
   # Previously each matrix job created-or-updated the release itself, which is a race: four
@@ -22,6 +25,7 @@ jobs:
   # release missing whichever platform lost. That is worse than a failed release, because it
   # looks successful while quietly shipping an incomplete set.
   create-release:
+    needs: audit
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:
@@ -49,9 +53,9 @@ jobs:
           fi
 
   build:
-    needs: [create-release]
+    needs: [audit, create-release]
     # `always()` so a non-tag run, where create-release is skipped, still builds.
-    if: always() && needs.create-release.result != 'failure'
+    if: ${{ !cancelled() && needs.audit.result == 'success' && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped') }}
 
     defaults:
       run:

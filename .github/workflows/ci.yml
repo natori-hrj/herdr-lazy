@@ -9,6 +9,9 @@ permissions:
   contents: read
 
 jobs:
+  audit:
+    uses: ./.github/workflows/audit.yml
+
   test:
     runs-on: ${{ matrix.os }}
     strategy:
