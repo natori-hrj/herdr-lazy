@@ -34,6 +34,7 @@ mod recommendations;
 mod registry;
 mod starter;
 mod starter_ui;
+mod theme;
 mod ui;
 
 use std::env;

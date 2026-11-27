@@ -7,6 +7,7 @@
 
 use std::io::{self, Write};
 
+use crate::theme::{Color, Role, Theme};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
 
@@ -40,6 +41,7 @@ struct LaunchResult {
 }
 
 struct App {
+    theme: Theme,
     profile: Option<crate::profile::WorkspaceProfile>,
     profile_error: Option<String>,
     global_source: Source,
@@ -60,6 +62,7 @@ struct App {
 
 impl App {
     fn load() -> Self {
+        let (theme, theme_error) = Theme::configured();
         let context = crate::context::read_context_from_env();
         let (profile, profile_error) = match crate::profile::discover(context.context.as_ref()) {
             Ok(profile) => (profile, None),
@@ -89,6 +92,7 @@ impl App {
         };
 
         let mut app = Self {
+            theme,
             profile,
             profile_error,
             global_source,
@@ -104,7 +108,7 @@ impl App {
             results: Vec::new(),
             cursor: 0,
             error,
-            flash: None,
+            flash: theme_error.map(|error| format!("Using terminal theme: {error}")),
         };
         app.rebuild();
         app
@@ -440,6 +444,8 @@ impl App {
     }
 
     fn draw_review(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        let danger = self.theme.color(Role::Danger);
+        let accent = self.theme.color(Role::Accent);
         let rule = "─".repeat((width as usize).clamp(20, 200));
         write!(out, "\x1b[H\x1b[2J")?;
         writeln!(
@@ -452,12 +458,12 @@ impl App {
         if let Some(error) = &self.error {
             writeln!(
                 out,
-                " \x1b[31mcannot read installed plugins:\x1b[0m {}\r",
+                " {danger}cannot read installed plugins:\x1b[0m {}\r",
                 one_line(error)
             )?;
         }
         if self.selected_source == SourceKind::Profile && self.profile_source.is_none() {
-            writeln!(out, " \x1b[31mworkspace profile is unavailable:\x1b[0m\r")?;
+            writeln!(out, " {danger}workspace profile is unavailable:\x1b[0m\r")?;
             writeln!(
                 out,
                 "   {}\r",
@@ -553,7 +559,7 @@ impl App {
         }
 
         let footer = match &self.flash {
-            Some(message) => format!("\x1b[36m{}\x1b[0m", one_line(message)),
+            Some(message) => format!("{accent}{}\x1b[0m", one_line(message)),
             None if self.selected_source == SourceKind::Profile && self.profile_source.is_none() => {
                 "\x1b[1m[b]\x1b[0m use global bundle explicitly  \x1b[1m[r]\x1b[0m re-read  \x1b[1m[q]\x1b[0m quit".to_string()
             }
@@ -570,12 +576,13 @@ impl App {
         width: u16,
         height: u16,
     ) -> io::Result<()> {
+        let warning = self.theme.color(Role::Warning);
         let rule = "─".repeat((width as usize).clamp(20, 200));
         let operation = self.pending_operation.expect("checked by caller");
         write!(out, "\x1b[H\x1b[2J")?;
         writeln!(
             out,
-            "\x1b[1m workspace starter\x1b[0m  \x1b[33mconfirm {}\x1b[0m\r",
+            "\x1b[1m workspace starter\x1b[0m  {warning}confirm {}\x1b[0m\r",
             operation_label(operation)
         )?;
         writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
@@ -648,6 +655,7 @@ impl App {
     }
 
     fn draw_launch(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        let success = self.theme.color(Role::Success);
         let rule = "─".repeat((width as usize).clamp(20, 200));
         let picked = self
             .launch_choices
@@ -683,16 +691,14 @@ impl App {
             } else {
                 " "
             };
-            let tick = if choice.picked {
-                "\x1b[32m[x]\x1b[0m"
+            let (tick_color, tick) = if choice.picked {
+                (success, "[x]")
             } else {
-                "[ ]"
+                (Color::Plain, "[ ]")
             };
             writeln!(
                 out,
-                "{} {} {}\r",
-                pointer,
-                tick,
+                "{pointer} {tick_color}{tick}\x1b[0m {}\r",
                 truncate(
                     &target_label(&choice.target),
                     width.saturating_sub(8) as usize
@@ -708,11 +714,12 @@ impl App {
     }
 
     fn draw_launch_confirm(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        let warning = self.theme.color(Role::Warning);
         let rule = "─".repeat((width as usize).clamp(20, 200));
         write!(out, "\x1b[H\x1b[2J")?;
         writeln!(
             out,
-            "\x1b[1m workspace starter\x1b[0m  \x1b[33mconfirm launch\x1b[0m\r"
+            "\x1b[1m workspace starter\x1b[0m  {warning}confirm launch\x1b[0m\r"
         )?;
         writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
         writeln!(
@@ -750,6 +757,8 @@ impl App {
     }
 
     fn draw_results(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        let danger = self.theme.color(Role::Danger);
+        let success = self.theme.color(Role::Success);
         let rule = "─".repeat((width as usize).clamp(20, 200));
         write!(out, "\x1b[H\x1b[2J")?;
         writeln!(
@@ -762,11 +771,7 @@ impl App {
         } else {
             let visible = (height as usize).saturating_sub(5).max(1);
             for result in self.results.iter().take(visible) {
-                let colour = if result.success {
-                    "\x1b[32m"
-                } else {
-                    "\x1b[31m"
-                };
+                let colour = if result.success { success } else { danger };
                 writeln!(
                     out,
                     " {}{}\x1b[0m {} — {}\r",
@@ -797,8 +802,9 @@ impl App {
         rule: &str,
         footer: &str,
     ) -> io::Result<()> {
+        let accent = self.theme.color(Role::Accent);
         let footer = match &self.flash {
-            Some(message) => format!("\x1b[36m{}\x1b[0m", one_line(message)),
+            Some(message) => format!("{accent}{}\x1b[0m", one_line(message)),
             None => footer.to_string(),
         };
         write!(

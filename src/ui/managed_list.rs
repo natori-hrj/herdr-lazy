@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 use unicode_width::UnicodeWidthChar;
 
-use super::{footer_start_row, rule_line, App, Row, Status, LIST_TOP};
+use super::{footer_start_row, rule_line, App, Role, Row, Status, Theme, LIST_TOP};
 
 pub(super) fn list_top(height: u16) -> usize {
     if height < 7 {
@@ -68,6 +68,7 @@ fn row_line(
     focused: bool,
     picked: bool,
     columns: usize,
+    theme: Theme,
 ) -> io::Result<()> {
     let pointer = if focused { "> " } else { "  " };
     if columns < 12 {
@@ -112,7 +113,7 @@ fn row_line(
     write!(
         out,
         "{pointer}{checkbox}{}{status:<status_width$}\x1b[0m{warning}{disabled}{update} {emphasized}{name}\x1b[0m",
-        row.status.colour()
+        theme.color(row.status.role())
     )?;
 
     if commit_width > 0 {
@@ -172,7 +173,8 @@ pub(super) fn draw(app: &App, out: &mut impl Write, width: u16, height: u16) -> 
 
     if let Some(error) = &app.error {
         let (message, _) = clip(&format!("Cannot read plugin list · {error}"), columns);
-        write!(out, "\x1b[{};1H\x1b[31m{message}\x1b[0m", top + 1)?;
+        let danger = app.theme.color(Role::Danger);
+        write!(out, "\x1b[{};1H{danger}{message}\x1b[0m", top + 1)?;
     } else if app.rows.is_empty() {
         let (message, _) = clip(
             "No plugins yet · [/] Browse or run herdr-lazy init",
@@ -184,7 +186,14 @@ pub(super) fn draw(app: &App, out: &mut impl Write, width: u16, height: u16) -> 
         let (visible, start) = app.list_window(height);
         for (offset, row) in app.rows.iter().skip(start).take(visible).enumerate() {
             write!(out, "\x1b[{};1H", top + offset + 1)?;
-            row_line(out, row, start + offset == app.cursor, picked, columns)?;
+            row_line(
+                out,
+                row,
+                start + offset == app.cursor,
+                picked,
+                columns,
+                app.theme,
+            )?;
         }
     }
 
@@ -194,7 +203,8 @@ pub(super) fn draw(app: &App, out: &mut impl Write, width: u16, height: u16) -> 
         write!(out, "\x1b[{divider};1H\x1b[2m{}\x1b[0m", rule_line(width))?;
         if let Some(flash) = &app.flash {
             let (message, _) = clip(flash, columns);
-            write!(out, "\x1b[{footer};1H\x1b[36m{message}\x1b[0m")?;
+            let accent = app.theme.color(Role::Accent);
+            write!(out, "\x1b[{footer};1H{accent}{message}\x1b[0m")?;
         } else {
             let mut legend = String::new();
             for hint in [
@@ -259,7 +269,7 @@ mod tests {
         row.picked = true;
         for columns in [1, 10, 16, 24, 39, 63, 64, 95, 96, 132] {
             let mut output = Vec::new();
-            row_line(&mut output, &row, true, true, columns).unwrap();
+            row_line(&mut output, &row, true, true, columns, Theme::default()).unwrap();
             let output = String::from_utf8(output).unwrap();
             let mut segments = output.split("\x1b[");
             let mut visible = segments.next().unwrap().to_string();
