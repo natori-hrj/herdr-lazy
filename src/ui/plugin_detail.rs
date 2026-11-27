@@ -10,6 +10,7 @@ use crate::github::Changes;
 struct Line {
     text: String,
     color: Color,
+    bold: bool,
 }
 
 #[derive(Default)]
@@ -25,9 +26,14 @@ impl Body {
     }
 
     fn push_color(&mut self, text: impl Into<String>, color: Color) {
+        self.push_styled(text, color, false);
+    }
+
+    fn push_styled(&mut self, text: impl Into<String>, color: Color, bold: bool) {
         self.lines.push(Line {
             text: text.into(),
             color,
+            bold,
         });
     }
 
@@ -135,7 +141,7 @@ fn body(app: &App, width: u16) -> Body {
     }
 
     if !items.is_empty() {
-        body.push("Actions and panes");
+        body.push_styled("Actions and panes", Color::Plain, true);
         for (i, (target, label)) in items.iter().enumerate() {
             let selected = i == app.detail_cursor;
             let kind = match target {
@@ -163,13 +169,13 @@ fn body(app: &App, width: u16) -> Body {
             } else {
                 Color::Plain
             };
-            body.push_color(text, color);
+            body.push_styled(text, color, selected);
         }
         body.push("");
     }
 
     if !detail.events.is_empty() {
-        body.push("Events");
+        body.push_styled("Events", Color::Plain, true);
         for event in &detail.events {
             body.push(format!("  {event}"));
         }
@@ -181,7 +187,11 @@ fn body(app: &App, width: u16) -> Body {
             let warning = app.theme.color(Role::Warning);
             match changes {
                 Changes::Commits(subjects) if !subjects.is_empty() => {
-                    body.push_color(format!("Changes · {} new commits", subjects.len()), warning);
+                    body.push_styled(
+                        format!("Changes · {} new commits", subjects.len()),
+                        warning,
+                        true,
+                    );
                     for subject in subjects.iter().take(8) {
                         body.push(format!("  · {subject}"));
                     }
@@ -192,7 +202,7 @@ fn body(app: &App, width: u16) -> Body {
                 }
                 Changes::Commits(_) => {}
                 Changes::ManyPlus(count) => {
-                    body.push_color(format!("Changes · {count}+ commits behind"), warning);
+                    body.push_styled(format!("Changes · {count}+ commits behind"), warning, true);
                     body.push("Esc returns to the list. Press u there to update.");
                 }
                 Changes::Unknown(reason) => {
@@ -205,7 +215,7 @@ fn body(app: &App, width: u16) -> Body {
 
     if let Some((target, _)) = items.get(app.detail_cursor) {
         let (kind, command) = crate::bind_toml_fields(target, &detail.plugin_id);
-        body.push("Binding preview");
+        body.push_styled("Binding preview", Color::Plain, true);
         body.push(format!("  type = \"{kind}\""));
         body.push_wrapped(&format!("  command = \"{command}\""), text_width);
     }
@@ -283,17 +293,29 @@ pub(super) fn draw(app: &App, out: &mut impl Write, width: u16, height: u16) -> 
     let (start, visible) = body_window(height);
     let body = body(app, width);
     let offset = body.offset(app.detail_scroll, visible);
-    let mut title = format!(" {}", row.label);
-    if let Some((index, label)) = body.selected_row.zip(body.selected_label.as_ref()) {
-        if !(offset..offset + visible).contains(&index) {
-            title.push_str(&format!(" · Selected: {label}"));
-        }
-    }
-    let (title, _) = clip(&title, columns);
-    write!(out, "\x1b[H\x1b[2J\x1b[1m{title}\x1b[0m")?;
+    let selection_visible = body
+        .selected_row
+        .is_some_and(|index| (offset..offset + visible).contains(&index));
+    let title = format!(" {}", row.label);
+    let (_, title_cells) = clip(&title, columns);
+    let summary = if let Some(label) = body.selected_label.as_ref().filter(|_| !selection_visible) {
+        let budget = (columns * 2 / 3).max(columns - title_cells);
+        clip(&format!(" · Selected: {label}"), budget)
+    } else {
+        (String::new(), 0)
+    };
+    let (summary, summary_cells) = summary;
+    let (title, _) = clip(&title, columns - summary_cells);
+    write!(out, "\x1b[H\x1b[2J\x1b[1m{title}\x1b[0m{summary}")?;
     for (i, line) in body.lines.iter().skip(offset).take(visible).enumerate() {
         let (text, _) = clip(&format!(" {}", line.text), columns);
-        write!(out, "\x1b[{};1H{}{text}\x1b[0m", start + i, line.color)?;
+        let bold = if line.bold { "\x1b[1m" } else { "" };
+        write!(
+            out,
+            "\x1b[{};1H{}{bold}{text}\x1b[0m",
+            start + i,
+            line.color
+        )?;
     }
 
     let footer_row = footer_row(height);
@@ -306,23 +328,34 @@ pub(super) fn draw(app: &App, out: &mut impl Write, width: u16, height: u16) -> 
         )?;
     }
     if footer_row > 1 {
-        let (footer, color) = if app.awaiting_bind {
-            (
-                "Letter binds to prefix+shift+letter · Esc cancels".to_string(),
+        write!(out, "\x1b[{footer_row};1H")?;
+        let status = if app.awaiting_bind {
+            Some((
+                "Letter binds to prefix+shift+letter · Esc cancels",
                 app.theme.color(Role::Warning),
-            )
-        } else if let Some(message) = app.flash.as_ref() {
-            (message.clone(), app.theme.color(Role::Accent))
+            ))
+        } else {
+            app.flash
+                .as_deref()
+                .map(|message| (message, app.theme.color(Role::Accent)))
+        };
+        if let Some((message, color)) = status {
+            let (footer, _) = clip(message, columns);
+            write!(out, "{color}{footer}\x1b[0m")?;
         } else {
             let mut hints = String::from("Esc Back");
             let compact = width < 75;
-            if body.lines.len() > visible {
-                hints.push_str(if compact {
-                    " · Pg↑/↓"
-                } else {
-                    " · PgUp/PgDn Scroll"
-                });
-            }
+            hints.push_str(
+                match (offset > 0, offset + visible < body.lines.len(), compact) {
+                    (true, true, true) => " · Pg↑/↓",
+                    (true, false, true) => " · Pg↑",
+                    (false, true, true) => " · Pg↓",
+                    (true, true, false) => " · PgUp/PgDn Scroll",
+                    (true, false, false) => " · PgUp Scroll",
+                    (false, true, false) => " · PgDn Scroll",
+                    (false, false, _) => "",
+                },
+            );
             if body.selected_label.is_some() {
                 hints.push_str(if compact {
                     " · ↑↓ Enter b"
@@ -333,10 +366,15 @@ pub(super) fn draw(app: &App, out: &mut impl Write, width: u16, height: u16) -> 
             if row.installed.is_some() {
                 hints.push_str(if compact { " · L" } else { " · L Logs" });
             }
-            (hints, Color::Plain)
-        };
-        let (footer, _) = clip(&footer, columns);
-        write!(out, "\x1b[{footer_row};1H{color}{footer}\x1b[0m")?;
+            let (footer, _) = clip(&hints, columns);
+            let primary = if compact { "Enter" } else { "Enter Run" };
+            if let Some((before, after)) = footer.split_once(primary).filter(|_| selection_visible)
+            {
+                write!(out, "{before}\x1b[1m{primary}\x1b[0m{after}")?;
+            } else {
+                write!(out, "{footer}")?;
+            }
+        }
     }
     out.flush()
 }
@@ -367,8 +405,34 @@ mod tests {
 
     fn render(app: &App, width: u16, height: u16) -> String {
         let mut output = Vec::new();
-        draw(app, &mut output, width, height).unwrap();
+        app.draw(&mut output, width, height).unwrap();
         String::from_utf8(output).unwrap()
+    }
+
+    #[test]
+    fn detail_visual_hierarchy_tracks_the_viewport() {
+        let mut app = fixture();
+        let initial = render(&app, 40, 9);
+        assert!(initial.contains("Pg↓"));
+        assert!(!initial.contains("Pg↑"));
+        assert!(!initial.contains("\x1b[1mEnter\x1b[0m"));
+
+        app.detail_cursor = 1;
+        reveal_selection(&mut app, 40, 9);
+        let selected = render(&app, 40, 9);
+        assert!(selected.contains("\x1b[1m Actions and panes\x1b[0m"));
+        assert!(selected.contains("\x1b[1m > Action · Command 1\x1b[0m"));
+        assert!(selected.contains("Pg↑/↓"));
+        assert!(selected.contains("\x1b[1mEnter\x1b[0m"));
+
+        scroll_rows(&mut app, 40, 11, isize::MAX);
+        app.rows[0].label = "owner/long-plugin-name".into();
+        let end = render(&app, 40, 11);
+        assert!(end.contains("Selected: Command 1"));
+        assert!(end.contains("\x1b[1m Binding preview\x1b[0m"));
+        assert!(end.contains("Pg↑"));
+        assert!(!end.contains("Pg↓"));
+        assert!(!end.contains("\x1b[1mEnter\x1b[0m"));
     }
 
     #[test]
@@ -379,7 +443,7 @@ mod tests {
         let output = render(&app, 40, 10);
         assert!(output.contains("> Action · Command 10"));
         assert!(output.contains("Pg↑/↓"));
-        assert!(output.contains("Enter b"));
+        assert!(output.contains("Enter\x1b[0m b"));
         assert!(output.contains("\x1b[8;1H"));
         assert!(!output.contains("\x1b[9;1H"));
         assert!(!output.contains("Command 0"));

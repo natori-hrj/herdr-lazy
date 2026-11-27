@@ -38,6 +38,7 @@ fn row_line(
     theme: Theme,
 ) -> io::Result<()> {
     let pointer = if focused { "> " } else { "  " };
+    let emphasized = if focused { "\x1b[1m" } else { "" };
     if columns < 12 {
         let prefix = match (focused, row.picked) {
             (true, true) => "+",
@@ -46,7 +47,7 @@ fn row_line(
             (false, false) => " ",
         };
         let (label, _) = clip(&row.label, columns.saturating_sub(1));
-        return write!(out, "{prefix}{label}");
+        return write!(out, "{emphasized}{prefix}{label}\x1b[0m");
     }
     let compact = columns < 23;
     let checkbox = match (picked, row.picked) {
@@ -76,10 +77,9 @@ fn row_line(
         available
     };
     let (name, name_cells) = clip(&row.label, name_width);
-    let emphasized = if focused { "\x1b[1m" } else { "" };
     write!(
         out,
-        "{pointer}{checkbox}{}{status:<status_width$}\x1b[0m{warning}{disabled}{update} {emphasized}{name}\x1b[0m",
+        "{emphasized}{pointer}\x1b[0m{checkbox}{}{status:<status_width$}\x1b[0m{warning}{disabled}{update} {emphasized}{name}\x1b[0m",
         theme.color(row.status.role())
     )?;
 
@@ -173,9 +173,10 @@ pub(super) fn draw(app: &App, out: &mut impl Write, width: u16, height: u16) -> 
             let accent = app.theme.color(Role::Accent);
             write!(out, "\x1b[{footer};1H{accent}{message}\x1b[0m")?;
         } else {
+            let primary = "[/] Browse";
             let mut legend = String::new();
             for hint in [
-                "[/] Browse",
+                primary,
                 "[?] Help",
                 "[Ctrl+P] Commands",
                 "[l] Detail",
@@ -209,7 +210,12 @@ pub(super) fn draw(app: &App, out: &mut impl Write, width: u16, height: u16) -> 
                     }
                 }
             }
-            write!(out, "\x1b[{footer};1H{legend}")?;
+            write!(out, "\x1b[{footer};1H")?;
+            if let Some(rest) = legend.strip_prefix(primary) {
+                write!(out, "\x1b[1m{primary}\x1b[0m{rest}")?;
+            } else {
+                write!(out, "{legend}")?;
+            }
         }
     }
     out.flush()
@@ -219,6 +225,19 @@ pub(super) fn draw(app: &App, out: &mut impl Write, width: u16, height: u16) -> 
 mod tests {
     use super::super::terminal_text::cell_width;
     use super::*;
+
+    #[test]
+    fn manage_visual_hierarchy_emphasizes_focus_and_browse() {
+        let app = App {
+            rows: super::super::rows(&[crate::Spec::parse("owner/plugin")], &[]),
+            ..App::default()
+        };
+        let mut output = Vec::new();
+        app.draw(&mut output, 40, 9).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("\x1b[1m> \x1b[0m"));
+        assert!(output.contains("\x1b[1m[/] Browse\x1b[0m"));
+    }
 
     #[test]
     fn managed_rows_stay_inside_their_columns() {

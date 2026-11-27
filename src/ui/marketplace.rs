@@ -82,7 +82,7 @@ fn search_line(out: &mut impl Write, browser: &Browser, columns: usize) -> io::R
     let query = query_tail(&browser.query, available - category.len());
     write!(
         out,
-        "{prefix}\x1b[1m{query}\x1b[0m\x1b[7m \x1b[0m\x1b[2m{category}\x1b[0m"
+        "\x1b[1m{prefix}\x1b[0m\x1b[1m{query}\x1b[0m\x1b[7m \x1b[0m\x1b[2m{category}\x1b[0m"
     )
 }
 
@@ -101,8 +101,9 @@ fn result_line(
     today: i64,
 ) -> io::Result<()> {
     let point = if focused { ">" } else { " " };
+    let emphasize = if focused { "\x1b[1m" } else { "" };
     if columns == 1 {
-        return write!(out, "{point}");
+        return write!(out, "{emphasize}{point}\x1b[0m");
     }
     let status_width = if columns >= 32 {
         16
@@ -126,8 +127,7 @@ fn result_line(
         available
     };
     let (name, cells) = clip(&entry.full_name, name_width);
-    let emphasize = if focused { "\x1b[1m" } else { "" };
-    write!(out, "{point} {emphasize}{name}\x1b[0m")?;
+    write!(out, "{emphasize}{point} {name}\x1b[0m")?;
     if status_width > 0 {
         let pad = name_width - cells + 2;
         let color = if status.is_empty() {
@@ -201,7 +201,8 @@ pub(super) fn draw(
         };
         write!(out, "\x1b[1m{title}\x1b[0m")?;
         if !note.is_empty() {
-            write!(out, "  {color}{note}\x1b[0m")?;
+            let dim = if failed || refreshing { "" } else { "\x1b[2m" };
+            write!(out, "  {dim}{color}{note}\x1b[0m")?;
         }
         write!(out, "\x1b[2;1H")?;
     }
@@ -260,9 +261,10 @@ pub(super) fn draw(
         let divider = footer_start_row(height);
         let footer = divider + 1;
         write!(out, "\x1b[{divider};1H\x1b[2m{}\x1b[0m", rule_line(width))?;
+        let primary = "[Enter] Add";
         let mut hint_line = String::new();
         for hint in [
-            "[Enter] Add",
+            primary,
             "[Esc] Back",
             "[Tab] Category",
             "[Ctrl+O] Repo",
@@ -278,12 +280,19 @@ pub(super) fn draw(
         if hint_line.is_empty() {
             hint_line = clip("[Esc] Back", columns).0;
         }
-        let (label, color) = if let Some(flash) = &app.flash {
-            (clip(flash, columns).0, app.theme.color(Role::Accent))
+        write!(out, "\x1b[{footer};1H")?;
+        if let Some(flash) = &app.flash {
+            let (label, _) = clip(flash, columns);
+            let accent = app.theme.color(Role::Accent);
+            write!(out, "{accent}{label}\x1b[0m")?;
+        } else if let Some(rest) = hint_line
+            .strip_prefix(primary)
+            .filter(|_| !results.is_empty())
+        {
+            write!(out, "\x1b[1m{primary}\x1b[0m{rest}")?;
         } else {
-            (hint_line, Color::Plain)
-        };
-        write!(out, "\x1b[{footer};1H{color}{label}\x1b[0m")?;
+            write!(out, "{hint_line}")?;
+        }
     }
     out.flush()
 }
@@ -313,6 +322,18 @@ mod tests {
         let mut output = Vec::new();
         draw(app, &mut output, width, height, refreshing).unwrap();
         String::from_utf8(output).unwrap()
+    }
+
+    #[test]
+    fn marketplace_visual_hierarchy_emphasizes_search_focus_and_add() {
+        let app = app();
+        let mut output = Vec::new();
+        app.draw(&mut output, 80, 24).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("\x1b[1mSearch \x1b[0m"));
+        assert!(output.contains("\x1b[1m> owner/worktree\x1b[0m"));
+        assert!(output.contains("\x1b[1m[Enter] Add\x1b[0m"));
+        assert!(output.contains("\x1b[2mcached 2h ago\x1b[0m"));
     }
 
     #[test]
