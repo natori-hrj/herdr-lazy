@@ -32,13 +32,17 @@ impl Body {
     }
 
     fn push_wrapped(&mut self, text: &str, width: usize) {
+        self.push_wrapped_color(text, width, Color::Plain);
+    }
+
+    fn push_wrapped_color(&mut self, text: &str, width: usize, color: Color) {
         let mut line = String::new();
         let mut columns = 0;
         for ch in text.chars() {
             let ch = if ch.is_control() { ' ' } else { ch };
             let cells = cell_width(ch);
             if columns + cells > width && !line.is_empty() {
-                self.push(std::mem::take(&mut line));
+                self.push_color(std::mem::take(&mut line), color);
                 columns = 0;
             }
             if cells > width {
@@ -50,7 +54,7 @@ impl Body {
             }
         }
         if !line.is_empty() {
-            self.push(line);
+            self.push_color(line, color);
         }
     }
 
@@ -68,13 +72,47 @@ fn body(app: &App, width: u16) -> Body {
         return body;
     };
 
+    let text_width = usize::from(width).saturating_sub(2).max(1);
+    let (status, role) = match (row.installed.is_some(), row.enabled) {
+        (false, _) => ("Not installed", Role::Warning),
+        (true, Some(true)) => ("Installed · enabled", Role::Success),
+        (true, Some(false)) => ("Installed · disabled", Role::Accent),
+        (true, None) => ("Installed", Role::Success),
+    };
+    body.push_color(status, app.theme.color(role));
+    if let Some(slug) = row.slug.as_deref() {
+        body.push_wrapped(&format!("Repository · {slug}"), text_width);
+    }
+    if let Some(commit) = row.commit.as_deref() {
+        body.push_wrapped(&format!("Resolved commit · {commit}"), text_width);
+    }
+    if let Some(reference) = row
+        .listed_as
+        .as_deref()
+        .and_then(|line| crate::Spec::parse(line).reference)
+    {
+        body.push_wrapped(&format!("Listed ref · {reference}"), text_width);
+    }
+    if let Some(warning) = row.herdr_warning {
+        body.push_wrapped_color(
+            &format!(
+                "Requires Herdr {} · running {}",
+                warning.required, warning.running
+            ),
+            text_width,
+            app.theme.color(Role::Warning),
+        );
+    }
+    body.push("");
+
     let Some(detail) = row.detail.as_ref() else {
-        body.push("This plugin is not installed.");
-        body.push("Esc returns to the list. Press i there to install.");
+        body.push_wrapped(
+            "Esc returns to the list. Press i there to install.",
+            text_width,
+        );
         return body;
     };
 
-    let text_width = usize::from(width).saturating_sub(2).max(1);
     if !detail.description.is_empty() {
         body.push_wrapped(&detail.description, text_width);
         body.push("");
@@ -366,6 +404,42 @@ mod tests {
         assert!(render(&app, 40, 10).contains("> Action · Command 10"));
         assert!(confirm_selection_visible(&mut app, 40, 10));
         assert!(!confirm_selection_visible(&mut app, 40, 3));
+    }
+
+    #[test]
+    fn detail_lists_only_available_local_metadata() {
+        let mut app = fixture();
+        let row = &mut app.rows[0];
+        row.slug = Some("example/plugin".into());
+        row.enabled = Some(false);
+        row.commit = Some("0123456789abcdef0123456789abcdef01234567".into());
+        row.listed_as = Some("example/plugin@stable".into());
+        row.herdr_warning = Some(super::super::HerdrVersionWarning {
+            required: crate::HerdrVersion::parse("0.10.0").unwrap(),
+            running: crate::HerdrVersion::parse("0.9.5").unwrap(),
+        });
+        let wide = render(&app, 120, 24);
+        for fact in [
+            "Installed · disabled",
+            "Repository · example/plugin",
+            "Resolved commit · 0123456789abcdef0123456789abcdef01234567",
+            "Listed ref · stable",
+            "Requires Herdr 0.10.0 · running 0.9.5",
+        ] {
+            assert!(wide.contains(fact), "missing {fact}");
+        }
+        let narrow = body(&app, 25);
+        let text: String = narrow.lines.into_iter().map(|line| line.text).collect();
+        assert!(text.contains("0123456789abcdef0123456789abcdef01234567"));
+
+        let spec = crate::Spec::parse("example/missing@v1");
+        app.rows = super::super::rows(&[spec], &[]);
+        let missing = render(&app, 80, 10);
+        assert!(missing.contains("Not installed"));
+        assert!(missing.contains("Repository · example/missing"));
+        assert!(missing.contains("Listed ref · v1"));
+        assert!(!missing.contains("Resolved commit"));
+        assert!(!missing.contains("Requires Herdr"));
     }
 
     #[test]
