@@ -9,7 +9,7 @@
 //! build script. The list is the place where intent is recorded, so that is where a discovery
 //! lands.
 
-use crate::registry::Entry;
+use crate::registry::{search_terms, Entry};
 
 /// State of the browser overlay.
 pub(crate) struct Browser {
@@ -52,9 +52,14 @@ impl Browser {
     }
 
     pub(crate) fn results(&self) -> Vec<&Entry> {
+        let terms = search_terms(&self.query);
+        if terms.is_empty() && self.category.is_none() {
+            return self.all.iter().collect();
+        }
+
         self.all
             .iter()
-            .filter(|e| e.matches(&self.query))
+            .filter(|e| e.matches_terms(&terms))
             .filter(|e| match self.category {
                 Some(c) => crate::category::classify(e) == c,
                 None => true,
@@ -184,6 +189,27 @@ mod tests {
     #[test]
     fn an_empty_query_lists_everything() {
         assert_eq!(browser().results().len(), 3);
+    }
+
+    #[test]
+    fn whitespace_only_queries_keep_category_filtering_and_entry_order() {
+        let mut b = browser();
+        b.query = " \t\u{2003}".into();
+        assert!(b.results().into_iter().eq(b.all.iter()));
+
+        b.category = Some("worktree");
+        assert_eq!(b.results(), vec![&b.all[1]]);
+    }
+
+    #[test]
+    fn a_query_matches_unicode_terms_across_fields() {
+        let mut b = browser();
+        b.all[1].description = "fzf picker for worktrees: ΟΣ".into();
+        b.query = "  GIT-WORKTREE\u{2003}WORKTRUNK\tΟΣ  ".into();
+        assert_eq!(b.results(), vec![&b.all[1]]);
+
+        b.query.push_str(" Rust");
+        assert!(b.results().is_empty(), "language is excluded from search");
     }
 
     #[test]
