@@ -50,6 +50,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub(crate) const MAX_LOCAL_INPUT_BYTES: u64 = 64 * 1024;
 
 fn open_local_regular_file(path: &Path, label: &str) -> io::Result<fs::File> {
+    let not_regular = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{label} {} is not a regular file", path.display()),
+        )
+    };
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -57,12 +63,20 @@ fn open_local_regular_file(path: &Path, label: &str) -> io::Result<fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NONBLOCK);
     }
-    let file = options.open(path)?;
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(open_error) => {
+            #[cfg(windows)]
+            if open_error.kind() == io::ErrorKind::PermissionDenied
+                && matches!(fs::metadata(path), Ok(metadata) if metadata.is_dir())
+            {
+                return Err(not_regular());
+            }
+            return Err(open_error);
+        }
+    };
     if !file.metadata()?.file_type().is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{label} {} is not a regular file", path.display()),
-        ));
+        return Err(not_regular());
     }
     Ok(file)
 }
@@ -4899,6 +4913,27 @@ command = "something.else"
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("not a regular file"));
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_text_reader_preserves_locked_file_open_error() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let path = scratch_lock("shared-locked-read");
+        fs::write(&path, "owner/repo@main\n").unwrap();
+        let blocker = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+
+        let plain_error = fs::File::open(&path).unwrap_err();
+        let reader_error = read_local_text(&path, "plugin list").unwrap_err();
+        assert_eq!(reader_error.raw_os_error(), plain_error.raw_os_error());
+
+        drop(blocker);
+        clean_scratch_lock(&path);
     }
 
     #[cfg(unix)]
