@@ -14,12 +14,18 @@
 
 use std::{
     io::{self, Write},
+    sync::mpsc::{self, Receiver, TryRecvError},
     time::Duration,
 };
 
+mod command_palette;
 mod managed_list;
 mod marketplace;
+mod plugin_detail;
 mod terminal_text;
+mod theme_picker;
+
+use command_palette::{ManageCommand, Palette, PaletteAction};
 
 use crate::theme::{Color, Role, Theme};
 
@@ -1165,11 +1171,15 @@ impl AdoptPicker {
     }
 }
 
+type MarketplaceResult = Result<(Vec<crate::registry::Entry>, String), String>;
+
 /// `Default` so tests can build one from just the rows they care about; this struct grows a
 /// field per view, and every fixture should not have to know about all of them.
 #[derive(Default)]
 struct App {
     theme: Theme,
+    palette: Option<Palette>,
+    theme_picker: Option<theme_picker::Picker>,
     rows: Vec<Row>,
     /// The point-in-time workspace in which Herdr opened this pane, when available.
     workspace_context: Option<crate::context::PluginContext>,
@@ -1188,6 +1198,7 @@ struct App {
     last_event: Option<crate::context::PluginEvent>,
     /// Present while the marketplace browser is open; the pane draws that instead of the list.
     browser: Option<crate::browse::Browser>,
+    marketplace_refresh: Option<Receiver<MarketplaceResult>>,
     /// Present while the extras picker is open, for the same reason.
     extras: Option<ExtrasPicker>,
     /// Present while the focused-agent recommendations are open.
@@ -1200,6 +1211,7 @@ struct App {
     detail_of: Option<usize>,
     /// Which action is highlighted in the details view.
     detail_cursor: usize,
+    detail_scroll: usize,
     /// Changes fetched for the currently open details, and which row they belong to. Keyed by
     /// row so reopening the same plugin does not re-hit the network, and a stale result for a
     /// different plugin never shows.
@@ -1264,6 +1276,8 @@ impl App {
         match installed_plugins() {
             Ok(installed) => App {
                 theme,
+                palette: None,
+                theme_picker: None,
                 rows: rows_with_herdr_version(&desired, &installed, &market, herdr_version),
                 workspace_context: workspace_context.clone(),
                 workspace_profile: workspace_profile.clone(),
@@ -1273,12 +1287,14 @@ impl App {
                 context_warning: context_warning.clone(),
                 last_event: last_event.clone(),
                 browser: None,
+                marketplace_refresh: None,
                 extras: None,
                 recommendations: None,
                 adopt: None,
                 help: None,
                 detail_of: None,
                 detail_cursor: 0,
+                detail_scroll: 0,
                 detail_changes: None,
                 log_view: None,
                 machine_view: None,
@@ -1291,6 +1307,8 @@ impl App {
             },
             Err(e) => App {
                 theme,
+                palette: None,
+                theme_picker: None,
                 rows: Vec::new(),
                 workspace_context,
                 workspace_profile,
@@ -1300,12 +1318,14 @@ impl App {
                 context_warning,
                 last_event,
                 browser: None,
+                marketplace_refresh: None,
                 extras: None,
                 recommendations: None,
                 adopt: None,
                 help: None,
                 detail_of: None,
                 detail_cursor: 0,
+                detail_scroll: 0,
                 detail_changes: None,
                 log_view: None,
                 machine_view: None,
@@ -1322,6 +1342,7 @@ impl App {
     fn refresh(&mut self) {
         let (cursor, flash) = (self.cursor, self.flash.take());
         let (browser, help) = (self.browser.take(), self.help);
+        let marketplace_refresh = self.marketplace_refresh.take();
         let profile_open = self.profile_open;
         let pending_profile = self.pending_profile;
         let extras = self.extras.take();
@@ -1331,6 +1352,7 @@ impl App {
         let logs = self.log_view.take();
         *self = App::load(self.theme);
         self.browser = browser;
+        self.marketplace_refresh = marketplace_refresh;
         self.profile_open = profile_open;
         self.pending_profile = pending_profile;
         self.extras = extras;
@@ -1771,6 +1793,7 @@ impl App {
         };
         self.detail_of = Some(self.cursor);
         self.detail_cursor = 0;
+        self.detail_scroll = 0;
         self.flash = None;
 
         // Fetch only for a plugin the offline marker already flagged. Opening the details of
@@ -2233,20 +2256,72 @@ impl App {
         Ok(())
     }
 
-    /// `/` — open the marketplace browser.
+    /// Open immediately from disk, refreshing in the background if needed.
     fn open_browser(&mut self, force_refresh: bool) {
-        match crate::registry::load(force_refresh) {
-            Ok((entries, note)) => {
-                let listed: Vec<String> = crate::desired_plugins()
-                    .iter()
-                    .map(|l| crate::Spec::parse(l).repo)
-                    .collect();
-                self.browser = Some(crate::browse::Browser::new(entries, note, listed));
-                self.flash = None;
+        self.flash = None;
+        if self.browser.is_none() {
+            let listed = crate::desired_plugins()
+                .iter()
+                .map(|line| crate::Spec::parse(line).repo)
+                .collect();
+            let (entries, note, fresh) = match crate::registry::browser_cache() {
+                Some(cache) => (cache.entries, cache.note, cache.fresh),
+                None => (Vec::new(), String::new(), false),
+            };
+            self.browser = Some(crate::browse::Browser::new(entries, note, listed));
+            if fresh && !force_refresh {
+                return;
             }
-            // Browsing is a convenience over someone else's undocumented endpoint; failing to
-            // reach it must not look like herdr-lazy is broken.
-            Err(e) => self.flash = Some(format!("marketplace unavailable — {}", e)),
+        }
+        self.start_marketplace_refresh(move || crate::registry::load(force_refresh));
+    }
+
+    fn start_marketplace_refresh(
+        &mut self,
+        load: impl FnOnce() -> MarketplaceResult + Send + 'static,
+    ) {
+        if self.marketplace_refresh.is_some() {
+            return;
+        }
+        let (send, receive) = mpsc::channel();
+        match std::thread::Builder::new()
+            .name("marketplace".to_string())
+            .spawn(move || {
+                let _ = send.send(load());
+            }) {
+            Ok(_) => self.marketplace_refresh = Some(receive),
+            Err(error) => self.apply_marketplace_result(Err(error.to_string())),
+        }
+    }
+
+    fn poll_marketplace(&mut self) -> bool {
+        let Some(receive) = self.marketplace_refresh.as_ref() else {
+            return false;
+        };
+        let result = match receive.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => Err("refresh worker stopped".to_string()),
+        };
+        self.marketplace_refresh = None;
+        // Esc cancels delivery to the browser. Keep one worker slot until completion so
+        // reopening or holding Ctrl+R cannot fan out more requests.
+        if self.browser.is_none() {
+            return false;
+        }
+        self.apply_marketplace_result(result);
+        true
+    }
+
+    fn apply_marketplace_result(&mut self, result: MarketplaceResult) {
+        let Some(browser) = self.browser.as_mut() else {
+            return;
+        };
+        match result {
+            Ok((entries, note)) => browser.replace_entries(entries, note),
+            Err(error) => {
+                browser.source_note = format!("refresh failed: {}", sanitize_log_output(&error));
+            }
         }
     }
 
@@ -2562,7 +2637,32 @@ impl App {
         self.refresh();
     }
 
+    fn run_manage_command(&mut self, command: ManageCommand) {
+        match command {
+            ManageCommand::Browse => self.open_browser(false),
+            ManageCommand::Detail => self.open_detail(),
+            ManageCommand::Logs => self.open_logs(),
+            ManageCommand::Extras => self.open_extras(),
+            ManageCommand::Recommendations => self.open_recommendations(),
+            ManageCommand::Profile => self.open_profile(),
+            ManageCommand::Machines => self.open_machine_view(),
+            ManageCommand::SharedBundle => self.open_adopt(),
+            ManageCommand::Starter => self.flash = Some(crate::open_starter_pane()),
+            ManageCommand::Refresh => {
+                self.refresh();
+                self.flash = Some("re-read your list and what is installed".to_string());
+            }
+            ManageCommand::Help => self.help = Some(0),
+        }
+    }
+
     fn draw(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        if let Some(palette) = &self.palette {
+            return palette.draw(out, width, height, self.theme);
+        }
+        if let Some(picker) = &self.theme_picker {
+            return picker.draw(out, width, height);
+        }
         if let Some(offset) = self.help {
             return draw_help(out, width, height, offset, &self.help_context());
         }
@@ -2579,7 +2679,7 @@ impl App {
             return self.draw_logs(out, width, height);
         }
         if self.detail_of.is_some() {
-            return self.draw_detail(out, width, height);
+            return plugin_detail::draw(self, out, width, height);
         }
         if self.browser.is_some() {
             return self.draw_browser(out, width, height);
@@ -2931,192 +3031,8 @@ impl App {
         out.flush()
     }
 
-    /// What this plugin does, and how to actually use it.
-    ///
-    /// A distro that installs seven plugins in one go leaves the user holding seven things
-    /// they did not choose individually and cannot obviously operate. herdr already knows the
-    /// answer — every manifest declares its actions, panes and events — so the pane can just
-    /// show it, and run the actions too.
-    fn draw_detail(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
-        let warning = self.theme.color(Role::Warning);
-        let accent = self.theme.color(Role::Accent);
-        let rule = rule_line(width);
-        let idx = self.detail_of.expect("checked by caller");
-        let Some(row) = self.rows.get(idx) else {
-            return Ok(());
-        };
-        write!(out, "\x1b[H\x1b[2J")?;
-        writeln!(out, "\x1b[1m {}\x1b[0m\r", row.label)?;
-        writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
-
-        let Some(d) = row.detail.as_ref() else {
-            writeln!(
-                out,
-                " \x1b[2mnot installed yet — press i to install, then look again\x1b[0m\r"
-            )?;
-            let footer = self
-                .flash
-                .as_deref()
-                .map(|message| format!("{accent}{}\x1b[0m", message))
-                .unwrap_or_else(|| "\x1b[2many key goes back\x1b[0m".to_string());
-            write!(
-                out,
-                "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r\n",
-                footer_start_row(height),
-                rule,
-                footer
-            )?;
-            return out.flush();
-        };
-
-        let items = Self::bindable(d);
-
-        if !d.description.is_empty() {
-            for line in wrap(&d.description, (width as usize).saturating_sub(3).max(20)) {
-                writeln!(out, " {}\r", line)?;
-            }
-            writeln!(out, "\r")?;
-        }
-
-        if let Some(maintenance) = row.maintenance.as_ref() {
-            if let Some(age) = maintenance.age() {
-                let quiet = if maintenance.is_quiet() {
-                    " · quiet (fact only)"
-                } else {
-                    ""
-                };
-                writeln!(out, " maintenance: last pushed {} ago{}\r", age, quiet)?;
-            }
-        }
-
-        if items.is_empty() && d.events.is_empty() {
-            writeln!(
-                out,
-                " \x1b[2mthis plugin declares no actions, panes or events — it may work \
-                 entirely on its own\x1b[0m\r"
-            )?;
-        }
-
-        // Actions and panes in one list, because `enter` and `b` treat them the same way and
-        // the cursor indexes into it. Two separate sections would mean two things claiming to
-        // be "the highlighted one".
-        if !items.is_empty() {
-            writeln!(
-                out,
-                " \x1b[1mthings you can run\x1b[0m  \x1b[2m(enter runs it · b binds it to a key)\x1b[0m\r"
-            )?;
-            for (i, (target, label)) in items.iter().enumerate() {
-                let sel = if i == self.detail_cursor {
-                    "\x1b[7m>"
-                } else {
-                    " "
-                };
-                let kind = match target {
-                    crate::BindTarget::Action(_) => "action",
-                    crate::BindTarget::Pane(_) => "pane",
-                };
-                writeln!(
-                    out,
-                    "{}\x1b[0m  {:<44} \x1b[2m{:<7}{}\x1b[0m\r",
-                    sel,
-                    truncate(label, 44),
-                    kind,
-                    target.id()
-                )?;
-            }
-            writeln!(out, "\r")?;
-        }
-
-        if !d.events.is_empty() {
-            writeln!(
-                out,
-                " \x1b[1mruns by itself on\x1b[0m  \x1b[2m{}\x1b[0m\r",
-                d.events.join(", ")
-            )?;
-            writeln!(out, "\r")?;
-        }
-
-        // What changed since install — the point of the whole feature. Only present when this
-        // plugin was flagged and the fetch happened on open; a plugin with no marker shows
-        // nothing here, which is correct.
-        if let Some((row_idx, changes)) = &self.detail_changes {
-            if *row_idx == idx {
-                use crate::github::Changes;
-                match changes {
-                    Changes::Commits(cs) if !cs.is_empty() => {
-                        writeln!(
-                            out,
-                            " \x1b[1m{warning}{} new commit(s) since you installed\x1b[0m  \
-                             \x1b[2m(press u to update)\x1b[0m\r",
-                            cs.len()
-                        )?;
-                        for subject in cs.iter().take(8) {
-                            writeln!(
-                                out,
-                                "   \x1b[2m·\x1b[0m {}\r",
-                                truncate(subject, width.saturating_sub(6) as usize)
-                            )?;
-                        }
-                        if cs.len() > 8 {
-                            writeln!(out, "   \x1b[2m… and {} more\x1b[0m\r", cs.len() - 8)?;
-                        }
-                        writeln!(out, "\r")?;
-                    }
-                    Changes::Commits(_) => {} // marker was stale; nothing actually newer
-                    Changes::ManyPlus(n) => {
-                        writeln!(
-                            out,
-                            " {warning}{}+ commits behind\x1b[0m \x1b[2m— more than one page; \
-                             press u to catch up\x1b[0m\r\r",
-                            n
-                        )?;
-                    }
-                    Changes::Unknown(why) => {
-                        writeln!(
-                            out,
-                            " \x1b[2mcould not check for changes: {}\x1b[0m\r\r",
-                            why
-                        )?;
-                    }
-                }
-            }
-        }
-
-        if let Some((target, _)) = items.get(self.detail_cursor) {
-            // Show the lines that `b` would actually write, not a fixed example — panes and
-            // actions produce different `type` values, and a wrong example here would send
-            // someone to hand-write a binding herdr ignores.
-            let (kind, command) = crate::bind_toml_fields(target, &d.plugin_id);
-            writeln!(
-                out,
-                " \x1b[2mb binds the highlighted one:  type = \"{}\"  command = \"{}\"\x1b[0m\r",
-                kind, command
-            )?;
-        }
-
-        let footer = if self.awaiting_bind {
-            format!("{warning}press a letter to bind this to prefix+shift+<letter>, or esc\x1b[0m")
-        } else {
-            match &self.flash {
-                Some(m) => format!("{accent}{}\x1b[0m", m),
-                None => "\x1b[1m[enter]\x1b[0m run  \x1b[1m[b]\x1b[0m bind to a key  \
-                         \x1b[1m[L]\x1b[0m logs  \x1b[1m[j/k]\x1b[0m move  \
-                         \x1b[1m[esc]\x1b[0m back"
-                    .to_string(),
-            }
-        };
-        write!(
-            out,
-            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r\n",
-            footer_start_row(height),
-            rule,
-            footer
-        )?;
-        out.flush()
-    }
-
     fn draw_browser(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
-        marketplace::draw(self, out, width, height, false)
+        marketplace::draw(self, out, width, height, self.marketplace_refresh.is_some())
     }
 
     fn draw_extras(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
@@ -3679,6 +3595,7 @@ fn help_lines(columns: usize, context: &str) -> Vec<(bool, String)> {
         &[
             ("space", "tick or untick this row (click does the same)"),
             ("esc", "clear the selection"),
+            ("ctrl+p", "find Manage commands by name"),
             (
                 "",
                 "with nothing ticked, every action below uses the cursor row",
@@ -3762,6 +3679,7 @@ fn help_lines(columns: usize, context: &str) -> Vec<(bool, String)> {
                 "toggle auto-sync: install missing plugins when herdr starts",
             ),
             ("ctrl+r", "re-read the list and what is installed"),
+            ("T", "preview and save a terminal theme"),
             ("q", "quit from the plugin list"),
         ],
     );
@@ -3939,17 +3857,15 @@ pub(crate) fn run() -> io::Result<()> {
     // level: with capture on, the terminal stops doing its own selection, so anyone who wants
     // to copy text with the mouse would be blocked. SGR mode (1006) is enabled alongside 1000
     // so clicks past column 95 still report correctly.
-    write!(out, "\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h")?;
-    out.flush()?;
+    let result = write!(out, "\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h")
+        .and_then(|()| out.flush())
+        .and_then(|()| event_loop(&mut out));
 
-    let result = event_loop(&mut out);
-
-    // Restore unconditionally, even if the loop failed: leaving a pane in raw mode with no
-    // cursor would wedge the terminal.
-    write!(out, "\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l")?;
-    out.flush()?;
-    terminal::disable_raw_mode()?;
-    result
+    // Restore both the screen and raw mode even if writing to the terminal fails.
+    let restore_screen =
+        write!(out, "\x1b[0m\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l").and_then(|()| out.flush());
+    let restore_mode = terminal::disable_raw_mode();
+    result.and(restore_screen).and(restore_mode)
 }
 
 fn event_loop(out: &mut impl Write) -> io::Result<()> {
@@ -3963,6 +3879,7 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
     let mut startup_redraws = STARTUP_REDRAWS;
 
     loop {
+        redraw |= app.poll_marketplace();
         let (width, height) = terminal::size().unwrap_or((80, 24));
         let size = (width, height);
         if redraw || last_size != Some(size) || startup_redraws > 0 {
@@ -3972,7 +3889,14 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             startup_redraws = startup_redraws.saturating_sub(1);
         }
 
-        let key = match event::poll(Duration::from_millis(100))? {
+        // Terminal input wakes the poll immediately. Only a visible refresh result
+        // needs a shorter timeout so its completion reaches the screen sooner.
+        let poll_timeout = if app.browser.is_some() && app.marketplace_refresh.is_some() {
+            Duration::from_millis(25)
+        } else {
+            Duration::from_millis(100)
+        };
+        let key = match event::poll(poll_timeout)? {
             false => continue,
             true => match event::read()? {
                 Event::Key(k) if k.kind == KeyEventKind::Press => {
@@ -3981,7 +3905,19 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                 }
                 Event::Mouse(m) => {
                     use crossterm::event::MouseEventKind;
-                    if let Some(offset) = app.help {
+                    if let Some(palette) = app.palette.as_mut() {
+                        match m.kind {
+                            MouseEventKind::ScrollDown => palette.move_cursor(true),
+                            MouseEventKind::ScrollUp => palette.move_cursor(false),
+                            _ => {}
+                        }
+                    } else if let Some(picker) = &mut app.theme_picker {
+                        match m.kind {
+                            MouseEventKind::ScrollDown => picker.move_to(true),
+                            MouseEventKind::ScrollUp => picker.move_to(false),
+                            _ => {}
+                        }
+                    } else if let Some(offset) = app.help {
                         let key = match m.kind {
                             MouseEventKind::ScrollUp => Some(KeyCode::Up),
                             MouseEventKind::ScrollDown => Some(KeyCode::Down),
@@ -4003,6 +3939,19 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                             MouseEventKind::ScrollUp => app.scroll_logs(-1, visible, width),
                             _ => {}
                         }
+                    } else if app.detail_of.is_some() {
+                        use crossterm::event::MouseEventKind;
+                        if !app.awaiting_bind && app.pending_bind.is_none() {
+                            match m.kind {
+                                MouseEventKind::ScrollDown => {
+                                    plugin_detail::scroll_rows(&mut app, width, height, 1);
+                                }
+                                MouseEventKind::ScrollUp => {
+                                    plugin_detail::scroll_rows(&mut app, width, height, -1);
+                                }
+                                _ => {}
+                            }
+                        }
                     } else {
                         app.handle_mouse(m, height)?;
                     }
@@ -4017,6 +3966,32 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             },
         };
 
+        if let Some(picker) = &mut app.theme_picker {
+            if classify(&key) == Action::Quit {
+                return Ok(());
+            }
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
+                match picker.key(key.code, width, height) {
+                    theme_picker::Action::Continue => {}
+                    theme_picker::Action::Cancel => app.theme_picker = None,
+                    theme_picker::Action::Apply { value, theme } => {
+                        match crate::theme::save(&value) {
+                            Ok(()) => {
+                                app.theme = theme;
+                                app.theme_picker = None;
+                                app.flash = Some("Theme saved".to_string());
+                            }
+                            Err(error) => picker.save_error(error),
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
         // Any keypress retires the previous result line.
         app.flash = None;
 
@@ -4026,6 +4001,18 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
         // pty sends Ctrl+D at end of input — which silently ran "drop from list" on whatever
         // the cursor happened to be on. Destructive actions must not be reachable by a
         // modifier chord the user did not intend.
+        if let Some(palette) = app.palette.as_mut() {
+            match palette.handle_key(key, width, height) {
+                PaletteAction::Continue => {}
+                PaletteAction::Close => app.palette = None,
+                PaletteAction::Quit => return Ok(()),
+                PaletteAction::Run(command) => {
+                    app.palette = None;
+                    app.run_manage_command(command);
+                }
+            }
+            continue;
+        }
         if let Some(offset) = app.help {
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                 return Ok(());
@@ -4210,7 +4197,11 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             // later arm would never see it.
             if key.modifiers.contains(KeyModifiers::CONTROL) {
                 match key.code {
-                    KeyCode::Char('j') | KeyCode::Char('m') => app.run_detail_action(),
+                    KeyCode::Char('j') | KeyCode::Char('m') if !app.awaiting_bind => {
+                        if plugin_detail::confirm_selection_visible(&mut app, width, height) {
+                            app.run_detail_action();
+                        }
+                    }
                     KeyCode::Char('c') => return Ok(()),
                     _ => {}
                 }
@@ -4220,7 +4211,11 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             if app.awaiting_bind {
                 app.awaiting_bind = false;
                 match key.code {
-                    KeyCode::Char(c) if c.is_ascii_alphabetic() => app.bind_selected(c),
+                    KeyCode::Char(c) if c.is_ascii_alphabetic() => {
+                        if plugin_detail::confirm_selection_visible(&mut app, width, height) {
+                            app.bind_selected(c);
+                        }
+                    }
                     KeyCode::Esc => app.flash = Some("not bound".to_string()),
                     _ => app.flash = Some("that is not a letter — nothing bound".to_string()),
                 }
@@ -4229,15 +4224,7 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
 
             match key.code {
                 KeyCode::Char('b') => {
-                    if app
-                        .rows
-                        .get(idx)
-                        .and_then(|r| r.detail.as_ref())
-                        .map(|d| App::bindable(d).is_empty())
-                        .unwrap_or(true)
-                    {
-                        app.flash = Some("no actions to bind".to_string());
-                    } else {
+                    if plugin_detail::confirm_selection_visible(&mut app, width, height) {
                         app.awaiting_bind = true;
                         app.flash = None;
                     }
@@ -4249,12 +4236,20 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                 KeyCode::Char('j') | KeyCode::Down => {
                     if app.detail_cursor + 1 < n {
                         app.detail_cursor += 1;
+                        plugin_detail::reveal_selection(&mut app, width, height);
                     }
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    app.detail_cursor = app.detail_cursor.saturating_sub(1)
+                    app.detail_cursor = app.detail_cursor.saturating_sub(1);
+                    plugin_detail::reveal_selection(&mut app, width, height);
                 }
-                KeyCode::Enter => app.run_detail_action(),
+                KeyCode::PageDown => plugin_detail::scroll_page(&mut app, width, height, true),
+                KeyCode::PageUp => plugin_detail::scroll_page(&mut app, width, height, false),
+                KeyCode::Enter => {
+                    if plugin_detail::confirm_selection_visible(&mut app, width, height) {
+                        app.run_detail_action();
+                    }
+                }
                 KeyCode::Char('L') => app.open_logs_for(idx),
                 _ => {}
             }
@@ -4466,11 +4461,13 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             continue;
         }
 
-        // Ctrl+R re-reads state in both views: the list here, the marketplace index in the
-        // browser. Plain `r` is restore, following lazy.nvim.
-        if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            app.refresh();
-            app.flash = Some("re-read your list and what is installed".to_string());
+        if command_palette::is_open_key(key) {
+            app.palette = Some(Palette::new(&app));
+            continue;
+        }
+
+        if let Some(command) = ManageCommand::for_key(key) {
+            app.run_manage_command(command);
             continue;
         }
 
@@ -4512,7 +4509,6 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             // is the wrong thing to inherit. See the `S` arm below.
             // Space / Enter tick the row; every bulk action then applies to what is ticked.
             KeyCode::Char(' ') | KeyCode::Enter => app.toggle_pick(),
-            KeyCode::Char('l') | KeyCode::Right => app.open_detail(),
             KeyCode::Char('i') => app.install_targets()?,
             KeyCode::Char('I') => {
                 suspended(|| {
@@ -4551,16 +4547,12 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                 })
             }
             KeyCode::Char('d') => app.drop_selected(),
-            KeyCode::Char('/') => app.open_browser(false),
-            KeyCode::Char('e') => app.open_extras(),
-            KeyCode::Char('f') => app.open_adopt(),
-            KeyCode::Char('p') => app.open_profile(),
-            KeyCode::Char('m') => app.open_machine_view(),
-            KeyCode::Char('w') => {
-                app.flash = Some(crate::open_starter_pane());
+            KeyCode::Char('T') => {
+                app.theme_picker = Some(theme_picker::Picker::new(
+                    app.theme,
+                    std::env::var_os(crate::theme::ENV_KEY).is_some(),
+                ));
             }
-            KeyCode::Char('n') => app.open_recommendations(),
-            KeyCode::Char('?') => app.help = Some(0),
 
             // Keys lazy.nvim has that this does not. Rather than doing nothing — which reads
             // as "the pane is broken" to someone whose fingers know lazy — say where the
@@ -4575,7 +4567,6 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             KeyCode::Char('C') | KeyCode::Char('c') => {
                 app.flash = Some("no check yet — [U] updates and reports what moved".to_string())
             }
-            KeyCode::Char('L') => app.open_logs(),
             _ => {}
         }
     }
@@ -4584,6 +4575,95 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn marketplace_entry(name: &str) -> crate::registry::Entry {
+        crate::registry::Entry {
+            full_name: name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn marketplace_completion_keeps_query_and_selected_plugin() {
+        let (send, receive) = mpsc::channel();
+        let mut app = App {
+            browser: Some(crate::browse::Browser::new(
+                vec![
+                    marketplace_entry("owner/worktree-one"),
+                    marketplace_entry("owner/worktree-two"),
+                ],
+                "cached".to_string(),
+                Vec::new(),
+            )),
+            marketplace_refresh: Some(receive),
+            ..Default::default()
+        };
+        let browser = app.browser.as_mut().unwrap();
+        browser.query = "worktree".to_string();
+        browser.category = Some("worktree");
+        browser.move_down();
+
+        assert!(!app.poll_marketplace());
+        send.send(Ok((
+            vec![
+                marketplace_entry("owner/worktree-two"),
+                marketplace_entry("owner/note"),
+            ],
+            "just refreshed".to_string(),
+        )))
+        .unwrap();
+        assert!(app.poll_marketplace());
+        let browser = app.browser.as_ref().unwrap();
+        assert_eq!(browser.query, "worktree");
+        assert_eq!(browser.category, Some("worktree"));
+        assert_eq!(browser.selected().unwrap().full_name, "owner/worktree-two");
+        assert_eq!(browser.source_note, "just refreshed");
+        assert!(!app.poll_marketplace());
+    }
+
+    #[test]
+    fn marketplace_ignores_duplicate_requests_and_completion_after_close() {
+        let (send, receive) = mpsc::channel();
+        let mut app = App {
+            marketplace_refresh: Some(receive),
+            ..Default::default()
+        };
+        app.start_marketplace_refresh(|| unreachable!("another request is already running"));
+        send.send(Ok((Vec::new(), "just refreshed".to_string())))
+            .unwrap();
+
+        assert!(!app.poll_marketplace());
+        assert!(app.browser.is_none());
+        assert!(app.marketplace_refresh.is_none());
+    }
+
+    #[test]
+    fn marketplace_distinguishes_loading_and_refresh_failure_from_no_match() {
+        let (send, receive) = mpsc::channel();
+        let mut app = App {
+            browser: Some(crate::browse::Browser::new(
+                Vec::new(),
+                String::new(),
+                Vec::new(),
+            )),
+            marketplace_refresh: Some(receive),
+            ..Default::default()
+        };
+        let mut loading = Vec::new();
+        app.draw_browser(&mut loading, 80, 24).unwrap();
+        assert!(String::from_utf8(loading)
+            .unwrap()
+            .contains("Loading marketplace"));
+
+        send.send(Err("offline".to_string())).unwrap();
+        assert!(app.poll_marketplace());
+        let mut failed = Vec::new();
+        app.draw_browser(&mut failed, 80, 24).unwrap();
+        let failed = String::from_utf8(failed).unwrap();
+        assert!(failed.contains("refresh failed: offline"));
+        assert!(failed.contains("Ctrl+R retries"));
+        assert!(!failed.contains("No matches"));
+    }
 
     #[test]
     fn footer_leaves_the_host_owned_terminal_row_visible() {

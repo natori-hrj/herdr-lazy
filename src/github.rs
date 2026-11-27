@@ -10,7 +10,7 @@
 //! when the trigger is a human opening one plugin's details, and hopeless for anything that
 //! tried to check everything at once — so nothing does.
 
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// What changed since install, for the details view.
 #[derive(Debug, Clone, PartialEq)]
@@ -24,6 +24,7 @@ pub(crate) enum Changes {
 }
 
 const PAGE: usize = 30;
+const MAX_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Commit subjects on `owner/repo`'s default branch that are newer than `installed_commit`.
 pub(crate) fn changes_since(owner_repo: &str, installed_commit: &str) -> Changes {
@@ -118,11 +119,24 @@ pub(crate) fn repo_exists(owner_repo: &str) -> Option<bool> {
 /// marketplace fetch do.
 fn fetch(url: &str) -> Option<String> {
     let try_one = |prog: &str, args: &[&str]| -> Option<String> {
-        let out = Command::new(prog).args(args).output().ok()?;
-        if !out.status.success() {
+        let mut child = Command::new(prog)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let body = match crate::read_limited(child.stdout.take()?, MAX_RESPONSE_BYTES) {
+            Ok(Some(body)) => body,
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        };
+        if !child.wait().ok()?.success() {
             return None;
         }
-        let body = String::from_utf8_lossy(&out.stdout).to_string();
+        let body = String::from_utf8_lossy(&body).to_string();
         (!body.trim().is_empty()).then_some(body)
     };
     // A User-Agent is required by the GitHub API, or it answers 403.
