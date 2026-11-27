@@ -6,18 +6,23 @@
 //!
 //! **This URL is not a documented API.** It was found by reading what the marketplace page
 //! fetches, and it can change or disappear without notice. Everything here therefore fails
-//! soft: if the index cannot be fetched or parsed, browsing is unavailable and every other
+//! soft: if a refresh fails, browsing can continue with a valid cache and every other
 //! part of herdr-lazy carries on working. It is a convenience layered on top, never a
 //! dependency of the manager.
 
 use std::fs;
 use std::io;
-use std::path::PathBuf;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::json;
 
 const INDEX_URL: &str = "https://assets.herdr.dev/plugins/index.json";
+// The public index already approaches 2 MiB and grows as new repositories are listed.
+const MAX_INDEX_BYTES: u64 = 8 * 1024 * 1024;
 
 /// How long a cached copy is considered good.
 ///
@@ -219,39 +224,75 @@ fn cache_path() -> PathBuf {
     base.join("herdr-lazy").join("marketplace.json")
 }
 
-fn cache_age_seconds() -> Option<u64> {
-    let meta = fs::metadata(cache_path()).ok()?;
+fn cache_age_seconds(path: &Path) -> Option<u64> {
+    let meta = fs::metadata(path).ok()?;
     let modified = meta.modified().ok()?;
     modified.elapsed().ok().map(|d| d.as_secs())
+}
+
+/// Read stdout and wait for a successful exit before the shared download deadline.
+fn download_output(prog: &str, args: &[&str], deadline: Instant) -> Option<Vec<u8>> {
+    if Instant::now() >= deadline {
+        return None;
+    }
+    let mut child = Command::new(prog)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let (send, receive) = mpsc::channel();
+    let reader = child.stdout.take().map(|stdout| {
+        thread::Builder::new().spawn(move || {
+            let body = crate::read_limited(stdout, MAX_INDEX_BYTES);
+            let _ = send.send(body);
+        })
+    });
+    if matches!(reader, Some(Ok(_))) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if let Ok(Ok(Some(body))) = receive.recv_timeout(remaining) {
+            while Instant::now() < deadline {
+                match child.try_wait() {
+                    Ok(Some(status)) => return status.success().then_some(body),
+                    Ok(None) => thread::sleep(
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(Duration::from_millis(10)),
+                    ),
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    None
 }
 
 /// Download the index. Shells out, because std has no TLS — the same reasoning that has the
 /// install script use curl.
 fn download() -> Result<String, String> {
+    let deadline = Instant::now() + Duration::from_secs(20);
     let attempt = |prog: &str, args: &[&str]| -> Option<String> {
-        let out = Command::new(prog).args(args).output().ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let body = String::from_utf8_lossy(&out.stdout).to_string();
-        if body.trim().is_empty() {
-            None
-        } else {
-            Some(body)
-        }
+        let body = download_output(prog, args, deadline)?;
+        let body = String::from_utf8_lossy(&body).to_string();
+        (!body.trim().is_empty()).then_some(body)
     };
 
-    attempt(
-        "curl",
-        &["-fsL", "--max-time", "20", "--retry", "1", INDEX_URL],
-    )
-    .or_else(|| attempt("wget", &["-q", "-O", "-", "--timeout=20", INDEX_URL]))
-    .ok_or_else(|| {
-        format!(
-            "could not fetch {} (curl/wget unavailable or offline)",
-            INDEX_URL
-        )
-    })
+    attempt("curl", &["-fsL", "--max-time", "20", INDEX_URL])
+        .or_else(|| {
+            attempt(
+                "wget",
+                &["-q", "-O", "-", "--timeout=20", "--tries=1", INDEX_URL],
+            )
+        })
+        .ok_or_else(|| {
+            format!(
+                "could not fetch {} (curl/wget unavailable or offline)",
+                INDEX_URL
+            )
+        })
 }
 
 /// Parse the index document into entries.
@@ -259,8 +300,8 @@ fn download() -> Result<String, String> {
 /// Tolerant by design: a missing optional field yields an empty value rather than discarding
 /// the entry, because the shape here belongs to someone else and may gain or lose fields.
 pub(crate) fn parse_index(body: &str) -> Result<Vec<Entry>, String> {
-    let v =
-        json::parse(body.trim()).map_err(|e| format!("marketplace index is not JSON: {}", e))?;
+    let v = json::parse(body.trim())
+        .map_err(|e| format!("marketplace index is not JSON: {}", clean_external_text(&e)))?;
     let plugins = v
         .get("plugins")
         .and_then(|p| p.as_array())
@@ -311,34 +352,60 @@ pub(crate) fn parse_index(body: &str) -> Result<Vec<Entry>, String> {
 /// Returns the entries and a human note about where they came from, so the UI can be honest
 /// about showing data that may be hours old.
 pub(crate) fn load(force: bool) -> Result<(Vec<Entry>, String), String> {
-    let age = cache_age_seconds();
+    load_with(&cache_path(), force, download)
+}
+
+fn load_with(
+    path: &Path,
+    force: bool,
+    download_index: impl FnOnce() -> Result<String, String>,
+) -> Result<(Vec<Entry>, String), String> {
+    let age = cache_age_seconds(path);
     let fresh_enough = !force && age.map(|a| a < CACHE_SECONDS).unwrap_or(false);
 
+    let read_cache = || {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|b| parse_index(&b).ok())
+    };
     if fresh_enough {
-        if let Ok(body) = fs::read_to_string(cache_path()) {
-            if let Ok(entries) = parse_index(&body) {
-                return Ok((entries, describe_age(age)));
-            }
+        if let Some(entries) = read_cache() {
+            return Ok((entries, describe_age(age)));
         }
     }
 
-    match download() {
-        Ok(body) => {
-            let entries = parse_index(&body)?;
+    match download_index().and_then(|body| parse_index(&body).map(|entries| (body, entries))) {
+        Ok((body, entries)) => {
             // Cache only what parsed, so a corrupt download cannot poison later runs.
-            let _ = write_cache(&body);
+            let _ = write_cache(path, &body);
             Ok((entries, "just refreshed".to_string()))
         }
-        Err(e) => {
-            // Offline with a stale cache is far better than offline with nothing.
-            if let Ok(body) = fs::read_to_string(cache_path()) {
-                if let Ok(entries) = parse_index(&body) {
-                    return Ok((entries, format!("{} (offline: {})", describe_age(age), e)));
-                }
-            }
-            Err(e)
-        }
+        Err(e) => match read_cache() {
+            Some(entries) => Ok((
+                entries,
+                format!("{} (refresh failed: {})", describe_cached_age(age), e),
+            )),
+            None => Err(e),
+        },
     }
+}
+
+pub(crate) struct BrowserCache {
+    pub(crate) entries: Vec<Entry>,
+    pub(crate) note: String,
+    pub(crate) fresh: bool,
+}
+
+pub(crate) fn browser_cache() -> Option<BrowserCache> {
+    let path = cache_path();
+    let age = cache_age_seconds(&path);
+    let body = fs::read_to_string(path).ok()?;
+    let entries = parse_index(&body).ok()?;
+    Some(BrowserCache {
+        entries,
+        note: describe_age(age),
+        fresh: age.is_some_and(|seconds| seconds < CACHE_SECONDS),
+    })
 }
 
 /// Entries from the cache, or nothing. Never fetches.
@@ -352,18 +419,24 @@ pub(crate) fn cached_entries() -> Vec<Entry> {
         .unwrap_or_default()
 }
 
-fn write_cache(body: &str) -> io::Result<()> {
-    let p = cache_path();
+fn write_cache(p: &Path, body: &str) -> io::Result<()> {
     if let Some(parent) = p.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(p, body)
+    crate::write_bytes_atomically(p, body.as_bytes())
 }
 
 fn describe_age(age: Option<u64>) -> String {
+    if age.is_some_and(|s| s < 90) {
+        return "just refreshed".to_string();
+    }
+    describe_cached_age(age)
+}
+
+fn describe_cached_age(age: Option<u64>) -> String {
     match age {
         None => "cached".to_string(),
-        Some(s) if s < 90 => "just refreshed".to_string(),
+        Some(s) if s < 60 => "cached less than 1m ago".to_string(),
         Some(s) if s < 3600 => format!("cached {}m ago", s / 60),
         Some(s) => format!("cached {}h ago", s / 3600),
     }
@@ -385,6 +458,89 @@ mod tests {
          "description":"Interactive fzf picker for Worktrunk","url":"https://github.com/devashish2203/herdr-worktrunk",
          "stars":41,"language":"Shell","topics":["herdr-plugin","git-worktree"]}
       ]}"#;
+
+    fn cache_fixture(name: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-lazy-marketplace-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn download_deadline_bounds_pipe_read_and_child_exit() {
+        for command in ["exec sleep 3", "exec 1>&-; exec sleep 3"] {
+            let start = Instant::now();
+            let deadline = start + Duration::from_millis(50);
+            assert!(download_output("sh", &["-c", command], deadline).is_none());
+            assert!(start.elapsed() < Duration::from_secs(2));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn download_output_returns_bytes_from_successful_command() {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        assert_eq!(
+            download_output("sh", &["-c", "printf index"], deadline).as_deref(),
+            Some(b"index".as_slice())
+        );
+    }
+
+    #[test]
+    fn malformed_refresh_preserves_valid_cache() {
+        let dir = cache_fixture("fallback");
+        let path = dir.join("index.json");
+        fs::write(&path, INDEX).unwrap();
+        let result = load_with(&path, true, || Ok("{\"plugins\"\u{1b}:[]}".to_string()));
+        let persisted = fs::read_to_string(&path);
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(dir).unwrap();
+
+        let (entries, note) = result.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(note.starts_with("cached"));
+        assert!(note.contains("refresh failed: marketplace index is not JSON"));
+        assert!(!note.chars().any(char::is_control));
+        assert_eq!(persisted.unwrap(), INDEX);
+    }
+
+    #[test]
+    fn malformed_refresh_without_usable_cache_returns_original_error() {
+        let dir = cache_fixture("corrupt");
+        let path = dir.join("index.json");
+        fs::write(&path, "invalid cached index").unwrap();
+        let result = load_with(&path, true, || Ok("{}".to_string()));
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(dir).unwrap();
+
+        assert_eq!(
+            result.unwrap_err(),
+            "marketplace index has no `plugins` array"
+        );
+    }
+
+    #[test]
+    fn valid_refresh_replaces_stale_cache() {
+        let dir = cache_fixture("replace");
+        let path = dir.join("index.json");
+        fs::write(&path, r#"{"plugins":[]}"#).unwrap();
+        let result = load_with(&path, true, || Ok(INDEX.to_string()));
+        let persisted = fs::read_to_string(&path);
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(dir).unwrap();
+
+        let (entries, note) = result.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(note, "just refreshed");
+        assert_eq!(persisted.unwrap(), INDEX);
+    }
 
     #[test]
     fn parses_the_real_index_shape() {
