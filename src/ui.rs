@@ -3757,10 +3757,13 @@ fn draw_help(
         let end = (start + visible).min(lines.len());
         let full = "Esc Back · ↑↓ PgUp/PgDn Scroll";
         let compact = "Esc Back · ↑↓ Scroll";
+        let arrows = "Esc Back · ↑↓";
         let controls = if full.chars().count() <= columns {
             full
         } else if compact.chars().count() <= columns {
             compact
+        } else if arrows.chars().count() <= columns {
+            arrows
         } else {
             "Esc Back"
         };
@@ -5132,11 +5135,13 @@ mod tests {
             help: Some(0),
             ..App::default()
         };
-        let mut output = Vec::new();
-        app.draw(&mut output, width, height).unwrap();
-        assert!(String::from_utf8(output)
-            .unwrap()
-            .ends_with("\x1b[7;1HEsc Back · ↑↓ Scroll"));
+        for (width, controls) in [(24, "Esc Back · ↑↓ Scroll"), (20, "Esc Back · ↑↓")] {
+            let mut output = Vec::new();
+            app.draw(&mut output, width, height).unwrap();
+            assert!(String::from_utf8(output)
+                .unwrap()
+                .ends_with(&format!("\x1b[7;1H{controls}")));
+        }
 
         let narrow_end = help_scroll(0, KeyCode::End, width, height, "");
         let wide_end = help_scroll(0, KeyCode::End, 80, 24, "");
