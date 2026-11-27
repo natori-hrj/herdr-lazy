@@ -112,6 +112,11 @@ since the previous release tag. To release that batch, run `scripts/release.sh <
 The script checks the build, bumps the version, and pushes the version commit and tag
 together.
 
+When a release-preparation PR already stamps the version in `Cargo.toml`, `Cargo.lock`,
+and `herdr-plugin.toml`, `scripts/release.sh` rejects that version as already set.
+After the PR has merged and the release checks pass, the maintainer tags the verified
+`main` commit with the matching version.
+
 The tag starts the release workflow. After the audit and all five builds pass, the workflow
 uploads the archives and checksums to a draft, publishes it with GitHub-generated notes,
 and checks the download URLs. If an upload fails, rerun the failed job to finish the draft.
