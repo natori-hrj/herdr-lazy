@@ -63,7 +63,7 @@ manage the *other* plugins.
 
 ## Install
 
-Requires Herdr 0.9.0 or later. Herdr 0.9.0 resolves the plugin manifest’s relative
+Requires herdr ≥ 0.9.0. Herdr 0.9.0 resolves the plugin manifest’s relative
 commands on Windows, which lets the same manifest run on all supported platforms.
 Check your version with `herdr --version` before installing.
 
