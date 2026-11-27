@@ -452,7 +452,8 @@ active filters, a single abbreviation of 3–12 ASCII letters or digits can matc
 of repository name parts, such as `wti` for `worktree-tool-inspector`.
 
 Marketplace discovery combines the query with category and installation filters. The header
-shows the result count and catalog size.
+normally shows the result count and catalog size, but can omit both when the inventory is
+unavailable or when a narrow pane shows refresh status or an error.
 
 | Key | Marketplace action |
 | --- | --- |
@@ -464,8 +465,8 @@ shows the result count and catalog size.
 
 Categories use keywords in names, descriptions, and topics. Unclassified entries appear in
 `other`. Herdr's installed inventory and your list are tracked separately. If the inventory is
-unavailable, the installed and not-installed filters report that state. Choose `any` or
-refresh to retry the inventory lookup.
+unavailable, the installed and not-installed filters report that state. Choose `any` to browse
+without the installation filter, or press `Ctrl+R` to retry the inventory lookup.
 
 Enter adds to your list rather than installing outright: one keystroke on a fuzzy match
 should not run a stranger's build script. The list is where intent is recorded.
