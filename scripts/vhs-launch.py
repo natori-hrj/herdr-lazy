@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch the released TUI with a fictional catalog and an allowlisted environment."""
+"""Launch the TUI with a fictional catalog and an allowlisted environment."""
 
 import hashlib
 import json
@@ -8,7 +8,7 @@ from pathlib import Path
 import runpy
 import sys
 
-binary, root = map(Path, sys.argv[1:])
+binary, root = map(Path, sys.argv[1:3])
 fixture = runpy.run_path(str(Path(__file__).with_name("record-demo.py")))["fixture"]
 env = fixture(root)
 
@@ -49,6 +49,12 @@ snapshot = Path(env["DEMO_PLUGIN_LIST"])
 installed = json.loads(snapshot.read_text(encoding="utf-8"))
 plugins = installed["result"]["plugins"]
 plugins[0]["description"] = "Navigate related worktrees and pin frequently used workspaces."
+if sys.argv[3:] == ["--unicode"]:
+    plugins[0]["description"] = (
+        "Worktree 👩‍💻 tools for cafe\u0301 and 日本語 projects. "
+        "Navigate related worktrees and pin frequently used workspaces "
+        "while keeping related terminal panes together."
+    )
 plugins[0]["source"]["repo"] = "worktree-tools"
 for name in [*bundle[2:6], "keymap-helper"]:
     plugins.append({

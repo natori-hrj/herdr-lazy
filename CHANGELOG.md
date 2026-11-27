@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.46.0
+
+### Added
+
+- Combine Marketplace text search with category and installation filters. Use Tab or Shift+Tab to cycle categories, Ctrl+F to cycle installation filters, Ctrl+N to switch between stars and name order, and Ctrl+L to reset the search. [#139](https://github.com/natori-hrj/herdr-lazy/pull/139)
+
+### Changed
+
+- Normalize searchable Marketplace text when loading the catalog so repeated searches reuse it. [#136](https://github.com/natori-hrj/herdr-lazy/pull/136)
+- Adapt Manage and Marketplace columns to the visible rows. Give the focused row a background while preserving status colors and improve the contrast of secondary text. [#138](https://github.com/natori-hrj/herdr-lazy/pull/138) [#141](https://github.com/natori-hrj/herdr-lazy/pull/141) [#143](https://github.com/natori-hrj/herdr-lazy/pull/143) [#144](https://github.com/natori-hrj/herdr-lazy/pull/144)
+- Keep command palette results and key hints together, preview each theme on a plugin row, and make navigation and action hints more consistent across views. [#137](https://github.com/natori-hrj/herdr-lazy/pull/137) [#142](https://github.com/natori-hrj/herdr-lazy/pull/142) [#145](https://github.com/natori-hrj/herdr-lazy/pull/145)
+
+### Fixed
+
+- Clip and wrap terminal text at grapheme boundaries and measure its display width in cells. Keep selected text readable when terminal palette colors coincide. [#140](https://github.com/natori-hrj/herdr-lazy/pull/140)
+
+See the [v0.46.0 release notes](docs/release-v0.46.0.md) for recordings, measurements, and verification coverage.
+Requires Herdr 0.9.0 or later.
+
 ## v0.45.0
 
 ### Added
