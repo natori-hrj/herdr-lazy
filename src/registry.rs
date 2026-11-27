@@ -18,7 +18,8 @@ use std::process::{Command, Stdio};
 use crate::json;
 
 const INDEX_URL: &str = "https://assets.herdr.dev/plugins/index.json";
-const MAX_INDEX_BYTES: u64 = 2 * 1024 * 1024;
+// The public index already approaches 2 MiB and grows as new repositories are listed.
+const MAX_INDEX_BYTES: u64 = 8 * 1024 * 1024;
 
 /// How long a cached copy is considered good.
 ///
