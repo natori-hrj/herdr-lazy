@@ -241,17 +241,19 @@ fn download() -> Result<String, String> {
         }
     };
 
-    attempt(
-        "curl",
-        &["-fsL", "--max-time", "20", "--retry", "1", INDEX_URL],
-    )
-    .or_else(|| attempt("wget", &["-q", "-O", "-", "--timeout=20", INDEX_URL]))
-    .ok_or_else(|| {
-        format!(
-            "could not fetch {} (curl/wget unavailable or offline)",
-            INDEX_URL
-        )
-    })
+    attempt("curl", &["-fsL", "--max-time", "20", INDEX_URL])
+        .or_else(|| {
+            attempt(
+                "wget",
+                &["-q", "-O", "-", "--timeout=20", "--tries=1", INDEX_URL],
+            )
+        })
+        .ok_or_else(|| {
+            format!(
+                "could not fetch {} (curl/wget unavailable or offline)",
+                INDEX_URL
+            )
+        })
 }
 
 /// Parse the index document into entries.
@@ -349,6 +351,24 @@ fn load_with(
     }
 }
 
+pub(crate) struct BrowserCache {
+    pub(crate) entries: Vec<Entry>,
+    pub(crate) note: String,
+    pub(crate) fresh: bool,
+}
+
+pub(crate) fn browser_cache() -> Option<BrowserCache> {
+    let path = cache_path();
+    let age = cache_age_seconds(&path);
+    let body = fs::read_to_string(path).ok()?;
+    let entries = parse_index(&body).ok()?;
+    Some(BrowserCache {
+        entries,
+        note: describe_age(age),
+        fresh: age.is_some_and(|seconds| seconds < CACHE_SECONDS),
+    })
+}
+
 /// Entries from the cache, or nothing. Never fetches.
 ///
 /// Used by the list view, which runs on every keypress-driven redraw and must not depend on
@@ -364,7 +384,7 @@ fn write_cache(p: &Path, body: &str) -> io::Result<()> {
     if let Some(parent) = p.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(p, body)
+    crate::write_bytes_atomically(p, body.as_bytes())
 }
 
 fn describe_age(age: Option<u64>) -> String {
