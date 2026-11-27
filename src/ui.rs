@@ -18,6 +18,8 @@ use std::{
     time::Duration,
 };
 
+mod managed_list;
+
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
 
@@ -740,7 +742,7 @@ fn rows_with_herdr_version(
 
 /// Screen row where the list starts, in both views.
 ///
-/// The header is two lines (title + rule) in the list view and three in the browser (title,
+/// The standard header is two lines (title + rule) in Manage and three in the browser (title,
 /// query, rule). Click handling and drawing must agree on this, so it lives in one place
 /// rather than being counted twice.
 const LIST_TOP: usize = 2;
@@ -1748,28 +1750,23 @@ impl App {
 
     /// How many rows fit, and which one is at the top. Used by both drawing and clicking.
     fn list_window(&self, height: u16) -> (usize, usize) {
-        let visible = (height as usize).saturating_sub(6).max(1);
-        let start = if self.cursor >= visible {
-            self.cursor - visible + 1
-        } else {
-            0
-        };
+        let top = managed_list::list_top(height);
+        let visible = usize::from(footer_start_row(height))
+            .saturating_sub(top + 1)
+            .max(1);
+        let start = self.cursor.saturating_sub(visible - 1);
         (visible, start)
     }
 
     /// Which row is under this screen line, if any.
     fn row_at(&self, screen_row: u16, height: u16) -> Option<usize> {
+        if self.error.is_some() || height == 0 {
+            return None;
+        }
         let (visible, start) = self.list_window(height);
-        let y = screen_row as usize;
-        if y < LIST_TOP {
-            return None; // header
-        }
-        let idx = start + (y - LIST_TOP);
-        if y - LIST_TOP < visible && idx < self.rows.len() {
-            Some(idx)
-        } else {
-            None
-        }
+        let offset = usize::from(screen_row).checked_sub(managed_list::list_top(height))?;
+        let idx = start + offset;
+        (offset < visible && idx < self.rows.len()).then_some(idx)
     }
 
     fn open_detail(&mut self) {
@@ -3767,123 +3764,7 @@ impl App {
     }
 
     fn draw_list(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
-        // Rules span the pane. A fixed width looked deliberate at 80 columns and plainly
-        // broken at 140, where the list ran well past the line meant to underline it.
-        let rule = rule_line(width);
-        // Home the cursor and clear, rather than scrolling: redraw in place.
-        write!(out, "\x1b[H\x1b[2J")?;
-
-        let installed = self
-            .rows
-            .iter()
-            .filter(|r| r.status != Status::Missing)
-            .count();
-        let to_sync = self
-            .rows
-            .iter()
-            .filter(|r| matches!(r.status, Status::Missing | Status::Drifted { .. }))
-            .count();
-        let updates = self.rows.iter().filter(|r| r.maybe_stale).count();
-        writeln!(
-            out,
-            "\x1b[1m herdr-lazy\x1b[0m  \x1b[2m{} installed · {} to sync · {} updates\x1b[0m\r",
-            installed, to_sync, updates
-        )?;
-        writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
-
-        if let Some(e) = &self.error {
-            writeln!(out, " \x1b[31mcannot read plugin list:\x1b[0m {}\r", e)?;
-        } else if self.rows.is_empty() {
-            writeln!(
-                out,
-                " \x1b[2mno plugins yet — press / to browse, or run `herdr-lazy init`\x1b[0m\r"
-            )?;
-        }
-
-        // Reserve the header (2), footer (2) and a spare line.
-        let (visible, start) = self.list_window(height);
-
-        for (i, row) in self.rows.iter().enumerate().skip(start).take(visible) {
-            let selected = i == self.cursor;
-            let pointer = if selected { "\x1b[7m>" } else { " " };
-            // A checkbox only when something is ticked: an always-visible column of empty
-            // boxes implies every row needs a decision, when the common case is acting on
-            // the one row under the cursor.
-            let box_ = if self.any_picked() {
-                if row.picked {
-                    "\x1b[32m[x]\x1b[0m "
-                } else {
-                    "\x1b[2m[ ]\x1b[0m "
-                }
-            } else {
-                ""
-            };
-            let commit = row
-                .commit
-                .as_deref()
-                .map(crate::short)
-                .unwrap_or_else(|| "-".to_string());
-            // `↑` next to the commit rather than a column of its own: it qualifies the commit
-            // that is shown, and the row is already wide.
-            let up = if row.maybe_stale {
-                "\x1b[33m↑\x1b[0m"
-            } else {
-                " "
-            };
-            // Point at `l`, not `u`. The whole point of this feature is reading the change
-            // before applying it — telling the user to update straight away skips the review
-            // it exists to offer. `l` opens the details, which fetch and show what changed;
-            // `u` is the step after they have decided.
-            let note = row.trailing_text();
-            // The trailing text gets whatever width is left, so a narrow pane truncates the
-            // description rather than wrapping or pushing the row off-screen.
-            let trailing_width = (width as usize).saturating_sub(66);
-            writeln!(
-                out,
-                "{} {}{}{}\x1b[0m {:<44} \x1b[2m{:<12}\x1b[0m{} {}\x1b[0m\r",
-                pointer,
-                box_,
-                row.colour(),
-                row.marker(),
-                truncate(&row.label, 44),
-                commit,
-                up,
-                if note.is_empty() {
-                    String::new()
-                } else {
-                    format!("\x1b[2m{}\x1b[0m", truncate(&note, trailing_width))
-                },
-            )?;
-        }
-
-        // Keys are shown as `[s] sync`, not `sync` with a bold "s".
-        //
-        // Bolding the first letter reads as a hint only if you already know the convention,
-        // and it disappears entirely on a terminal that renders bold faintly — leaving a row
-        // of words with no visible connection to any key. Brackets survive any theme.
-        let legend = [
-            ("i", "install"),
-            ("u", "update"),
-            ("x", "remove"),
-            ("/", "search"),
-            ("?", "more"),
-        ]
-        .iter()
-        .map(|(k, label)| format!("\x1b[1m[{}]\x1b[0m {}", k, label))
-        .collect::<Vec<_>>()
-        .join("  ");
-        let footer = match &self.flash {
-            Some(msg) => format!("\x1b[36m{}\x1b[0m", msg),
-            None => legend,
-        };
-        write!(
-            out,
-            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r\n",
-            footer_start_row(height),
-            rule,
-            footer
-        )?;
-        out.flush()
+        managed_list::draw(self, out, width, height)
     }
 }
 
@@ -4104,9 +3985,7 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 
 /// Cut a label to `max` *characters*.
 ///
-/// Not display columns: a CJK or emoji label counts as one char per glyph while occupying two
-/// terminal cells, so such a row's trailing columns drift right. Plugin slugs are ASCII in
-/// practice, and the alternative is a unicode-width dependency for a cosmetic case.
+/// This character limit is used for panes that do not align on terminal display columns.
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -5512,7 +5391,7 @@ mod tests {
         let (visible, start) = app.list_window(4); // tiny pane: 1 visible row
         assert_eq!(visible, 1);
         assert_eq!(start, 4);
-        assert_eq!(app.row_at(LIST_TOP as u16, 4), Some(4));
+        assert_eq!(app.row_at(0, 4), Some(4));
     }
 
     /// A single click must never install or remove anything — it only moves the cursor. The
@@ -5731,11 +5610,16 @@ mod tests {
         let out = String::from_utf8(buf).unwrap();
 
         assert!(out.contains("0 installed · 1 to sync · 0 updates"));
-        assert!(out.contains("[i]") && out.contains("install"));
-        assert!(out.contains("[u]") && out.contains("update"));
-        assert!(out.contains("[x]") && out.contains("remove"));
-        assert!(out.contains("[/]") && out.contains("search"));
-        assert!(out.contains("[?]") && out.contains("more"));
+        for hint in [
+            "[i] Install",
+            "[u] Update",
+            "[x] Remove",
+            "[/] Browse",
+            "[?] Help",
+            "[l] Detail",
+        ] {
+            assert!(out.contains(hint), "missing {hint}");
+        }
         assert!(!out.contains("[m] machines"));
         assert!(!out.contains("[p] profile"));
     }
