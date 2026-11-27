@@ -59,9 +59,15 @@ fn query_tail(query: &str, columns: usize) -> String {
     clip(query, columns).0
 }
 
-fn search_line(out: &mut impl Write, browser: &Browser, columns: usize) -> io::Result<()> {
+fn search_line(
+    out: &mut impl Write,
+    browser: &Browser,
+    columns: usize,
+    has_divider: bool,
+) -> io::Result<Option<String>> {
     if columns < 2 {
-        return write!(out, "\x1b[7m \x1b[0m");
+        write!(out, "\x1b[7m \x1b[0m")?;
+        return Ok(None);
     }
     let prefix = if columns >= 32 {
         "Search "
@@ -70,35 +76,45 @@ fn search_line(out: &mut impl Write, browser: &Browser, columns: usize) -> io::R
     } else {
         "/"
     };
-    let category = format!("  [Tab] {}", browser.category_label());
-    let compact_category = format!("  {}", browser.category_label());
-    let available = columns - prefix.len() - 1;
-    let category = if category.len() + 6 <= available {
-        category.as_str()
-    } else if compact_category.len() + 4 <= available {
-        compact_category.as_str()
+    let (category, installed, sort) = (
+        browser.category_label(),
+        browser.install_filter_label(),
+        browser.sort_label(),
+    );
+    let controls = format!("  [Tab] {category}  [Ctrl+F] {installed}  [Ctrl+N] {sort}");
+    let compact_install = if installed == "not installed" {
+        "not inst."
     } else {
-        ""
+        installed
     };
-    let query = query_tail(&browser.query, available - category.len());
+    let available = columns - prefix.len() - 1;
+    // The existing divider can carry the shortcuts without taking cells from the query.
+    let divider_controls = (has_divider && controls.len() + 6 > available)
+        .then(|| format!("Tab {category} ^F {compact_install} ^N {sort}"))
+        .filter(|label| label.len() <= columns);
+    let compact = format!("  {category} / {installed} / {sort}");
+    let category_only = format!("  {category}");
+    let controls = if divider_controls.is_some() {
+        ""
+    } else {
+        [controls.as_str(), &compact, &category_only]
+            .into_iter()
+            .find(|label| label.len() + 6 <= available)
+            .unwrap_or("")
+    };
+    let query = query_tail(&browser.query, available - controls.len());
     write!(
         out,
-        "{prefix}\x1b[1m{query}\x1b[0m\x1b[7m \x1b[0m\x1b[2m{category}\x1b[0m"
-    )
+        "{prefix}\x1b[1m{query}\x1b[0m\x1b[7m \x1b[0m\x1b[2m{controls}\x1b[0m"
+    )?;
+    Ok(divider_controls)
 }
 
-fn status(app: &App, browser: &Browser, entry: &Entry, columns: usize) -> &'static str {
+fn status(browser: &Browser, entry: &Entry, columns: usize) -> &'static str {
     if columns < 16 {
         return "";
     }
-    let installed = app.rows.iter().any(|row| {
-        row.installed.is_some()
-            && row
-                .slug
-                .as_deref()
-                .is_some_and(|slug| slug.eq_ignore_ascii_case(&entry.full_name))
-    });
-    match (installed, browser.is_listed(entry)) {
+    match (browser.is_installed(entry), browser.is_listed(entry)) {
         (true, true) if columns >= 40 => "Installed+Listed",
         (true, true) => "Inst.+List",
         (true, false) => "Installed",
@@ -121,7 +137,7 @@ fn draw_results(
         .skip(window.start)
         .take(window.visible)
         .map(|&entry| {
-            let status = status(app, browser, entry, columns);
+            let status = status(browser, entry, columns);
             let metrics = format!("{} · {}★", age_label(&entry.pushed_at, today), entry.stars);
             (entry, status, metrics)
         })
@@ -189,8 +205,9 @@ pub(super) fn draw(
     let results = browser.results();
     let loading = refreshing && browser.all.is_empty();
     let failed = !refreshing && browser.source_note.contains("refresh failed:");
+    let inventory_unavailable = !browser.all.is_empty() && browser.inventory_unavailable();
     if window.top == 3 {
-        let title = if (refreshing || failed) && columns < 34 {
+        let title = if inventory_unavailable || ((refreshing || failed) && columns < 34) {
             "Marketplace".to_string()
         } else {
             format!("Marketplace  {}/{}", results.len(), browser.all.len())
@@ -214,8 +231,11 @@ pub(super) fn draw(
                 .as_deref()
                 .unwrap_or(&browser.source_note)
         };
+        let inventory_note = (!refreshing && inventory_unavailable)
+            .then(|| format!("Install state unavailable · {note}"));
+        let note = inventory_note.as_deref().unwrap_or(note);
         let (note, _) = clip(note, columns.saturating_sub(title_cells + 2));
-        let color = if failed {
+        let color = if failed || inventory_note.is_some() {
             app.theme.color(Role::Danger)
         } else {
             Color::Plain
@@ -226,11 +246,14 @@ pub(super) fn draw(
         }
         write!(out, "\x1b[2;1H")?;
     }
-    if window.top > 0 {
-        search_line(out, browser, columns)?;
-    }
+    let divider_controls = if window.top > 0 {
+        search_line(out, browser, columns, window.top == 3)?
+    } else {
+        None
+    };
     if window.top == 3 {
-        write!(out, "\x1b[3;1H\x1b[2m{}\x1b[0m", rule_line(width))?;
+        let divider = divider_controls.unwrap_or_else(|| rule_line(width));
+        write!(out, "\x1b[3;1H\x1b[2m{divider}\x1b[0m")?;
     }
 
     let description_width = if results.is_empty() {
@@ -240,8 +263,10 @@ pub(super) fn draw(
             "Marketplace unavailable · Ctrl+R retries"
         } else if browser.all.is_empty() {
             "No plugins in the index"
+        } else if browser.install_filter_unavailable() {
+            "Install state unavailable · Ctrl+R"
         } else {
-            "No matches · edit search or change category"
+            "No matches · Ctrl+L resets search"
         };
         let (message, _) = clip(message, columns);
         write!(out, "\x1b[{};1H{message}", window.top + 1)?;
@@ -264,7 +289,7 @@ pub(super) fn draw(
         for hint in [
             "[Enter] Add",
             "[Esc] Back",
-            "[Tab] Category",
+            "[Ctrl+L] Reset",
             "[Ctrl+O] Repo",
             "[Ctrl+R] Refresh",
         ] {
@@ -304,6 +329,7 @@ mod tests {
                 }],
                 "cached 2h ago".to_string(),
                 vec!["owner/worktree".to_string()],
+                Some(&[]),
             )),
             ..App::default()
         }
@@ -313,6 +339,39 @@ mod tests {
         let mut output = Vec::new();
         draw(app, &mut output, width, height, refreshing).unwrap();
         String::from_utf8(output).unwrap()
+    }
+
+    #[test]
+    fn marketplace_badges_follow_the_browser_inventory() {
+        let installed = crate::parse_plugin_list(
+            r#"{"result":{"plugins":[
+                {"name":"worktree","source":{"url":"https://github.com/OWNER/worktree.git"}}
+            ]}}"#,
+        )
+        .unwrap();
+        let mut app = app();
+        let browser = app.browser.as_mut().unwrap();
+        *browser = Browser::new(
+            browser.all.clone(),
+            browser.source_note.clone(),
+            browser.listed.clone(),
+            Some(&installed),
+        );
+
+        let available = frame(&app, 80, 14, false);
+        assert!(available.contains("Installed+Listed"), "{available:?}");
+
+        // The Manage view still reflects its older snapshot.
+        app.rows = super::super::rows(&[crate::Spec::parse("owner/worktree")], &installed);
+        assert_eq!(app.rows[0].slug.as_deref(), Some("owner/worktree"));
+        assert!(app.rows[0].installed.is_some());
+        let browser = app.browser.as_mut().unwrap();
+        browser.replace_entries(browser.all.clone(), browser.source_note.clone(), None);
+
+        let unavailable = frame(&app, 80, 14, false);
+        assert!(unavailable.contains("Install state unavailable"));
+        assert!(unavailable.contains("Listed"));
+        assert!(!unavailable.contains("Installed"), "{unavailable:?}");
     }
 
     #[test]
@@ -404,6 +463,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn marketplace_compact_controls_remain_visible_at_40_columns() {
+        let mut app = app();
+        let browser = app.browser.as_mut().unwrap();
+        browser.category = Some("notifications");
+        browser.cycle_install_filter();
+        browser.cycle_install_filter();
+        browser.query = "長い worktree query".to_string();
+
+        let compact = frame(&app, 40, 12, false);
+        assert!(compact.contains("Tab notifications"), "{compact:?}");
+        assert!(compact.contains("^F not inst."), "{compact:?}");
+        assert!(compact.contains("^N stars"), "{compact:?}");
+        assert!(compact.contains("長い worktree query"), "{compact:?}");
+        assert!(compact.contains("\x1b[4;1HNo matches"), "{compact:?}");
+        assert!(compact.contains("\x1b[10;1H[Enter] Add"), "{compact:?}");
     }
 
     #[test]
