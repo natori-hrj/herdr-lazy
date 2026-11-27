@@ -8,22 +8,28 @@ security sources and dependency versions are unchanged. See the
 
 ## Terminal captures and recordings
 
-These 1760×660 terminal captures were recorded with VHS from the published
+These 1280×720 terminal captures were recorded with VHS from the published
 v0.45.0 binary using fictional plugin data.
 
 ![Manage plugin list and selected row](media/vhs/manage.png)
 
 ![Selected plugin metadata and actions](media/vhs/details.png)
 
-![Manage command palette search](media/vhs/command-palette.png)
+![Manage command palette with available commands](media/vhs/command-palette.png)
 
-![Marketplace search showing the selected row and Japanese fixture text](media/vhs/marketplace.png)
+[See fuzzy search narrow the command list](media/vhs/command-palette-search.png).
+
+![Marketplace search results kept visible during a background refresh](media/vhs/marketplace-refresh.png)
+
+[Unfiltered catalog](media/vhs/marketplace-catalog.png) · [Filtered results](media/vhs/marketplace.png)
 
 ![Theme picker preview](media/vhs/theme-selection.png)
 
-The 25-second workflow is available as a [GIF](media/vhs/demo.gif) and
+[Catppuccin preview](media/vhs/theme-catppuccin.png) · [Manage after applying Nord](media/vhs/manage-themed.png)
+
+The 28-second workflow is available as a [GIF](media/vhs/demo.gif) and
 [MP4](media/vhs/demo.mp4). The [VHS guide](demo.md) describes how to regenerate
-both videos and all five screenshots.
+both videos and the screenshots.
 
 ## Performance
 

@@ -14,9 +14,9 @@ pane to browse the Marketplace, inspect plugins, and decide what to install or u
 [![Latest release](https://img.shields.io/github/v/release/natori-hrj/herdr-lazy)](https://github.com/natori-hrj/herdr-lazy/releases/latest)
 ![Platforms: macOS, Linux, Windows](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-informational)
 
-![herdr-lazy v0.45.0 terminal demo showing Manage, details, command palette, Marketplace, and theme selection](docs/media/vhs/demo.gif)
+![herdr-lazy v0.45.0 terminal demo showing Manage, command palette, Marketplace search and refresh, plugin details, and theme selection](docs/media/vhs/demo.gif)
 
-[Watch the MP4](docs/media/vhs/demo.mp4) · [Regenerate the VHS recording and screenshots](docs/demo.md)
+[Watch the MP4](docs/media/vhs/demo.mp4) · [Regenerate the VHS recording and screenshots](docs/demo.md) · [Visual comparison](docs/vhs/visual-review.md)
 
 ## Try it in 60 seconds
 

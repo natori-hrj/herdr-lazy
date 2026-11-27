@@ -4,6 +4,11 @@ set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
 output=${1:-"$repo/docs/media/vhs"}
+font_size=${2:-22}
+case "$font_size" in
+    22|24) ;;
+    *) printf '%s\n' "Font size must be 22 or 24." >&2; exit 2 ;;
+esac
 mkdir -p "$output"
 output=$(cd "$output" && pwd)
 work=$(mktemp -d)
@@ -12,7 +17,7 @@ mkdir -p "$work"/{bin,fixture,home,config,data/fonts,cache,state,run}
 
 download() {
     local url=$1 sha=$2 file="$work/${1##*/}"
-    curl --fail --silent --show-error --location --retry 2 --output "$file" "$url"
+    curl --disable --fail --silent --show-error --location --retry 2 --output "$file" "$url"
     printf '%s  %s\n' "$sha" "$file" | sha256sum --check >&2
 }
 
@@ -52,9 +57,13 @@ isolated() {
 [[ $(isolated fc-match -f '%{file}' 'JetBrains Mono') == "$work/data/fonts/JetBrainsMono-Regular.ttf" ]]
 (
     cd "$work/run"
-    isolated vhs "$repo/docs/vhs/workflow.tape"
+    sed "s/^Set FontSize 22$/Set FontSize $font_size/" "$repo/docs/vhs/workflow.tape" > workflow.tape
+    isolated vhs workflow.tape
 )
-assets=(demo.gif demo.mp4 manage.png details.png command-palette.png marketplace.png theme-selection.png)
+[[ $(cat "$work/fixture/config/theme") == nord ]]
+assets=(demo.gif demo.mp4 manage.png command-palette.png command-palette-search.png
+    marketplace-catalog.png marketplace.png marketplace-refresh.png details.png
+    theme-catppuccin.png theme-selection.png manage-themed.png)
 for asset in "${assets[@]}"; do
     test -s "$work/run/$asset"
 done
