@@ -11,7 +11,7 @@ pub(super) fn list_top(height: u16) -> usize {
     }
 }
 
-fn cell_width(ch: char) -> usize {
+pub(super) fn cell_width(ch: char) -> usize {
     // Count emoji presentation selectors conservatively for terminals that expand them.
     if ch == '\u{fe0f}' {
         1
@@ -20,7 +20,7 @@ fn cell_width(ch: char) -> usize {
     }
 }
 
-fn clip(text: &str, columns: usize) -> (String, usize) {
+pub(super) fn clip(text: &str, columns: usize) -> (String, usize) {
     let mut line = String::new();
     let mut width = 0;
     if columns == 0 {
