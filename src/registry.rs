@@ -52,13 +52,21 @@ pub(crate) struct Entry {
     pub(crate) pushed_at: String,
 }
 
+pub(crate) fn search_terms(query: &str) -> Vec<String> {
+    query.split_whitespace().map(str::to_lowercase).collect()
+}
+
 impl Entry {
-    /// Does this entry match every whitespace-separated term?
+    /// Does this entry match every term returned by [`search_terms`]?
     ///
     /// All terms must match (narrowing as you type), but each may match any of name,
     /// description or topics — searching "worktree fzf" should find a worktree plugin whose
     /// description mentions fzf, without the user thinking about which field holds what.
-    pub(crate) fn matches(&self, query: &str) -> bool {
+    pub(crate) fn matches_terms(&self, terms: &[String]) -> bool {
+        if terms.is_empty() {
+            return true;
+        }
+
         let haystack = format!(
             "{} {} {}",
             self.full_name,
@@ -66,9 +74,12 @@ impl Entry {
             self.topics.join(" ")
         )
         .to_lowercase();
-        query
-            .split_whitespace()
-            .all(|term| haystack.contains(&term.to_lowercase()))
+        terms.iter().all(|term| haystack.contains(term))
+    }
+
+    #[cfg(test)]
+    fn matches(&self, query: &str) -> bool {
+        self.matches_terms(&search_terms(query))
     }
 }
 
