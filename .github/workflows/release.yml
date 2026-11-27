@@ -71,6 +71,11 @@ jobs:
         run: |
           set -euo pipefail
           version=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' herdr-plugin.toml | head -1)
+          cargo_version=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -1)
+          if [[ -z "$version" || "$cargo_version" != "$version" ]]; then
+            echo "Cargo.toml version '$cargo_version' does not match manifest version '$version'" >&2
+            exit 1
+          fi
 
           fingerprint=$(sh scripts/build-fingerprint.sh)
           asset="herdr-lazy-${version}-${fingerprint}-${{ matrix.target }}.tar.gz"
@@ -84,6 +89,13 @@ jobs:
           binary="target/${{ matrix.target }}/release/herdr-lazy"
           if [[ "${{ matrix.target }}" == *-windows-* ]]; then
             binary="${binary}.exe"
+          fi
+          if [[ "${{ matrix.native }}" == "true" ]]; then
+            actual_version=$("$binary" --version)
+            if [[ "$actual_version" != "herdr-lazy $version" ]]; then
+              echo "expected herdr-lazy $version from $binary, got: $actual_version" >&2
+              exit 1
+            fi
           fi
           cp "$binary" "$staging/"
           binary_name=$(basename "$binary")
