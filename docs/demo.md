@@ -1,6 +1,6 @@
 # Reproduce the TUI demo
 
-The 24-second recording uses the actual release binary in a 112×24 terminal.
+The default 24-second recording uses the binary you build in a 112×24 terminal.
 Its plugin list, installed records, and Marketplace entries are fictional,
 so it runs without Herdr, network access, or any personal configuration.
 
@@ -47,3 +47,29 @@ Use 0.1 seconds for the first Manage frame or 16 seconds for the completed
 Marketplace search. A pre-theme release can record the same screens with the
 terminal's default palette. The cast records color escape sequences, so use a
 true-color terminal when comparing presets.
+
+### Candidate-only recordings
+
+The default workflow is the demo for released builds. These modes require a
+development build that includes the named feature. Build the candidate checkout
+and pass that binary to the recorder:
+
+```sh
+cargo build --release --locked
+for mode in palette theme cached-marketplace; do
+  python3 scripts/record-demo.py target/release/herdr-lazy \
+    "/tmp/herdr-lazy-${mode}.cast" --columns 80 --mode "$mode"
+done
+```
+
+| Mode | Candidate feature | Frames to compare |
+| --- | --- | --- |
+| `palette` | Command palette | At 2 s, Ctrl+P opens Commands. At 5 s the query narrows to Browse Marketplace, which opens at 9 s. |
+| `theme` | Interactive theme picker | At 2 s, `T` opens the picker. At 5 s it previews Catppuccin and at 9 s Enter applies it to the fixture. |
+| `cached-marketplace` | Adaptive Marketplace with background refresh | At 2 s the cached catalog is visible. At 5 s it shows the search results, at 9 s a refresh is in flight, and at 13 s the failed refresh leaves those results visible. |
+
+The theme mode writes only inside the disposable fixture and cannot be combined
+with `--theme`, which has environment precedence over the picker. The cached
+Marketplace mode uses a two-hour-old fictional index and a local downloader that
+returns a controlled error after the in-flight frame is captured. No network
+request is made. These playback timings are chosen for readability.

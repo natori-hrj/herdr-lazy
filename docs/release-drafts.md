@@ -35,16 +35,20 @@ Restart Herdr and open Manage with `prefix+shift+l` on a fresh setup, or use
 - Detail scrolls while preserving action focus. You can inspect the locally known
   repository, resolved commit, listed ref, and Herdr version compatibility.
 - Terminal default, Catppuccin, Tokyo Night, Gruvbox, Nord, and custom color presets
-  are available through `HERDR_LAZY_THEME`. Include a palette picker or command
-  palette only after verifying those features in the release build.
+  are available through `HERDR_LAZY_THEME`. If included in the verified build,
+  `T` previews and saves a theme and Ctrl+P opens the command palette.
+- The offline recorder has separate candidate-only flows for the command palette,
+  theme picker, and cached Marketplace refresh. The default workflow remains
+  available for the current release.
 
 **Performance evidence for the Marketplace refresh candidate.** On Linux x86_64,
 five alternating runs per build used real HTTPS, a stale 2,108-entry cache, a stub
 Herdr process, and a 120×24 PTY. The median time from `/` to the first usable
 Marketplace frame was 449.482 ms on the synchronous build and 28.990 ms on the
 background-refresh build. The median time to the successful refresh message was
-449.498 ms and 536.845 ms, respectively. The first-frame measure captures stale-cache usability. Completion includes
-the network request and the UI's wait before painting the status.
+449.498 ms and 536.845 ms, respectively. The first-frame measure captures
+stale-cache usability. Completion includes the network request and the wait before
+the UI paints the status.
 
 A separate 30-run Linux PTY comparison used staggered mock downloads. When the
 shorter visible-refresh poll was included, p95 from downloader output readiness
@@ -53,8 +57,9 @@ the interface's reaction to a completed download under controlled conditions.
 
 ## X draft
 
-Manage Herdr plugins in one pane with herdr-lazy. Browse with `/`, inspect
-plugins with `l`, and keep your setup in a plain-text list and lockfile.
+Bring your Herdr plugins to a new machine with a list and lockfile. In the new
+herdr-lazy release, Marketplace shows cached results during refresh, Ctrl+P finds
+Manage commands, and T previews themes.
 https://github.com/natori-hrj/herdr-lazy
 
 ## Reddit draft
@@ -65,6 +70,10 @@ I built herdr-lazy for people who want to browse and manage plugins from their
 Herdr workspace. The Manage pane lets you find a plugin, add it to a plain-text
 list, and choose when to install it. A lockfile records the installed commits
 for reproducing a setup on another machine.
+
+In this release, cached Marketplace results remain usable during a refresh.
+Ctrl+P searches Manage commands, and T previews and saves a theme. The offline
+recording shows each interaction with fictional plugin data.
 
 It works with Herdr 0.9.0 or later. The repository has installation steps and a
 short, reproducible offline demo. Feedback on the workflow and platform behavior
@@ -78,6 +87,10 @@ If you keep a collection of Herdr plugins across workspaces or machines, give
 herdr-lazy a try. Open Manage, press `/` to browse the Marketplace, then use
 `l` on an installed plugin for its declared actions. The list and lockfile are
 plain text and can be kept with your dotfiles.
+
+This release adds readable Marketplace rows in narrow panes, Ctrl+P command
+search, and theme selection with T. If you use a small Herdr pane, reports on
+keyboard navigation and terminal sizing would be particularly helpful.
 
 The README covers fresh installs and existing setups. I would especially
 appreciate reports from Linux and Windows users about the install and pane

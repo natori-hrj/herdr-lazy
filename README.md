@@ -2,9 +2,9 @@
 
 > Find, install, and update Herdr plugins from one pane.
 
-A simple plugin **manager** for [herdr](https://herdr.dev). Search the marketplace, install
-what you need, update it later, or remove it when you are done. Underneath, it keeps a plain
-list and lockfile so the setup stays readable and reproducible.
+When you set up Herdr on another machine, a plain-text plugin list records what you want
+and a lockfile records the commits you installed. In your workspace, Manage gives you one
+pane to browse the Marketplace, inspect plugins, and decide what to install or update.
 
 [![CI](https://github.com/natori-hrj/herdr-lazy/actions/workflows/ci.yml/badge.svg)](https://github.com/natori-hrj/herdr-lazy/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/natori-hrj/herdr-lazy)](https://github.com/natori-hrj/herdr-lazy/releases/latest)
@@ -12,7 +12,9 @@ list and lockfile so the setup stays readable and reproducible.
 
 ![herdr-lazy in Ghostty: Herdr's main screen, the manage pane, marketplace search, and adding a plugin](docs/demo.gif)
 
-[Record the Manage, Detail, and Marketplace flow with an offline fixture](docs/demo.md).
+[Record the released Manage, Detail, and Marketplace workflow with an offline fixture](docs/demo.md).
+The guide also covers candidate-only recordings for the command palette, theme picker,
+and cached Marketplace refresh.
 
 ## Try it in 60 seconds
 
