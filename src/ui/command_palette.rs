@@ -2,7 +2,11 @@ use std::io::{self, Write};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use super::{footer_start_row, terminal_text::clip, App};
+use super::{
+    footer_start_row,
+    terminal_text::{clip, clip_tail, display_width},
+    App,
+};
 use crate::theme::{Role, Theme};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -251,24 +255,29 @@ impl Palette {
     ) -> io::Result<()> {
         write!(out, "\x1b[H\x1b[2J")?;
         let columns = usize::from(width.saturating_sub(1));
-        let footer = footer_row(height);
-        if columns == 0 || height == 0 {
+        let last_row = last_content_row(height);
+        if columns == 0 || last_row == 0 {
             return out.flush();
         }
         let (title, _) = clip(" Commands", columns);
         write!(out, "\x1b[1m{title}\x1b[0m")?;
-        if footer < 3 {
+        if last_row < 2 {
             return out.flush();
         }
-        let (query, _) = clip(&format!(" > {}", self.query), columns.saturating_sub(1));
+        let query = query_line(&self.query, columns.saturating_sub(1));
         write!(out, "\x1b[2;1H{query}\x1b[7m \x1b[0m")?;
+        if last_row < 3 {
+            return out.flush();
+        }
 
         let results = self.results();
         let visible = visible_rows(height);
         let start = self.cursor.saturating_sub(visible.saturating_sub(1));
+        let mut row = 3;
         if visible > 0 && results.is_empty() {
             let (empty, _) = clip(" No matching commands", columns);
-            write!(out, "\x1b[3;1H{empty}")?;
+            write!(out, "\x1b[{row};1H{empty}")?;
+            row += 1;
         }
         for (i, item) in results.iter().enumerate().skip(start).take(visible) {
             let selected = i == self.cursor;
@@ -280,25 +289,48 @@ impl Palette {
                 format!("{pointer}{}", item.label)
             };
             let (text, _) = clip(&line, columns);
-            let color = if selected {
-                theme.color(Role::Accent)
-            } else {
-                crate::theme::Color::Plain
-            };
-            write!(out, "\x1b[{};1H{color}{text}\x1b[0m", 3 + i - start)?;
+            write!(out, "\x1b[{row};1H")?;
+            if selected {
+                write!(out, "\x1b[1m{}", theme.color(Role::Accent))?;
+            }
+            write!(out, "{text}\x1b[0m")?;
+            row += 1;
         }
-        let (hint, _) = clip(" ↑↓ Select · Enter Open · Esc Back", columns);
-        write!(out, "\x1b[{footer};1H\x1b[2m{hint}\x1b[0m")?;
+        let hints: &[&str] = match (visible > 0 && width >= 6, results.len()) {
+            (false, _) | (_, 0) => &[" Esc Back"],
+            (true, 1) => &[" Enter Open · Esc Back", " Enter · Esc", "Enter Esc"],
+            _ => &[
+                " ↑↓ Select · Enter Open · Esc Back",
+                " ↑↓ · Enter · Esc",
+                "Enter Esc",
+            ],
+        };
+        let hint = hints
+            .iter()
+            .copied()
+            .find(|hint| display_width(hint) <= columns)
+            .unwrap_or("Esc");
+        let (hint, _) = clip(hint, columns);
+        write!(out, "\x1b[{row};1H\x1b[2m{hint}\x1b[0m")?;
         out.flush()
     }
 }
 
-fn footer_row(height: u16) -> usize {
+fn query_line(query: &str, columns: usize) -> String {
+    const PROMPT: &str = " > ";
+    let available = columns.saturating_sub(PROMPT.len());
+    if available == 0 {
+        return clip(&format!("{PROMPT}{query}"), columns).0;
+    }
+    format!("{PROMPT}{}", clip_tail(query, available))
+}
+
+fn last_content_row(height: u16) -> usize {
     usize::from(footer_start_row(height)) + usize::from(height >= 3)
 }
 
 fn visible_rows(height: u16) -> usize {
-    footer_row(height).saturating_sub(3)
+    last_content_row(height).saturating_sub(3)
 }
 
 fn rank(needle: &str, text: &str) -> Option<usize> {
@@ -336,6 +368,102 @@ mod tests {
             assert_eq!(
                 palette.handle_key(key(KeyCode::Char(ch)), 40, 10),
                 PaletteAction::Continue
+            );
+        }
+    }
+
+    fn render(palette: &Palette, width: u16, height: u16) -> String {
+        let mut bytes = Vec::new();
+        palette
+            .draw(&mut bytes, width, height, Theme::default())
+            .unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn hints_follow_the_visible_results_at_short_and_tall_heights() {
+        let mut palette = Palette::default();
+        let initial = render(&palette, 80, 24);
+        assert!(initial.contains("> Browse Marketplace"));
+        assert!(initial.contains("\x1b[10;1H\x1b[2m ↑↓ Select · Enter Open · Esc Back"));
+        let short = render(&palette, 80, 6);
+        assert!(short.contains("> Browse Marketplace"));
+        assert!(!short.contains("Browse optional bundles"));
+        assert!(short.contains("\x1b[4;1H\x1b[2m ↑↓ Select · Enter Open · Esc Back"));
+
+        type_query(&mut palette, "Brws MKT");
+        for height in [6, 24] {
+            let filtered = render(&palette, 80, height);
+            assert!(filtered.contains(" > Brws MKT"));
+            assert!(filtered.contains("> Browse Marketplace"));
+            assert!(!filtered.contains("Show keyboard help"));
+            assert!(filtered.contains("\x1b[4;1H\x1b[2m Enter Open · Esc Back"));
+        }
+
+        type_query(&mut palette, " zzzz");
+        for height in [6, 24] {
+            let empty = render(&palette, 80, height);
+            assert!(empty.contains("\x1b[3;1H No matching commands"));
+            assert!(empty.contains("\x1b[4;1H\x1b[2m Esc Back"));
+        }
+    }
+
+    #[test]
+    fn narrow_draw_keeps_the_open_and_back_hints_visible() {
+        let output = render(&Palette::default(), 24, 8);
+        assert!(output.contains(" ↑↓ · Enter · Esc"));
+    }
+
+    #[test]
+    fn compact_query_draws_with_only_two_content_rows() {
+        let mut palette = Palette::default();
+        type_query(&mut palette, "browse");
+        let output = render(&palette, 40, 4);
+        assert!(output.contains(" Commands"));
+        assert!(output.contains("\x1b[2;1H > browse\x1b[7m \x1b[0m"));
+        assert!(!output.contains("\x1b[3;1H"));
+        assert!(!output.contains("\x1b[4;1H"));
+        assert_eq!(
+            palette.handle_key(key(KeyCode::Enter), 40, 4),
+            PaletteAction::Continue
+        );
+    }
+
+    #[test]
+    fn compact_query_keeps_its_editing_end_visible() {
+        let query = "unmatched-query-with-a-long-prefix-followed-by-the-tail";
+        for (width, height) in [(24, 8), (40, 9)] {
+            let mut palette = Palette::default();
+            type_query(&mut palette, query);
+            let tail_cells = usize::from(width) - 6;
+            for end in [query.len(), query.len() - 1] {
+                let tail = &query[end - tail_cells..end];
+                let output = render(&palette, width, height);
+                assert!(
+                    output.contains(&format!("\x1b[2;1H > …{tail}\x1b[7m \x1b[0m")),
+                    "{width}x{height} query row: {output:?}"
+                );
+                assert!(output.contains("No matching commands"));
+                palette.handle_key(key(KeyCode::Backspace), width, height);
+            }
+        }
+    }
+
+    #[test]
+    fn palette_query_keeps_graphemes_and_contextual_width_before_the_caret() {
+        for (query, width, expected) in [
+            ("xy👩‍💻", 8, "…👩‍💻"),
+            ("xy👩‍💻", 7, "…"),
+            ("xye\u{301}", 7, "…e\u{301}"),
+            ("xxकक्क", 8, "…क्क"),
+            ("لا", 6, "لا"),
+        ] {
+            let mut palette = Palette::default();
+            type_query(&mut palette, query);
+            let frame = render(&palette, width, 8);
+            assert!(
+                frame.contains(&format!("\x1b[2;1H > {expected}\x1b[7m \x1b[0m")),
+                "{query:?}, {width}: {frame:?}"
             );
         }
     }
@@ -441,9 +569,7 @@ mod tests {
     fn compact_draw_reveals_selected_row_and_keeps_host_rows_clear() {
         let mut palette = context(true, true);
         palette.handle_key(key(KeyCode::End), 40, 8);
-        let mut bytes = Vec::new();
-        palette.draw(&mut bytes, 32, 8, Theme::default()).unwrap();
-        let output = String::from_utf8(bytes).unwrap();
+        let output = render(&palette, 32, 8);
         assert!(output.contains("> Show keyboard help"));
         assert!(output.contains("\x1b[6;1H"));
         assert!(!output.contains("\x1b[7;1H"));

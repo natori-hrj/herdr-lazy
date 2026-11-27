@@ -1,7 +1,28 @@
 use std::borrow::Cow;
+use std::io::{self, Write};
 
 use unicode_segmentation::{GraphemeIndices, UnicodeSegmentation};
 use unicode_width::UnicodeWidthStr;
+
+use crate::theme::Selection;
+
+pub(super) fn start_selection(
+    out: &mut impl Write,
+    selection: Selection,
+    columns: usize,
+) -> io::Result<()> {
+    // Fill the row before writing text, whose display width depends on the terminal.
+    write!(
+        out,
+        "{selection}{:columns$}\x1b[1G{}",
+        "",
+        selection.foreground()
+    )
+}
+
+pub(super) fn finish_selection(out: &mut impl Write) -> io::Result<()> {
+    out.write_all(b"\x1b[39m\x1b[49m")
+}
 
 pub(super) fn one_line(text: &str) -> Cow<'_, str> {
     // Keep text fields on their row and prevent them from emitting terminal commands.
