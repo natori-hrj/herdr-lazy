@@ -38,6 +38,19 @@ impl Browser {
         }
     }
 
+    pub(crate) fn replace_entries(&mut self, entries: Vec<Entry>, note: String) {
+        let selected = self.selected().map(|entry| entry.full_name.clone());
+        self.all = entries;
+        self.source_note = note;
+        self.cursor = selected
+            .and_then(|name| {
+                self.results()
+                    .iter()
+                    .position(|entry| entry.full_name == name)
+            })
+            .unwrap_or(0);
+    }
+
     pub(crate) fn results(&self) -> Vec<&Entry> {
         self.all
             .iter()
