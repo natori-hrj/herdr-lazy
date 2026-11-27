@@ -64,6 +64,7 @@ name = "herdr-lazy"
 version = "0.44.4"
 dependencies = [
  "crossterm",
+ "libc",
  "unicode-width",
 ]
 
