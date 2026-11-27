@@ -64,7 +64,10 @@ name = "herdr-lazy"
 version = "0.44.4"
 dependencies = [
  "crossterm",
+ "libc",
+ "rustix",
  "unicode-width",
+ "windows-sys",
 ]
 
 [[package]]

@@ -13,6 +13,11 @@
 
 use std::collections::BTreeMap;
 
+// A 2,108-entry Marketplace snapshot reached six container levels. Leave room
+// for schema growth while bounding recursion during parsing and drop.
+// A root array or object counts as level one. Scalars do not add a level.
+pub(crate) const MAX_CONTAINER_DEPTH: usize = 64;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Null,
@@ -68,7 +73,7 @@ pub fn parse(input: &str) -> Result<Value, String> {
     let bytes: Vec<char> = input.chars().collect();
     let mut p = Parser { b: &bytes, i: 0 };
     p.ws();
-    let v = p.value()?;
+    let v = p.value(0)?;
     p.ws();
     if p.i != p.b.len() {
         return Err(format!("trailing input at char {}", p.i));
@@ -122,10 +127,14 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn value(&mut self) -> Result<Value, String> {
+    fn value(&mut self, depth: usize) -> Result<Value, String> {
         match self.peek() {
-            Some('{') => self.object(),
-            Some('[') => self.array(),
+            Some('{' | '[') if depth >= MAX_CONTAINER_DEPTH => Err(format!(
+                "JSON container depth exceeds {MAX_CONTAINER_DEPTH} at char {}",
+                self.i
+            )),
+            Some('{') => self.object(depth + 1),
+            Some('[') => self.array(depth + 1),
             Some('"') => Ok(Value::Str(self.string()?)),
             Some('t') => self.literal("true", Value::Bool(true)),
             Some('f') => self.literal("false", Value::Bool(false)),
@@ -135,7 +144,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn object(&mut self) -> Result<Value, String> {
+    fn object(&mut self, depth: usize) -> Result<Value, String> {
         self.expect('{')?;
         let mut map = BTreeMap::new();
         self.ws();
@@ -149,7 +158,7 @@ impl<'a> Parser<'a> {
             self.ws();
             self.expect(':')?;
             self.ws();
-            let v = self.value()?;
+            let v = self.value(depth)?;
             map.insert(k, v);
             self.ws();
             match self.bump() {
@@ -160,7 +169,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn array(&mut self) -> Result<Value, String> {
+    fn array(&mut self, depth: usize) -> Result<Value, String> {
         self.expect('[')?;
         let mut items = Vec::new();
         self.ws();
@@ -170,7 +179,7 @@ impl<'a> Parser<'a> {
         }
         loop {
             self.ws();
-            items.push(self.value()?);
+            items.push(self.value(depth)?);
             self.ws();
             match self.bump() {
                 Some(',') => continue,
@@ -305,6 +314,64 @@ mod tests {
         // walks `chars()`, so anything indexing by byte would split these and panic.
         assert_eq!(parse(r#""あ""#).unwrap(), Value::Str("あ".to_string()));
         assert_eq!(parse(r#""🚀""#).unwrap(), Value::Str("🚀".to_string()));
+    }
+
+    fn nested(prefix: &str, suffix: &str, depth: usize, inner: &str) -> String {
+        format!("{}{inner}{}", prefix.repeat(depth), suffix.repeat(depth))
+    }
+
+    fn assert_depth_error(document: &str) {
+        let error = parse(document).unwrap_err();
+        assert!(error.starts_with("JSON container depth exceeds"), "{error}");
+    }
+
+    #[test]
+    fn accepts_containers_below_and_at_the_depth_limit() {
+        for (prefix, suffix) in [("[", "]"), (r#"{"child":"#, "}")] {
+            for depth in [MAX_CONTAINER_DEPTH - 1, MAX_CONTAINER_DEPTH] {
+                assert!(parse(&nested(prefix, suffix, depth, "null")).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_arrays_and_objects_above_the_depth_limit_before_reading_children() {
+        let depth = MAX_CONTAINER_DEPTH + 1;
+        for (prefix, suffix) in [("[", "]"), (r#"{"child":"#, "}")] {
+            assert_depth_error(&nested(prefix, suffix, depth, "null"));
+            assert_depth_error(&prefix.repeat(depth));
+        }
+    }
+
+    #[test]
+    fn counts_array_and_object_levels_together() {
+        let pairs = MAX_CONTAINER_DEPTH / 2;
+        let prefix = r#"[{"child":"#.repeat(pairs);
+        let suffix = "}]".repeat(pairs);
+        assert!(parse(&format!("{prefix}null{suffix}")).is_ok());
+
+        for inner in ["[]", "{}"] {
+            assert_depth_error(&format!("{prefix}{inner}{suffix}"));
+        }
+    }
+
+    #[test]
+    fn bounded_parse_and_drop_fit_a_small_stack() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let prefix = r#"{"sibling":[0],"child":"#;
+                let depth = MAX_CONTAINER_DEPTH - 1;
+                let accepted = nested(prefix, "}", depth, "[0]");
+                drop(parse(&accepted).unwrap());
+
+                // Each object has already parsed a sibling when its child is rejected.
+                let partial = nested(prefix, "}", depth, "[[]]");
+                assert_depth_error(&partial);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

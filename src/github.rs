@@ -10,7 +10,8 @@
 //! when the trigger is a human opening one plugin's details, and hopeless for anything that
 //! tried to check everything at once — so nothing does.
 
-use std::process::{Command, Stdio};
+use std::process::ExitStatus;
+use std::time::{Duration, Instant};
 
 /// What changed since install, for the details view.
 #[derive(Debug, Clone, PartialEq)]
@@ -24,7 +25,9 @@ pub(crate) enum Changes {
 }
 
 const PAGE: usize = 30;
-const MAX_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_PROBE_BYTES: usize = 64;
+const DOWNLOAD_BUDGET: Duration = Duration::from_secs(15);
 
 /// Commit subjects on `owner/repo`'s default branch that are newer than `installed_commit`.
 pub(crate) fn changes_since(owner_repo: &str, installed_commit: &str) -> Changes {
@@ -78,26 +81,36 @@ pub(crate) fn repo_exists(owner_repo: &str) -> Option<bool> {
         .unwrap_or_else(|| "https://github.com".to_string());
     let url = format!("{}/{}", base, owner_repo);
 
-    // `-o /dev/null -w %{http_code}` rather than `-f`, so a 404 is an answer and a dead network
-    // is a failure — telling the two apart is the whole point.
-    if let Ok(out) = Command::new("curl")
-        .args([
+    repo_exists_with(&url, crate::download::capture)
+}
+
+fn repo_exists_with(
+    url: &str,
+    mut capture: impl FnMut(&str, &[&str], usize, Instant) -> Option<(ExitStatus, Vec<u8>)>,
+) -> Option<bool> {
+    let deadline = Instant::now() + DOWNLOAD_BUDGET;
+    let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    // Capture only the status code. A 404 is an answer, while a dead network is not.
+    if let Some((status, bytes)) = capture(
+        "curl",
+        &[
             "-sIL",
             "--max-time",
             "15",
             "-o",
-            "/dev/null",
+            null_device,
             "-w",
             "%{http_code}",
             "-H",
             "User-Agent: herdr-lazy",
-            &url,
-        ])
-        .output()
-    {
-        if out.status.success() {
-            let code = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if let Ok(n) = code.parse::<u16>() {
+            url,
+        ],
+        MAX_PROBE_BYTES,
+        deadline,
+    ) {
+        if status.success() {
+            let code = String::from_utf8_lossy(&bytes);
+            if let Ok(n) = code.trim().parse::<u16>() {
                 if n > 0 {
                     return Some(n < 400);
                 }
@@ -105,38 +118,31 @@ pub(crate) fn repo_exists(owner_repo: &str) -> Option<bool> {
         }
     }
     // wget exits 8 on a server error response, which is an answer of "not found".
-    match Command::new("wget")
-        .args(["-q", "--spider", "--timeout=15", &url])
-        .status()
-    {
-        Ok(s) if s.success() => Some(true),
-        Ok(s) if s.code() == Some(8) => Some(false),
-        _ => None,
+    let (status, _) = capture(
+        "wget",
+        &["-q", "--spider", "--timeout=15", url],
+        MAX_PROBE_BYTES,
+        deadline,
+    )?;
+    if status.success() {
+        Some(true)
+    } else if status.code() == Some(8) {
+        Some(false)
+    } else {
+        None
     }
 }
 
 /// Shell out to curl/wget — std has no TLS, the same reason the install script and the
 /// marketplace fetch do.
 fn fetch(url: &str) -> Option<String> {
+    let deadline = Instant::now() + DOWNLOAD_BUDGET;
     let try_one = |prog: &str, args: &[&str]| -> Option<String> {
-        let mut child = Command::new(prog)
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
-        let body = match crate::read_limited(child.stdout.take()?, MAX_RESPONSE_BYTES) {
-            Ok(Some(body)) => body,
-            Ok(None) | Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        };
-        if !child.wait().ok()?.success() {
+        let (status, bytes) = crate::download::capture(prog, args, MAX_RESPONSE_BYTES, deadline)?;
+        if !status.success() {
             return None;
         }
-        let body = String::from_utf8_lossy(&body).to_string();
+        let body = String::from_utf8_lossy(&bytes).to_string();
         (!body.trim().is_empty()).then_some(body)
     };
     // A User-Agent is required by the GitHub API, or it answers 403.
@@ -215,6 +221,66 @@ pub(crate) fn parse_commits(body: &str, installed_commit: &str) -> Changes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn exit_status(code: i32) -> ExitStatus {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            ExitStatus::from_raw(code << 8)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            ExitStatus::from_raw(code as u32)
+        }
+    }
+
+    #[test]
+    fn valid_curl_status_is_an_answer_without_a_fallback() {
+        for (code, exists) in [("200", true), ("301", true), ("404", false)] {
+            let result = repo_exists_with(
+                "https://example.test/owner/repo",
+                |program, args, cap, _| {
+                    assert_eq!(program, "curl");
+                    assert!(args.contains(&"%{http_code}"));
+                    assert_eq!(cap, MAX_PROBE_BYTES);
+                    Some((exit_status(0), format!("{code}\n").into_bytes()))
+                },
+            );
+            assert_eq!(result, Some(exists));
+        }
+    }
+
+    #[test]
+    fn wget_status_and_unavailable_network_share_the_curl_deadline() {
+        for (curl, wget, expected) in [
+            (Some((0, "not a status")), Some(8), Some(false)),
+            (Some((0, "000")), Some(0), Some(true)),
+            (Some((6, "200")), Some(4), None),
+            (None, None, None),
+        ] {
+            let mut attempted = Vec::new();
+            let result = repo_exists_with(
+                "https://example.test/owner/repo",
+                |program, args, cap, deadline| {
+                    assert_eq!(cap, MAX_PROBE_BYTES);
+                    attempted.push((program.to_string(), deadline));
+                    if program == "curl" {
+                        curl.map(|(code, text)| (exit_status(code), text.as_bytes().to_vec()))
+                    } else {
+                        assert_eq!(program, "wget");
+                        assert!(args.contains(&"--spider"));
+                        wget.map(|code| (exit_status(code), Vec::new()))
+                    }
+                },
+            );
+            assert_eq!(result, expected);
+            assert_eq!(attempted.len(), 2);
+            assert_eq!(attempted[0].0, "curl");
+            assert_eq!(attempted[1].0, "wget");
+            assert_eq!(attempted[0].1, attempted[1].1);
+        }
+    }
 
     fn payload(shas_and_subjects: &[(&str, &str)]) -> String {
         let items: Vec<String> = shas_and_subjects
