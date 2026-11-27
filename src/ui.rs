@@ -3755,8 +3755,23 @@ fn draw_help(
     let footer = footer_start_row(height);
     if footer > first_row {
         let end = (start + visible).min(lines.len());
-        let hint = format!("Esc close · ↑↓ scroll · {end}/{}", lines.len());
-        write!(out, "\x1b[{footer};1H{}", truncate(&hint, columns))?;
+        let full = "Esc Back · ↑↓ PgUp/PgDn Scroll";
+        let compact = "Esc Back · ↑↓ Scroll";
+        let arrows = "Esc Back · ↑↓";
+        let controls = if full.chars().count() <= columns {
+            full
+        } else if compact.chars().count() <= columns {
+            compact
+        } else if arrows.chars().count() <= columns {
+            arrows
+        } else {
+            "Esc Back"
+        };
+        let progress = format!(" · {end}/{}", lines.len());
+        write!(out, "\x1b[{footer};1H{}", truncate(controls, columns))?;
+        if controls.chars().count() + progress.chars().count() <= columns {
+            write!(out, "{progress}")?;
+        }
     }
     out.flush()
 }
@@ -5059,34 +5074,52 @@ mod tests {
 
     #[test]
     fn help_layout_fits_short_panes_and_reaches_the_final_shortcut() {
-        let (width, height) = (40, 9);
-        let (columns, _, _) = help_viewport(width, height);
-        assert!(help_lines(columns, "")
-            .iter()
-            .all(|(_, line)| line.chars().count() <= columns));
+        for (width, height) in [(40, 9), (40, 11), (80, 24), (100, 30), (160, 48)] {
+            let (columns, visible, _) = help_viewport(width, height);
+            let lines = help_lines(columns, "");
+            let total = lines.len();
+            assert!(lines
+                .iter()
+                .all(|(_, line)| line.chars().count() <= columns));
 
-        let frame = |offset| {
-            let mut output = Vec::new();
-            draw_help(&mut output, width, height, offset, "").unwrap();
-            let output = String::from_utf8(output).unwrap();
-            assert!(!output.contains('\n'));
-            for movement in output
-                .split("\x1b[")
-                .filter(|part| part.starts_with(|c: char| c.is_ascii_digit()))
-            {
-                if let Some((row, _)) = movement.split_once(";1H") {
-                    assert!(row.parse::<u16>().unwrap() <= footer_start_row(height));
+            let footer_row = footer_start_row(height);
+            let footer_position = format!("\x1b[{footer_row};1H");
+            let frame = |offset| {
+                let app = App {
+                    help: Some(offset),
+                    ..App::default()
+                };
+                let mut output = Vec::new();
+                app.draw(&mut output, width, height).unwrap();
+                let output = String::from_utf8(output).unwrap();
+                assert!(!output.contains('\n'));
+                for movement in output
+                    .split("\x1b[")
+                    .filter(|part| part.starts_with(|c: char| c.is_ascii_digit()))
+                {
+                    if let Some((row, _)) = movement.split_once(";1H") {
+                        assert!(row.parse::<u16>().unwrap() <= footer_row);
+                    }
                 }
+                output
+            };
+            let controls = "Esc Back · ↑↓ PgUp/PgDn Scroll";
+            let first = frame(0);
+            assert!(first.contains("Keyboard shortcuts"));
+            assert!(first.contains("Lowercase acts"));
+            let end = visible.min(total);
+            if end < total {
+                assert!(!first.contains("quit from the plugin list"));
             }
-            output
-        };
-        let first = frame(0);
-        assert!(first.contains("Keyboard shortcuts"));
-        assert!(first.contains("Lowercase acts"));
-        assert!(!first.contains("quit from the plugin list"));
-        let last = help_scroll(0, KeyCode::End, width, height, "");
-        assert!(frame(last).contains("quit from the plugin list"));
-        assert_eq!(frame(usize::MAX), frame(last));
+            assert!(first.ends_with(&format!("{footer_position}{controls} · {end}/{total}")));
+            let last = help_scroll(0, KeyCode::End, width, height, "");
+            let final_frame = frame(last);
+            assert!(final_frame.contains("quit from the plugin list"));
+            assert!(
+                final_frame.ends_with(&format!("{footer_position}{controls} · {total}/{total}"))
+            );
+            assert_eq!(frame(usize::MAX), final_frame);
+        }
     }
 
     #[test]
@@ -5097,6 +5130,18 @@ mod tests {
         assert_eq!(page, visible);
         assert_eq!(help_scroll(page, KeyCode::PageUp, width, height, ""), 0);
         assert_eq!(help_scroll(0, KeyCode::Up, width, height, ""), 0);
+
+        let app = App {
+            help: Some(0),
+            ..App::default()
+        };
+        for (width, controls) in [(24, "Esc Back · ↑↓ Scroll"), (20, "Esc Back · ↑↓")] {
+            let mut output = Vec::new();
+            app.draw(&mut output, width, height).unwrap();
+            assert!(String::from_utf8(output)
+                .unwrap()
+                .ends_with(&format!("\x1b[7;1H{controls}")));
+        }
 
         let narrow_end = help_scroll(0, KeyCode::End, width, height, "");
         let wide_end = help_scroll(0, KeyCode::End, 80, 24, "");
