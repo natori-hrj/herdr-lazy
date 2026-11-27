@@ -19,7 +19,7 @@ lto = "thin"
 name = "herdr-lazy"
 path = "src/main.rs"
 
-# The manager orchestrates the herdr CLI and uses platform flags for safe cache opens.
+# The manager uses the Herdr CLI for plugin operations.
 # TUI dependencies provide raw terminal input and Unicode display-cell widths.
 #
 # crossterm provides terminal input and lets the UI draw directly to a terminal.
@@ -27,9 +27,9 @@ path = "src/main.rs"
 crossterm = { version = "0.29", default-features = false, features = ["events"] }
 unicode-width = { version = "0.2", default-features = false }
 
-# Open cache files without blocking on a Unix special file before inspecting the handle.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+rustix = { version = "1.1", features = ["event", "fs"] }
 
 # crossterm's `windows` feature is not optional on Windows — it gates the
 # winapi/crossterm_winapi backends, and the crate hard-fails the build with
@@ -39,3 +39,4 @@ libc = "0.2"
 # here keeps the Unix dependency graph exactly as it was.
 [target.'cfg(windows)'.dependencies]
 crossterm = { version = "0.29", default-features = false, features = ["events", "windows"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Threading"] }
