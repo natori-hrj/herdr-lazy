@@ -20,7 +20,7 @@ fn cell_width(ch: char) -> usize {
     }
 }
 
-fn clip(text: &str, columns: usize) -> (String, usize) {
+pub(super) fn clip(text: &str, columns: usize) -> (String, usize) {
     let mut line = String::new();
     let mut width = 0;
     if columns == 0 {
