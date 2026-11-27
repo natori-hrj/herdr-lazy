@@ -1,9 +1,10 @@
-use super::terminal_text::{clip, finish_selection, start_selection};
 use std::io::{self, Write};
 
 use crate::theme::{Color, Selection};
 
-use super::{footer_start_row, rule_line, App, Role, Row, Status, Theme, LIST_TOP};
+use super::list_columns::Columns;
+use super::terminal_text::{clip, finish_selection, start_selection};
+use super::{footer_start_row, rule_line, App, Role, Row, Status, LIST_TOP};
 
 pub(super) fn list_top(height: u16) -> usize {
     if height < 7 {
@@ -31,78 +32,114 @@ fn status_label(status: &Status, compact: bool) -> &'static str {
     }
 }
 
-fn row_line(
-    out: &mut impl Write,
-    row: &Row,
-    selection: Option<Selection>,
-    picked: bool,
-    columns: usize,
-    theme: Theme,
-) -> io::Result<()> {
-    let focused = selection.is_some();
-    let pointer = if focused { "> " } else { "  " };
-    let compact = columns < 23;
-    let checkbox = match (picked, row.picked) {
-        (true, true) => "[x] ",
-        (true, false) => "[ ] ",
-        _ => "",
-    };
-    let status_width = if compact { 3 } else { 10 };
-    let prefix_width = pointer.len() + checkbox.len() + status_width + 4;
-    if columns < 12 || columns <= prefix_width {
-        let prefix = match (focused, row.picked) {
-            (true, true) => "+",
-            (true, false) => ">",
-            (false, true) => "*",
-            (false, false) => " ",
-        };
-        let (label, _) = clip(&row.label, columns - 1);
-        return write!(out, "{prefix}{label}");
-    }
-    let status = status_label(&row.status, compact);
-    let warning = if row.herdr_warning.is_some() {
-        '!'
-    } else {
-        ' '
-    };
-    let disabled = if row.enabled == Some(false) && row.status != Status::Disabled {
-        '-'
-    } else {
-        ' '
-    };
-    let update = if row.maybe_stale { '^' } else { ' ' };
-    let commit_width = if columns >= 64 { 16 } else { 0 };
-    let available = columns - prefix_width - commit_width;
-    let name_width = if columns >= 96 {
-        available.min(40)
-    } else {
-        available
-    };
-    let (name, name_cells) = clip(&row.label, name_width);
-    let emphasized = if focused { "\x1b[1m" } else { "" };
-    let dim = if focused { "" } else { "\x1b[2m" };
-    let foreground = selection.map_or(Color::Ansi(39), Selection::foreground);
-    let color = theme.color(row.status.role());
-    let color = selection.map_or(color, |selection| selection.status_color(color));
-    write!(
-        out,
-        "{pointer}{checkbox}{color}{status:<status_width$}{foreground}{warning}{disabled}{update} {emphasized}{name}\x1b[22m"
-    )?;
+fn markers(row: &Row) -> [char; 3] {
+    [
+        if row.herdr_warning.is_some() {
+            '!'
+        } else {
+            ' '
+        },
+        if row.enabled == Some(false) && row.status != Status::Disabled {
+            '-'
+        } else {
+            ' '
+        },
+        if row.maybe_stale { '^' } else { ' ' },
+    ]
+}
 
-    if commit_width > 0 {
-        let commit = row
-            .commit
-            .as_deref()
-            .map(crate::short)
-            .unwrap_or_else(|| "-".to_string());
-        let (commit, cells) = clip(&commit, commit_width - 4);
-        let pad = name_width - name_cells + 2;
-        write!(out, "{:pad$}{dim}{commit}\x1b[22m", "")?;
-        let notes_width = available.saturating_sub(name_width);
-        if notes_width > 0 {
-            let (note, _) = clip(&row.trailing_text(), notes_width);
-            let pad = commit_width - 2 - cells;
-            write!(out, "{:pad$}{dim}{note}\x1b[22m", "")?;
+fn compact_pointer(focused: bool, picked: bool) -> &'static str {
+    match (focused, picked) {
+        (true, true) => "+",
+        (true, false) => ">",
+        (false, true) => "*",
+        (false, false) => " ",
+    }
+}
+
+fn draw_rows(app: &App, out: &mut impl Write, columns: usize, height: u16) -> io::Result<()> {
+    let picked = app.any_picked();
+    let (visible, start) = app.list_window(height);
+    let rows = app.rows.get(start..).unwrap_or_default();
+    let rows = &rows[..visible.min(rows.len())];
+    let top = list_top(height);
+    let compact = columns < 23;
+    let status_width = rows
+        .iter()
+        .map(|row| status_label(&row.status, compact).len())
+        .max()
+        .unwrap_or(0);
+    let show_markers = rows.iter().any(|row| markers(row) != [' '; 3]);
+    let selector_width = 2 + usize::from(picked) * 4;
+    let state_width = status_width + usize::from(show_markers) * 3;
+    let narrow = columns < 12 || columns < selector_width + state_width + 1;
+    let prefix = if narrow { 1 } else { selector_width } + state_width;
+    let details: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            if narrow {
+                return (String::new(), String::new());
+            }
+            let commit = row.commit.as_deref().map(crate::short).unwrap_or_default();
+            (commit, row.trailing_text())
+        })
+        .collect();
+    let layout = Columns::new(
+        columns.saturating_sub(prefix + 1),
+        rows.iter()
+            .zip(&details)
+            .map(|(row, (commit, note))| (row.label.as_str(), commit.as_str(), note.as_str())),
+    );
+    for (offset, (row, (commit, note))) in rows.iter().zip(&details).enumerate() {
+        let focused = start + offset == app.cursor;
+        let selection = focused.then(|| app.theme.selection());
+        write!(out, "\x1b[{};1H", top + offset + 1)?;
+        if let Some(selection) = selection {
+            start_selection(out, selection, columns)?;
+        }
+        let pointer = if narrow {
+            compact_pointer(focused, row.picked)
+        } else if focused {
+            "> "
+        } else {
+            "  "
+        };
+        if columns < prefix {
+            let (label, _) = clip(&row.label, columns - 1);
+            write!(out, "{pointer}{label}")?;
+        } else {
+            let checkbox = match (picked && !narrow, row.picked) {
+                (true, true) => "[x] ",
+                (true, false) => "[ ] ",
+                _ => "",
+            };
+            let status = status_label(&row.status, compact);
+            let color = app.theme.color(row.status.role());
+            let color = selection.map_or(color, |selection| selection.status_color(color));
+            let foreground = selection.map_or(Color::Ansi(39), Selection::foreground);
+            write!(
+                out,
+                "{pointer}{checkbox}{color}{status:<status_width$}{foreground}"
+            )?;
+            if show_markers {
+                let [warning, disabled, update] = markers(row);
+                write!(out, "{warning}{disabled}{update}")?;
+            }
+            if columns > prefix {
+                let (name, cells) = clip(&row.label, layout.name);
+                let emphasized = if focused { "\x1b[1m" } else { "" };
+                write!(out, " {emphasized}{name}\x1b[22m")?;
+                layout.write_tail(
+                    out,
+                    layout.name - cells,
+                    if commit.is_empty() { "-" } else { commit },
+                    note,
+                    focused,
+                )?;
+            }
+        }
+        if focused {
+            finish_selection(out)?;
         }
     }
     Ok(())
@@ -155,19 +192,7 @@ pub(super) fn draw(app: &App, out: &mut impl Write, width: u16, height: u16) -> 
         );
         write!(out, "\x1b[{};1H{message}", top + 1)?;
     } else {
-        let picked = app.any_picked();
-        let (visible, start) = app.list_window(height);
-        for (offset, row) in app.rows.iter().skip(start).take(visible).enumerate() {
-            write!(out, "\x1b[{};1H", top + offset + 1)?;
-            let selection = (start + offset == app.cursor).then(|| app.theme.selection());
-            if let Some(selection) = selection {
-                start_selection(out, selection, columns)?;
-            }
-            row_line(out, row, selection, picked, columns, app.theme)?;
-            if selection.is_some() {
-                finish_selection(out)?;
-            }
-        }
+        draw_rows(app, out, columns, height)?;
     }
 
     if top > 0 {
@@ -227,6 +252,81 @@ mod tests {
     use super::*;
 
     #[test]
+    fn adaptive_manage_shows_notes_alongside_short_and_long_names() {
+        let app = App {
+            rows: super::super::rows(
+                &[
+                    crate::Spec::parse("owner/a"),
+                    crate::Spec::parse(
+                        "owner/a-very-long-plugin-name-that-could-take-the-entire-terminal",
+                    ),
+                ],
+                &[],
+            ),
+            cursor: 1,
+            ..App::default()
+        };
+        for (width, height) in [(40, 9), (40, 11), (80, 24), (100, 30), (160, 48)] {
+            let mut output = Vec::new();
+            app.draw(&mut output, width, height).unwrap();
+            let frame = String::from_utf8(output).unwrap();
+            for (index, name) in ["owner/a", "owner/a-very"].into_iter().enumerate() {
+                let position = format!("\x1b[{};1H", 3 + index);
+                let line = frame
+                    .split_once(&position)
+                    .unwrap()
+                    .1
+                    .split(";1H")
+                    .next()
+                    .unwrap();
+                assert!(
+                    line.contains("Missing") && line.contains(name),
+                    "{width}x{height}: {line:?}"
+                );
+                assert!(line.contains("in your"), "{width}x{height}: {line:?}");
+                assert_eq!(app.row_at(2 + index as u16, height), Some(index));
+            }
+        }
+    }
+
+    #[test]
+    fn picked_manage_row_keeps_status_and_markers_at_narrow_widths() {
+        let mut rows = super::super::rows(&[crate::Spec::parse("owner/plugin")], &[]);
+        let row = &mut rows[0];
+        row.status = Status::Drifted {
+            have: "abc123".into(),
+        };
+        row.picked = true;
+        row.enabled = Some(false);
+        row.maybe_stale = true;
+        row.herdr_warning = Some(super::super::HerdrVersionWarning {
+            required: crate::HerdrVersion::parse("0.8.0").unwrap(),
+            running: crate::HerdrVersion::parse("0.7.4").unwrap(),
+        });
+        let app = App {
+            rows,
+            ..App::default()
+        };
+
+        for (width, expected) in [(14, "> [x] DRF!-^"), (13, "+DRF!-^ own"), (8, "+DRF!-^")] {
+            let mut frame = Vec::new();
+            app.draw(&mut frame, width, 2).unwrap();
+            let frame = String::from_utf8(frame).unwrap();
+            let (_, line) = frame.split_once("\x1b[1;1H").unwrap();
+            let mut segments = line.rsplit("\x1b[1G").next().unwrap().split("\x1b[");
+            let mut visible = segments.next().unwrap().to_string();
+            for segment in segments {
+                visible.push_str(segment.split_once('m').unwrap().1);
+            }
+            assert!(
+                visible.starts_with(expected),
+                "{width} columns: {visible:?}"
+            );
+            assert!(visible.chars().map(cell_width).sum::<usize>() < usize::from(width));
+        }
+    }
+
+    #[test]
     fn managed_rows_stay_inside_their_columns() {
         let mut row = super::super::rows(&[crate::Spec::parse("owner/japanese")], &[])
             .pop()
@@ -234,20 +334,16 @@ mod tests {
         row.label = "日本語のプラグイン💡名前の長い名前".repeat(5);
         row.commit = Some("af06d0ad3fd99dc06027de187f1369328bf2d455".into());
         row.picked = true;
+        let app = App {
+            rows: vec![row],
+            ..App::default()
+        };
         for columns in [1, 10, 16, 24, 39, 63, 64, 95, 96, 132] {
             let mut output = Vec::new();
-            let theme = Theme::default();
-            row_line(
-                &mut output,
-                &row,
-                Some(theme.selection()),
-                true,
-                columns,
-                theme,
-            )
-            .unwrap();
+            draw_rows(&app, &mut output, columns, 2).unwrap();
             let output = String::from_utf8(output).unwrap();
-            let mut segments = output.split("\x1b[");
+            let line = output.strip_prefix("\x1b[1;1H").unwrap();
+            let mut segments = line.rsplit("\x1b[1G").next().unwrap().split("\x1b[");
             let mut visible = segments.next().unwrap().to_string();
             for segment in segments {
                 visible.push_str(segment.split_once('m').unwrap().1);
@@ -258,7 +354,6 @@ mod tests {
                 assert!(visible.contains("Missing"));
                 assert!(visible.contains("> [x]"));
             }
-            assert_eq!(visible.contains("af06d0ad3fd9"), columns >= 64);
         }
     }
 }

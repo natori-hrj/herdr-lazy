@@ -19,6 +19,7 @@ use std::{
 };
 
 mod command_palette;
+mod list_columns;
 mod managed_list;
 mod marketplace;
 mod plugin_detail;
@@ -1171,7 +1172,13 @@ impl AdoptPicker {
     }
 }
 
-type MarketplaceResult = Result<(Vec<crate::registry::Entry>, String), String>;
+struct MarketplaceUpdate {
+    entries: Vec<crate::registry::Entry>,
+    note: String,
+    installed: Option<Vec<Installed>>,
+}
+
+type MarketplaceResult = Result<MarketplaceUpdate, String>;
 
 /// `Default` so tests can build one from just the rows they care about; this struct grows a
 /// field per view, and every fixture should not have to know about all of them.
@@ -1198,6 +1205,7 @@ struct App {
     last_event: Option<crate::context::PluginEvent>,
     /// Present while the marketplace browser is open; the pane draws that instead of the list.
     browser: Option<crate::browse::Browser>,
+    marketplace_installed: Option<Vec<Installed>>,
     marketplace_refresh: Option<Receiver<MarketplaceResult>>,
     /// Present while the extras picker is open, for the same reason.
     extras: Option<ExtrasPicker>,
@@ -1287,6 +1295,7 @@ impl App {
                 context_warning: context_warning.clone(),
                 last_event: last_event.clone(),
                 browser: None,
+                marketplace_installed: Some(installed),
                 marketplace_refresh: None,
                 extras: None,
                 recommendations: None,
@@ -1318,6 +1327,7 @@ impl App {
                 context_warning,
                 last_event,
                 browser: None,
+                marketplace_installed: None,
                 marketplace_refresh: None,
                 extras: None,
                 recommendations: None,
@@ -2268,12 +2278,23 @@ impl App {
                 Some(cache) => (cache.entries, cache.note, cache.fresh),
                 None => (Vec::new(), String::new(), false),
             };
-            self.browser = Some(crate::browse::Browser::new(entries, note, listed));
+            self.browser = Some(crate::browse::Browser::new(
+                entries,
+                note,
+                listed,
+                self.marketplace_installed.as_deref(),
+            ));
             if fresh && !force_refresh {
                 return;
             }
         }
-        self.start_marketplace_refresh(move || crate::registry::load(force_refresh));
+        self.start_marketplace_refresh(move || {
+            crate::registry::load(force_refresh).map(|(entries, note)| MarketplaceUpdate {
+                entries,
+                note,
+                installed: installed_plugins().ok(),
+            })
+        });
     }
 
     fn start_marketplace_refresh(
@@ -2318,7 +2339,14 @@ impl App {
             return;
         };
         match result {
-            Ok((entries, note)) => browser.replace_entries(entries, note),
+            Ok(update) => {
+                self.marketplace_installed = update.installed;
+                browser.replace_entries(
+                    update.entries,
+                    update.note,
+                    self.marketplace_installed.as_deref(),
+                );
+            }
             Err(error) => {
                 browser.source_note = format!("refresh failed: {}", sanitize_log_output(&error));
             }
@@ -4425,6 +4453,15 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                 KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.open_browser(true)
                 }
+                KeyCode::Char('f') if key.modifiers == KeyModifiers::CONTROL => {
+                    app.browser.as_mut().unwrap().cycle_install_filter();
+                }
+                KeyCode::Char('n') if key.modifiers == KeyModifiers::CONTROL => {
+                    app.browser.as_mut().unwrap().toggle_sort();
+                }
+                KeyCode::Char('l') if key.modifiers == KeyModifiers::CONTROL => {
+                    app.browser.as_mut().unwrap().reset();
+                }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     return Ok(())
                 }
@@ -4433,9 +4470,6 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                     app.browser.as_mut().unwrap().push(c);
                 }
                 _ => {}
-            }
-            if let Some(b) = app.browser.as_mut() {
-                b.clamp();
             }
             continue;
         }
@@ -4648,6 +4682,7 @@ mod tests {
             vec![marketplace_entry("owner/a")],
             "cached".into(),
             vec!["owner/a".into()],
+            Some(&[]),
         ));
         let frame = draw_list_frame(&app, 120);
         let marketplace = list_frame_row(&frame, 4);
@@ -4686,6 +4721,7 @@ mod tests {
                 vec![entry],
                 "cached".into(),
                 Vec::new(),
+                Some(&[]),
             )),
             ..App::default()
         };
@@ -4734,6 +4770,7 @@ mod tests {
                             vec![marketplace_entry("owner/a"), marketplace_entry("owner/b")],
                             "cached".into(),
                             vec!["owner/a".into(), "owner/b".into()],
+                            Some(&[]),
                         )
                     }),
                     theme,
@@ -4791,37 +4828,63 @@ mod tests {
     #[test]
     fn marketplace_completion_keeps_query_and_selected_plugin() {
         let (send, receive) = mpsc::channel();
+        let installed = [
+            installed_at("OWNER", "worktree-one", 0),
+            installed_at("owner", "worktree-two", 0),
+        ];
         let mut app = App {
             browser: Some(crate::browse::Browser::new(
                 vec![
                     marketplace_entry("owner/worktree-one"),
                     marketplace_entry("owner/worktree-two"),
+                    marketplace_entry("owner/worktree-three"),
                 ],
                 "cached".to_string(),
-                Vec::new(),
+                vec!["owner/worktree-three".to_string()],
+                Some(&installed),
             )),
             marketplace_refresh: Some(receive),
             ..Default::default()
         };
         let browser = app.browser.as_mut().unwrap();
-        browser.query = "worktree".to_string();
+        browser.query = "WoRkTrEe".to_string();
         browser.category = Some("worktree");
+        browser.cycle_install_filter();
+        browser.toggle_sort();
+        assert_eq!(browser.results().len(), 2);
         browser.move_down();
 
         assert!(!app.poll_marketplace());
-        send.send(Ok((
-            vec![
-                marketplace_entry("owner/worktree-two"),
+        send.send(Ok(MarketplaceUpdate {
+            entries: vec![
+                marketplace_entry("OWNER/WORKTREE-TWO"),
+                marketplace_entry("owner/worktree-one"),
                 marketplace_entry("owner/note"),
+                marketplace_entry("owner/worktree-three"),
             ],
-            "just refreshed".to_string(),
-        )))
+            note: "just refreshed".to_string(),
+            installed: Some(vec![
+                installed_at("owner", "worktree-two", 0),
+                installed_at("owner", "worktree-three", 0),
+            ]),
+        }))
         .unwrap();
         assert!(app.poll_marketplace());
         let browser = app.browser.as_ref().unwrap();
-        assert_eq!(browser.query, "worktree");
+        assert_eq!(browser.query, "WoRkTrEe");
         assert_eq!(browser.category, Some("worktree"));
-        assert_eq!(browser.selected().unwrap().full_name, "owner/worktree-two");
+        assert_eq!(browser.install_filter_label(), "installed");
+        assert_eq!(browser.sort_label(), "name");
+        assert_eq!(
+            browser
+                .results()
+                .iter()
+                .map(|entry| entry.full_name.as_str())
+                .collect::<Vec<_>>(),
+            ["owner/worktree-three", "OWNER/WORKTREE-TWO"],
+        );
+        assert_eq!(browser.cursor, 1);
+        assert_eq!(browser.selected().unwrap().full_name, "OWNER/WORKTREE-TWO");
         assert_eq!(browser.source_note, "just refreshed");
         assert!(!app.poll_marketplace());
     }
@@ -4834,12 +4897,90 @@ mod tests {
             ..Default::default()
         };
         app.start_marketplace_refresh(|| unreachable!("another request is already running"));
-        send.send(Ok((Vec::new(), "just refreshed".to_string())))
-            .unwrap();
+        send.send(Ok(MarketplaceUpdate {
+            entries: Vec::new(),
+            note: "just refreshed".to_string(),
+            installed: Some(Vec::new()),
+        }))
+        .unwrap();
 
         assert!(!app.poll_marketplace());
         assert!(app.browser.is_none());
         assert!(app.marketplace_refresh.is_none());
+    }
+
+    #[test]
+    fn marketplace_inventory_failure_invalidates_filters_and_recovers_selection() {
+        let installed = vec![
+            installed_at("owner", "worktree-one", 0),
+            installed_at("owner", "worktree-two", 0),
+        ];
+        let entries = || {
+            vec![
+                marketplace_entry("owner/worktree-one"),
+                marketplace_entry("owner/worktree-two"),
+                marketplace_entry("owner/worktree-three"),
+            ]
+        };
+        let mut app = App {
+            browser: Some(crate::browse::Browser::new(
+                entries(),
+                "cached".to_string(),
+                Vec::new(),
+                Some(&installed),
+            )),
+            marketplace_installed: Some(installed.clone()),
+            ..Default::default()
+        };
+        let browser = app.browser.as_mut().unwrap();
+        browser.cycle_install_filter();
+        browser.move_down();
+        assert_eq!(browser.selected().unwrap().full_name, "owner/worktree-two");
+
+        for _ in 0..2 {
+            app.apply_marketplace_result(Ok(MarketplaceUpdate {
+                entries: entries(),
+                note: "just refreshed".to_string(),
+                installed: None,
+            }));
+            let mut failed = Vec::new();
+            app.draw_browser(&mut failed, 40, 12).unwrap();
+            let failed = String::from_utf8(failed).unwrap();
+            assert!(failed.contains("Install state unavailable"), "{failed:?}");
+            assert!(!failed.contains("2/3"), "{failed:?}");
+            assert!(app.browser.as_ref().unwrap().selected().is_none());
+            assert!(app.marketplace_installed.is_none());
+        }
+
+        app.apply_marketplace_result(Ok(MarketplaceUpdate {
+            entries: entries(),
+            note: "just refreshed".to_string(),
+            installed: Some(installed),
+        }));
+        let browser = app.browser.as_mut().unwrap();
+        assert_eq!(browser.install_filter_label(), "installed");
+        assert_eq!(browser.selected().unwrap().full_name, "owner/worktree-two");
+
+        app.apply_marketplace_result(Ok(MarketplaceUpdate {
+            entries: entries(),
+            note: "just refreshed".to_string(),
+            installed: None,
+        }));
+        let browser = app.browser.as_mut().unwrap();
+        browser.cycle_install_filter();
+        assert_eq!(browser.install_filter_label(), "not installed");
+        assert!(browser.results().is_empty());
+        browser.cycle_install_filter();
+        assert_eq!(browser.results().len(), 3);
+        assert!(browser
+            .results()
+            .iter()
+            .all(|entry| !browser.is_installed(entry)));
+        let mut unfiltered = Vec::new();
+        app.draw_browser(&mut unfiltered, 40, 12).unwrap();
+        assert!(String::from_utf8(unfiltered)
+            .unwrap()
+            .contains("Install state unavailable"));
     }
 
     #[test]
@@ -4850,6 +4991,7 @@ mod tests {
                 Vec::new(),
                 String::new(),
                 Vec::new(),
+                Some(&[]),
             )),
             marketplace_refresh: Some(receive),
             ..Default::default()
