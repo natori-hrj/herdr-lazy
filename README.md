@@ -137,6 +137,13 @@ herdr-lazy() {
 }
 ```
 
+The Manage list keeps status visible in narrow panes and shows commit and detail columns
+when there is room. A `>` points to the focused plugin, `[x]` marks a bulk selection,
+`^` flags repository activity since install, and `!` flags a newer Herdr requirement.
+Press `l` for the focused plugin's details. In very narrow panes, the status labels
+shorten to `OK` (installed), `MIS` (missing), `DRF` (drifted), `UNV` (unverified),
+`OFF` (disabled), `EXT` (unlisted), `LNK` (local link), or `MGR` (herdr-lazy).
+
 ```sh
 herdr-lazy init          # write the curated default list
 herdr-lazy list          # show what the list asks for
@@ -700,9 +707,8 @@ the rest still needs design.
 
 - **Rust, and nearly dependency-free.** The manager is orchestration — shelling out to
   the herdr CLI — which std covers, including a small hand-written JSON reader for
-  `plugin list --json`. The one dependency is `crossterm`, because std cannot put a
-  terminal into raw mode and the manage pane needs it. Not ratatui: the UI is a list
-  with a status column, and ratatui costs 70 crates against crossterm's 19.
+  `plugin list --json`. The UI uses `crossterm` for terminal input and `unicode-width`
+  to keep CJK names and emoji within the visible Manage columns.
 - **Never parse human output.** All state comes from `herdr plugin list --json`.
 - **Long operations leave the TUI** rather than being redrawn as in-pane progress, so
   a failing plugin build shows you its actual output.
