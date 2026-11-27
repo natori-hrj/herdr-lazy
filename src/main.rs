@@ -25,6 +25,7 @@
 mod browse;
 mod category;
 mod context;
+mod download;
 mod extras;
 mod github;
 mod json;
@@ -40,18 +41,10 @@ mod ui;
 use std::env;
 use std::fmt;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-
-/// Read an external command's stdout without allowing an untrusted response to grow memory
-/// without bound. `None` means the response exceeded the limit.
-pub(crate) fn read_limited(reader: impl Read, max_bytes: u64) -> io::Result<Option<Vec<u8>>> {
-    let mut body = Vec::new();
-    reader.take(max_bytes + 1).read_to_end(&mut body)?;
-    Ok(((body.len() as u64) <= max_bytes).then_some(body))
-}
 
 /// Curated "batteries-included" default set — the distro layer.
 ///
@@ -5208,14 +5201,5 @@ command = "something.else"
             "README does not say `{}`",
             promised
         );
-    }
-
-    #[test]
-    fn external_responses_are_rejected_above_the_limit() {
-        let exact = std::io::Cursor::new(b"1234");
-        assert_eq!(read_limited(exact, 4).unwrap(), Some(b"1234".to_vec()));
-
-        let oversized = std::io::Cursor::new(b"12345");
-        assert_eq!(read_limited(oversized, 4).unwrap(), None);
     }
 }

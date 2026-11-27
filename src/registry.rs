@@ -13,16 +13,13 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::json;
 
 const INDEX_URL: &str = "https://assets.herdr.dev/plugins/index.json";
 // The public index already approaches 2 MiB and grows as new repositories are listed.
-const MAX_INDEX_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_INDEX_BYTES: usize = 8 * 1024 * 1024;
 
 /// How long a cached copy is considered good.
 ///
@@ -230,52 +227,15 @@ fn cache_age_seconds(path: &Path) -> Option<u64> {
     modified.elapsed().ok().map(|d| d.as_secs())
 }
 
-/// Read stdout and wait for a successful exit before the shared download deadline.
-fn download_output(prog: &str, args: &[&str], deadline: Instant) -> Option<Vec<u8>> {
-    if Instant::now() >= deadline {
-        return None;
-    }
-    let mut child = Command::new(prog)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let (send, receive) = mpsc::channel();
-    let reader = child.stdout.take().map(|stdout| {
-        thread::Builder::new().spawn(move || {
-            let body = crate::read_limited(stdout, MAX_INDEX_BYTES);
-            let _ = send.send(body);
-        })
-    });
-    if matches!(reader, Some(Ok(_))) {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if let Ok(Ok(Some(body))) = receive.recv_timeout(remaining) {
-            while Instant::now() < deadline {
-                match child.try_wait() {
-                    Ok(Some(status)) => return status.success().then_some(body),
-                    Ok(None) => thread::sleep(
-                        deadline
-                            .saturating_duration_since(Instant::now())
-                            .min(Duration::from_millis(10)),
-                    ),
-                    Err(_) => break,
-                }
-            }
-        }
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-    None
-}
-
 /// Download the index. Shells out, because std has no TLS — the same reasoning that has the
 /// install script use curl.
 fn download() -> Result<String, String> {
     let deadline = Instant::now() + Duration::from_secs(20);
     let attempt = |prog: &str, args: &[&str]| -> Option<String> {
-        let body = download_output(prog, args, deadline)?;
+        let (status, body) = crate::download::capture(prog, args, MAX_INDEX_BYTES, deadline)?;
+        if !status.success() {
+            return None;
+        }
         let body = String::from_utf8_lossy(&body).to_string();
         (!body.trim().is_empty()).then_some(body)
     };
@@ -470,27 +430,6 @@ mod tests {
         ));
         fs::create_dir(&dir).unwrap();
         dir
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn download_deadline_bounds_pipe_read_and_child_exit() {
-        for command in ["exec sleep 3", "exec 1>&-; exec sleep 3"] {
-            let start = Instant::now();
-            let deadline = start + Duration::from_millis(50);
-            assert!(download_output("sh", &["-c", command], deadline).is_none());
-            assert!(start.elapsed() < Duration::from_secs(2));
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn download_output_returns_bytes_from_successful_command() {
-        let deadline = Instant::now() + Duration::from_secs(3);
-        assert_eq!(
-            download_output("sh", &["-c", "printf index"], deadline).as_deref(),
-            Some(b"index".as_slice())
-        );
     }
 
     #[test]
