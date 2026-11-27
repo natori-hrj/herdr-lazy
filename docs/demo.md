@@ -30,9 +30,9 @@ terminal window. Use the same terminal font, dimensions and palette for
 before/after images. Keep screenshots of real workspaces free of private paths
 and repository names.
 
-### Theme screenshots for a release candidate
+### Theme screenshots
 
-If the candidate supports `HERDR_LAZY_THEME`, use a fixed 80×24 frame for
+With v0.45.0 or later, use a fixed 80×24 frame for
 comparable screenshots. Record each built-in palette and pause on the same
 view and timestamp:
 
@@ -48,11 +48,10 @@ Marketplace search. A pre-theme release can record the same screens with the
 terminal's default palette. The cast records color escape sequences, so use a
 true-color terminal when comparing presets.
 
-### Candidate-only recordings
+### Command palette, theme picker, and cache refresh
 
-The default workflow is the demo for released builds. These modes require a
-development build that includes the named feature. Build the candidate checkout
-and pass that binary to the recorder:
+These modes use features introduced in v0.45.0. Build that version or a later
+checkout and pass its binary to the recorder:
 
 ```sh
 cargo build --release --locked
@@ -62,7 +61,7 @@ for mode in palette theme cached-marketplace; do
 done
 ```
 
-| Mode | Candidate feature | Frames to compare |
+| Mode | Feature | Frames to compare |
 | --- | --- | --- |
 | `palette` | Command palette | At 2 s, Ctrl+P opens Commands. At 5 s the query narrows to Browse Marketplace, which opens at 9 s. |
 | `theme` | Interactive theme picker | At 2 s, `T` opens the picker. At 5 s it previews Catppuccin and at 9 s Enter applies it to the fixture. |

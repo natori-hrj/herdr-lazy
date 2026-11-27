@@ -6,7 +6,7 @@ section applies only to changes included in the selected release.
 
 ## GitHub release draft
 
-**herdr-lazy {version}**
+**herdr-lazy v0.45.0**
 
 herdr-lazy lets you manage Herdr plugins from one pane. Use `/` to browse the
 Marketplace, `l` to inspect a plugin's declared actions, and `?` to see the
@@ -25,7 +25,7 @@ herdr plugin install natori-hrj/herdr-lazy
 Restart Herdr and open Manage with `prefix+shift+l` on a fresh setup, or use
 `herdr plugin pane open --plugin herdr-lazy --entrypoint manage --focus`.
 
-### Candidate changes to include after merge
+### What's new in v0.45.0
 
 - Manage adapts to terminal width, with explicit text statuses and a visible selection.
   Help scrolls in short panes.
@@ -35,13 +35,13 @@ Restart Herdr and open Manage with `prefix+shift+l` on a fresh setup, or use
 - Detail scrolls while preserving action focus. You can inspect the locally known
   repository, resolved commit, listed ref, and Herdr version compatibility.
 - Terminal default, Catppuccin, Tokyo Night, Gruvbox, Nord, and custom color presets
-  are available through `HERDR_LAZY_THEME`. If included in the verified build,
-  `T` previews and saves a theme and Ctrl+P opens the command palette.
-- The offline recorder has separate candidate-only flows for the command palette,
-  theme picker, and cached Marketplace refresh. The default workflow remains
-  available for the current release.
+  are available through `HERDR_LAZY_THEME`. Use `T` to preview and save a theme, or Ctrl+P to open the command palette.
+- The offline recorder has separate flows for the command palette,
+  theme picker, and cached Marketplace refresh. The default workflow covers Manage, details, and Marketplace.
 
-The candidate also bounds JSON nesting, Marketplace cache reads, response
+Run `herdr-lazy --version` or `herdr-lazy -V` to check your installed build.
+
+This release also bounds JSON nesting, Marketplace cache reads, response
 sizes, and shared downloader deadlines. A failed refresh preserves a valid cache.
 
 See [the final candidate report](release-v0.45.0.md) for the build SHA,

@@ -1,14 +1,15 @@
 # v0.45.0 candidate verification
 
-The candidate is main at [`45b84cbc3044eb3848c19007812a2b04eaab9399`](https://github.com/natori-hrj/herdr-lazy/commit/45b84cbc3044eb3848c19007812a2b04eaab9399).
-Its Git tree `5c84a07f84a3a972bda29313b500883b8b506c5a` matches Astra's reviewed candidate
-[`1b1877d4019750ae6bfadec5d2c20450e762f3e9`](https://github.com/natori-hrj/herdr-lazy/commit/1b1877d4019750ae6bfadec5d2c20450e762f3e9),
-including Cargo.lock. Main still carries v0.44.4 version fields pending the release stamp.
-See the [candidate changelog](../CHANGELOG.md) for the release changes.
+The final executable source before the release stamp is [`9c8d65853c0b5015c84b32360d9771388c86a79c`](https://github.com/natori-hrj/herdr-lazy/commit/9c8d65853c0b5015c84b32360d9771388c86a79c).
+The only executable source change since [Astra's reviewed candidate](https://github.com/natori-hrj/herdr-lazy/commit/1b1877d4019750ae6bfadec5d2c20450e762f3e9)
+is the CLI version reporting added by [#125](https://github.com/natori-hrj/herdr-lazy/pull/125). The audited
+security sources and dependency versions are unchanged. See the
+[candidate changelog](../CHANGELOG.md) for the release changes.
 
 ## Terminal captures and recordings
 
-These 80×24 captures use the actual candidate binary with fictional plugin data.
+These 80×24 captures use the security-integrated main build `45b84cbc3044eb3848c19007812a2b04eaab9399`
+with fictional plugin data. The subsequent CLI version flags leave the TUI unchanged.
 
 ![Marketplace search using cached results](screenshots/v0450-marketplace.png)
 
@@ -27,7 +28,7 @@ The [demo guide](demo.md) includes the recording commands and theme captures.
 
 ## Performance
 
-Baseline: v0.44.4 (`065f6cdb20b73d432435c57783c99ac5c9f3cf81`). Candidate: the main SHA above.
+Baseline: v0.44.4 (`065f6cdb20b73d432435c57783c99ac5c9f3cf81`). Measured candidate: `45b84cbc3044eb3848c19007812a2b04eaab9399`.
 Both are locked Rust 1.99.0 release builds measured in a 120×24 Linux x86_64 PTY
 (kernel 7.2.15-4-omarchy) on an AMD Ryzen AI 5 PRO 340 with a stub Herdr and
 1,000 fictional entries.
@@ -52,27 +53,29 @@ observations under this fixture. The comparison does not estimate live HTTPS
 latency or promise gains across systems.
 
 Use `scripts/benchmark-pty.py` to repeat the fresh-cache startup and search
-measurements. The Marketplace setup uses the same fixture, a stale cache mtime,
+measurements. The Marketplace setup used the same fixture, a stale cache mtime,
 a local curl stub and timestamps for the first complete Marketplace footer
 and the first complete footer with the distinct refreshed row.
 
 ## Verification and rehearsal
 
-- [Final main CI](https://github.com/natori-hrj/herdr-lazy/actions/runs/45957154644): Linux musl, macOS arm64, Windows MSVC,
-  Rust 1.78.0 and RustSec passed.
-- Linux local: Stable and Rust 1.78.0 tests, formatting, strict Clippy, locked
-  GNU and musl builds, and PTY interaction and security regressions passed.
-  macOS and Windows results are from CI.
-- Offline regression checks covered the JSON nesting boundary, bounded cache
-  reads and invalid UTF-8, bounded downloader output and shared deadlines,
-  recovery and cache preservation, direct-child reaping, and terminal restoration.
-- The isolated release dry-run and release workflow static validation passed.
-  Version stamping updated Cargo.toml,
-  Cargo.lock and herdr-plugin.toml. Both Linux targets built with the stamped
-  lockfile. Their packaged archives passed SHA-256 verification, extraction,
-  byte comparison, and an extracted-binary CLI smoke test. The CLI currently
-  has no version command. Cargo metadata, the manifest and the package name
-  supplied the version evidence.
+- [Security-integrated main CI](https://github.com/natori-hrj/herdr-lazy/actions/runs/45957154644)
+  and [CLI-integrated main CI](https://github.com/natori-hrj/herdr-lazy/actions/runs/45960106155) cover
+  Linux musl, macOS arm64, Windows MSVC, Rust 1.78.0, and RustSec.
+- Linux local verification covered Stable and Rust 1.78.0 tests, formatting,
+  strict Clippy, locked GNU and musl builds, and PTY interaction and security
+  regressions. The macOS and Windows results are from CI.
+- Offline regressions covered bounded JSON nesting, bounded cache reads,
+  invalid UTF-8, response size, shared downloader deadlines, cache recovery,
+  direct-child reaping, and terminal restoration.
+- The isolated rehearsal stamped Cargo.toml, Cargo.lock and the plugin
+  manifest to 0.45.0. GNU and musl archives passed SHA-256 verification,
+  extraction and a CLI smoke test. Both extracted binaries printed
+  `herdr-lazy 0.45.0` with `--version` and `-V` in an empty environment.
+- Release packaging checks that Cargo and the plugin manifest agree and that
+  a release tag names that version. Native build jobs also run the packaged
+  binary's version option. Intel macOS is cross-built on ARM, so the native
+  execution check is omitted for that artifact.
 
 ## Known limitations
 

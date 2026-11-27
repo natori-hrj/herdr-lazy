@@ -1,9 +1,10 @@
 # Changelog
 
-## v0.45.0 candidate
+## v0.45.0
 
 ### Added
 
+- Run `herdr-lazy --version` or `herdr-lazy -V` to print the installed build's version without running Herdr. [#125](https://github.com/natori-hrj/herdr-lazy/pull/125)
 - Open the searchable Manage command palette with Ctrl+P and press Enter to open the highlighted view. Existing shortcuts remain available. [#107](https://github.com/natori-hrj/herdr-lazy/pull/107)
 - Preview and save themes with `T` in Manage. Terminal colors remain the default. Catppuccin Mocha, Tokyo Night, Gruvbox, Nord, and custom color roles are available. `HERDR_LAZY_THEME` takes precedence over the saved preference. [#96](https://github.com/natori-hrj/herdr-lazy/pull/96) [#108](https://github.com/natori-hrj/herdr-lazy/pull/108)
 
