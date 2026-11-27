@@ -11,7 +11,7 @@ pub(super) fn list_top(height: u16) -> usize {
     }
 }
 
-fn cell_width(ch: char) -> usize {
+pub(super) fn cell_width(ch: char) -> usize {
     // Count emoji presentation selectors conservatively for terminals that expand them.
     if ch == '\u{fe0f}' {
         1
