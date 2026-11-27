@@ -4,7 +4,7 @@ use crossterm::event::KeyCode;
 
 use crate::theme::{Role, Theme, INPUT_LIMIT, PRESETS};
 
-use super::terminal_text::clip;
+use super::terminal_text::{clip, clip_tail, display_width};
 
 const CUSTOM: usize = PRESETS.len();
 const CURRENT_SUFFIX: &str = "  [Current]";
@@ -190,7 +190,7 @@ impl Picker {
         if self.editing {
             let prefix = if compact && save_visible(width, height) {
                 let prefix = format!("On {current} · ");
-                if prefix.chars().count() + 8 <= columns {
+                if display_width(&prefix) + 8 <= columns {
                     prefix
                 } else {
                     format!("[{}] ", clip(current, columns - 11).0)
@@ -272,14 +272,8 @@ impl Picker {
         columns: usize,
         prefix: &str,
     ) -> io::Result<()> {
-        // Keep the edit caret visible after the input outgrows its line. Custom palette tokens
-        // are ASCII. An unsupported character can occupy two cells until the user removes it.
-        let reversed: String = self.custom.chars().rev().collect();
-        let tail: String = clip(&reversed, columns - prefix.chars().count() - 1)
-            .0
-            .chars()
-            .rev()
-            .collect();
+        // Reserve a cell for the caret after the visible end of the input.
+        let tail = clip_tail(&self.custom, columns - display_width(prefix) - 1);
         write!(out, "\x1b[{row};1H{prefix}{tail}\x1b[7m \x1b[0m")
     }
 
@@ -355,6 +349,28 @@ impl Picker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_input_draws_whole_graphemes_before_the_caret() {
+        let mut picker = Picker::new(Theme::default(), false);
+        picker.key(KeyCode::End, 32, 5);
+        picker.key(KeyCode::Enter, 32, 5);
+        for ch in "abcdefge\u{301}👩‍💻".chars() {
+            picker.key(KeyCode::Char(ch), 32, 5);
+        }
+        for (width, height, expected) in [
+            (6, 8, "\x1b[2;1H…e\u{301}👩‍💻"),
+            (32, 5, "\x1b[1;1HOn Terminal default · …defge\u{301}👩‍💻"),
+        ] {
+            let mut out = Vec::new();
+            picker.draw(&mut out, width, height).unwrap();
+            let frame = String::from_utf8(out).unwrap();
+            assert!(
+                frame.contains(&format!("{expected}\x1b[7m \x1b[0m")),
+                "{frame:?}"
+            );
+        }
+    }
 
     #[test]
     fn focused_preview_sits_below_its_option_and_keeps_current_visible() {

@@ -1,18 +1,11 @@
 use std::io::{self, Write};
 
-use super::terminal_text::{cell_width, clip};
+use super::terminal_text::{clip, display_width, one_line};
 
 const GAP: usize = 2;
 
 fn width_up_to(text: &str, limit: usize) -> usize {
-    let mut width = 0;
-    for ch in text.chars() {
-        width += if ch.is_control() { 1 } else { cell_width(ch) };
-        if width >= limit {
-            return limit;
-        }
-    }
-    width
+    display_width(&one_line(text)).min(limit)
 }
 
 pub(super) struct Columns {

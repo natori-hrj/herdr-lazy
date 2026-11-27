@@ -253,8 +253,40 @@ pub(super) fn draw(app: &App, out: &mut impl Write, width: u16, height: u16) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::super::terminal_text::cell_width;
+    use super::super::terminal_text::display_width;
     use super::*;
+
+    #[test]
+    fn managed_label_keeps_whole_graphemes_at_the_right_edge() {
+        let mut app = App {
+            rows: super::super::rows(&[crate::Spec::parse("owner/plugin")], &[]),
+            ..App::default()
+        };
+        app.rows[0].status = Status::Ok;
+        let prefix = "> OK plugin-";
+        for (cluster, columns) in [
+            ("👩‍💻", 3),
+            ("⌚\u{fe0e}", 2),
+            ("☀\u{fe0f}", 3),
+            ("e\u{301}", 2),
+            ("界", 3),
+            ("🇯🇵", 3),
+            ("لا", 2),
+        ] {
+            app.rows[0].label = format!("plugin-{cluster}xy");
+            let render = |columns| {
+                let mut out = Vec::new();
+                app.draw(&mut out, prefix.len() as u16 + columns + 1, 2)
+                    .unwrap();
+                let frame = String::from_utf8(out).unwrap();
+                let (_, row) = frame.split_once("\x1b[1G").unwrap();
+                super::super::tests::list_row_text(row)
+            };
+            assert_eq!(render(columns), format!("{prefix}{cluster}…"));
+            assert_eq!(render(columns + 1), format!("{prefix}{cluster}xy"));
+            assert_eq!(render(columns - 1), format!("{prefix}…"));
+        }
+    }
 
     #[test]
     fn manage_visual_hierarchy_emphasizes_browse() {
@@ -307,6 +339,24 @@ mod tests {
     }
 
     #[test]
+    fn managed_row_pads_a_ligature_as_one_cell() {
+        let mut app = App {
+            rows: super::super::rows(&[crate::Spec::parse("owner/plugin")], &[]),
+            ..App::default()
+        };
+        app.rows[0].commit = Some("af06d0ad3fd99dc06027de187f1369328bf2d455".into());
+        let mut render = |label: &str| {
+            app.rows[0].label = label.into();
+            let mut out = Vec::new();
+            draw_rows(&app, &mut out, 64, 2).unwrap();
+            let frame = String::from_utf8(out).unwrap();
+            assert!(frame.contains("af06d0ad3fd9"));
+            frame
+        };
+        assert_eq!(render("لا"), render("x").replace("\x1b[1mx", "\x1b[1mلا"));
+    }
+
+    #[test]
     fn picked_manage_row_keeps_status_and_markers_at_narrow_widths() {
         let mut rows = super::super::rows(&[crate::Spec::parse("owner/plugin")], &[]);
         let row = &mut rows[0];
@@ -339,7 +389,7 @@ mod tests {
                 visible.starts_with(expected),
                 "{width} columns: {visible:?}"
             );
-            assert!(visible.chars().map(cell_width).sum::<usize>() < usize::from(width));
+            assert!(display_width(&visible) < usize::from(width));
         }
     }
 
@@ -365,7 +415,7 @@ mod tests {
             for segment in segments {
                 visible.push_str(segment.split_once('m').unwrap().1);
             }
-            let width = visible.chars().map(cell_width).sum::<usize>();
+            let width = display_width(&visible);
             assert!(width <= columns, "{columns} columns: {visible}");
             if columns >= 24 {
                 assert!(visible.contains("Missing"));

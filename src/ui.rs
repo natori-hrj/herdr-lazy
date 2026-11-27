@@ -27,6 +27,7 @@ mod terminal_text;
 mod theme_picker;
 
 use command_palette::{ManageCommand, Palette, PaletteAction};
+use terminal_text::{clip, wrap_line, wrap_words};
 
 use crate::theme::{Color, Role, Theme};
 
@@ -577,35 +578,10 @@ fn native_log_response_is_empty(output: &str) -> bool {
 }
 
 fn wrap_log_lines(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut lines = Vec::new();
-    let mut truncated = false;
-    for line in text.lines() {
-        let chars: Vec<char> = line.chars().collect();
-        if chars.is_empty() {
-            if lines.len() >= MAX_LOG_DISPLAY_LINES {
-                truncated = true;
-                break;
-            }
-            lines.push(String::new());
-            continue;
-        }
-        for chunk in chars.chunks(width) {
-            if lines.len() >= MAX_LOG_DISPLAY_LINES {
-                truncated = true;
-                break;
-            }
-            lines.push(chunk.iter().collect());
-        }
-        if truncated {
-            break;
-        }
-    }
-    if truncated {
-        if lines.len() == MAX_LOG_DISPLAY_LINES {
-            lines.pop();
-        }
-        lines.push(LOG_TRUNCATION_MARKER.to_string());
+    let mut wrapped = text.lines().flat_map(|line| wrap_line(line, width));
+    let mut lines: Vec<_> = wrapped.by_ref().take(MAX_LOG_DISPLAY_LINES).collect();
+    if wrapped.next().is_some() {
+        lines[MAX_LOG_DISPLAY_LINES - 1] = LOG_TRUNCATION_MARKER.to_string();
     }
     lines
 }
@@ -3580,14 +3556,11 @@ impl App {
 }
 
 fn add_help_line(lines: &mut Vec<(bool, String)>, bold: bool, text: &str, columns: usize) {
-    for line in wrap(text, columns) {
-        let chars: Vec<char> = line.chars().collect();
-        lines.extend(
-            chars
-                .chunks(columns)
-                .map(|chunk| (bold, chunk.iter().collect())),
-        );
-    }
+    lines.extend(
+        wrap_words(text, columns)
+            .into_iter()
+            .map(|line| (bold, line)),
+    );
 }
 
 fn help_lines(columns: usize, context: &str) -> Vec<(bool, String)> {
@@ -3741,7 +3714,7 @@ fn draw_help(
         write!(
             out,
             "\x1b[1m{}\x1b[0m",
-            truncate("Keyboard shortcuts", columns)
+            clip("Keyboard shortcuts", columns).0
         )?;
     }
     for (index, (bold, line)) in lines.iter().skip(start).take(visible).enumerate() {
@@ -3758,18 +3731,20 @@ fn draw_help(
         let full = "Esc Back · ↑↓ PgUp/PgDn Scroll";
         let compact = "Esc Back · ↑↓ Scroll";
         let arrows = "Esc Back · ↑↓";
-        let controls = if full.chars().count() <= columns {
+        let controls = if terminal_text::display_width(full) <= columns {
             full
-        } else if compact.chars().count() <= columns {
+        } else if terminal_text::display_width(compact) <= columns {
             compact
-        } else if arrows.chars().count() <= columns {
+        } else if terminal_text::display_width(arrows) <= columns {
             arrows
         } else {
             "Esc Back"
         };
         let progress = format!(" · {end}/{}", lines.len());
-        write!(out, "\x1b[{footer};1H{}", truncate(controls, columns))?;
-        if controls.chars().count() + progress.chars().count() <= columns {
+        write!(out, "\x1b[{footer};1H{}", clip(controls, columns).0)?;
+        if terminal_text::display_width(controls) + terminal_text::display_width(&progress)
+            <= columns
+        {
             write!(out, "{progress}")?;
         }
     }
@@ -3789,26 +3764,6 @@ fn help_scroll(offset: usize, key: KeyCode, width: u16, height: u16, context: &s
         KeyCode::End | KeyCode::Char('G') => last,
         _ => offset,
     }
-}
-
-/// Break text to a width, on spaces where possible.
-fn wrap(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut out = Vec::new();
-    let mut line = String::new();
-    for word in text.split_whitespace() {
-        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
-            out.push(std::mem::take(&mut line));
-        }
-        if !line.is_empty() {
-            line.push(' ');
-        }
-        line.push_str(word);
-    }
-    if !line.is_empty() {
-        out.push(line);
-    }
-    out
 }
 
 /// Cut a label to `max` *characters*.
@@ -4650,7 +4605,7 @@ mod tests {
         &row[..end]
     }
 
-    fn list_row_text(row: &str) -> String {
+    pub(super) fn list_row_text(row: &str) -> String {
         let mut segments = row.split("\x1b[");
         let mut text = segments.next().unwrap().to_string();
         for segment in segments {
@@ -4749,7 +4704,7 @@ mod tests {
                 let row = list_frame_row(&frame, LIST_TOP + 1 + index);
                 for pass in row.split("\x1b[1G") {
                     let text = list_row_text(pass);
-                    let cells = text.chars().map(terminal_text::cell_width).sum::<usize>();
+                    let cells = terminal_text::display_width(&text);
                     assert!(cells < usize::from(width), "width {width}: {text:?}");
                 }
             }
@@ -4863,7 +4818,7 @@ mod tests {
                         }
                         assert!(!row.contains("\x1b[0m"));
                         assert!(after.starts_with("\x1b[") && !after.contains("\x1b[49m"));
-                        let cells = text.chars().map(terminal_text::cell_width).sum::<usize>();
+                        let cells = terminal_text::display_width(&text);
                         assert!(cells <= usize::from(width - 1));
                     }
                 }
@@ -5080,7 +5035,7 @@ mod tests {
             let total = lines.len();
             assert!(lines
                 .iter()
-                .all(|(_, line)| line.chars().count() <= columns));
+                .all(|(_, line)| terminal_text::display_width(line) <= columns));
 
             let footer_row = footer_start_row(height);
             let footer_position = format!("\x1b[{footer_row};1H");
@@ -5451,6 +5406,47 @@ mod tests {
             view.display_lines(4),
             ["abcd", "ef", "next", "    ", "line"]
         );
+    }
+
+    #[test]
+    fn log_rendering_wraps_graphemes_and_preserves_log_sanitization() {
+        let app = App {
+            log_view: Some(LogView::from_result(
+                "example".into(),
+                Ok("x\x1b[31m👩‍💻\x1b[0me\u{301}界\n\n🇯🇵".into()),
+            )),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        app.draw_logs(&mut out, 5, 20).unwrap();
+        let frame = String::from_utf8(out).unwrap();
+        assert!(
+            frame.contains(" x👩‍💻\r\n e\u{301}界\r\n \r\n 🇯🇵\r\n"),
+            "{frame:?}"
+        );
+        assert!(!frame.contains("\x1b[31m"));
+    }
+
+    #[test]
+    fn log_rendering_fits_contextual_widths_on_one_cell_lines() {
+        let app = App {
+            log_view: Some(LogView::from_result("example".into(), Ok("xلاⵏ⵿ⴾy".into()))),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        app.draw_logs(&mut out, 3, 20).unwrap();
+        let frame = String::from_utf8(out).unwrap();
+        assert!(frame.contains(" x\r\n لا\r\n ⵏ⵿ⴾ\r\n y\r\n"), "{frame:?}");
+    }
+
+    #[test]
+    fn help_context_wraps_graphemes_within_its_columns() {
+        let mut out = Vec::new();
+        draw_help(&mut out, 9, 80, 0, " e\u{301}👩‍💻界 WXYZ \u{301}X").unwrap();
+        let frame = String::from_utf8(out).unwrap();
+        assert!(frame.contains("He\u{301}👩‍💻"), "{frame:?}");
+        assert!(frame.contains("H界"), "{frame:?}");
+        assert!(frame.contains("H \u{301}X"), "{frame:?}");
     }
 
     #[test]

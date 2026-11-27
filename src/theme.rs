@@ -58,14 +58,14 @@ impl fmt::Display for Color {
 
 #[derive(Clone, Copy)]
 pub(crate) enum Selection {
-    Ansi(u8),
+    Ansi { background: u8, foreground: u8 },
     Rgb(u32),
 }
 
 impl fmt::Display for Selection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            Self::Ansi(code) => write!(f, "\x1b[{code}m"),
+            Self::Ansi { background, .. } => write!(f, "\x1b[{background}m"),
             Self::Rgb(rgb) => write!(
                 f,
                 "\x1b[48;2;{};{};{}m",
@@ -80,7 +80,7 @@ impl fmt::Display for Selection {
 impl Selection {
     pub(crate) fn foreground(self) -> Color {
         match self {
-            Self::Ansi(_) => Color::Ansi(39),
+            Self::Ansi { foreground, .. } => Color::Ansi(foreground),
             Self::Rgb(rgb) if luminance(rgb) >= 0.179 => Color::Rgb(0x000000),
             Self::Rgb(_) => Color::Rgb(0xffffff),
         }
@@ -214,12 +214,32 @@ impl Theme {
             return Selection::Rgb(background);
         }
         let colors = std::env::var("COLORFGBG").unwrap_or_default();
-        match (self.custom, colors.rsplit_once(';')) {
-            (true, Some((_, "7" | "15"))) => Selection::Rgb(0xeeeeee),
-            (true, _) => Selection::Rgb(0x303030),
-            (false, Some((_, "7"))) => Selection::Ansi(107),
-            (false, Some((_, "15"))) => Selection::Ansi(47),
-            (false, _) => Selection::Ansi(100),
+        self.terminal_selection(&colors)
+    }
+
+    fn terminal_selection(self, colors: &str) -> Selection {
+        let (foreground, background) = colors.split_once(';').unwrap_or_default();
+        let background = background.rsplit(';').next().unwrap_or_default();
+        if self.custom {
+            return Selection::Rgb(match background {
+                "7" | "15" => 0xeeeeee,
+                _ => 0x303030,
+            });
+        }
+
+        let (background, palette_index, fallback) = match background {
+            "7" => (107, 15, 30),
+            "15" => (47, 7, 30),
+            _ => (100, 8, 97),
+        };
+        let foreground = if foreground.parse::<u8>() == Ok(palette_index) {
+            fallback
+        } else {
+            39
+        };
+        Selection::Ansi {
+            background,
+            foreground,
         }
     }
 
@@ -349,6 +369,37 @@ mod tests {
                 .colors
                 .iter()
                 .all(|color| matches!(color, Color::Rgb(_))));
+        }
+    }
+
+    #[test]
+    fn terminal_selection_uses_an_explicit_foreground_on_palette_collision() {
+        for (reported, background, foreground) in [
+            ("8;0", 100, 97),
+            ("7;15", 47, 30),
+            ("15;7", 107, 30),
+            ("7;default;15", 47, 30),
+            ("15;0;7", 107, 30),
+            ("15;0", 100, 39),
+            ("0;15", 47, 39),
+            ("0;15;7", 107, 39),
+            ("default;15", 47, 39),
+            (";7", 107, 39),
+            ("8", 100, 39),
+            ("", 100, 39),
+        ] {
+            let selection = Theme::default().terminal_selection(reported);
+            assert_eq!(
+                selection.to_string(),
+                format!("\x1b[{background}m"),
+                "{reported:?}"
+            );
+            assert_eq!(
+                selection.foreground(),
+                Color::Ansi(foreground),
+                "{reported:?}"
+            );
+            assert_eq!(selection.status_color(Color::Ansi(33)), Color::Ansi(33));
         }
     }
 

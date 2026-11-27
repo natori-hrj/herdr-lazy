@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::{
     footer_start_row,
-    terminal_text::{cell_width, clip},
+    terminal_text::{clip, clip_tail, display_width},
     App,
 };
 use crate::theme::{Role, Theme};
@@ -308,7 +308,7 @@ impl Palette {
         let hint = hints
             .iter()
             .copied()
-            .find(|hint| hint.chars().map(cell_width).sum::<usize>() <= columns)
+            .find(|hint| display_width(hint) <= columns)
             .unwrap_or("Esc");
         let (hint, _) = clip(hint, columns);
         write!(out, "\x1b[{row};1H\x1b[2m{hint}\x1b[0m")?;
@@ -319,21 +319,10 @@ impl Palette {
 fn query_line(query: &str, columns: usize) -> String {
     const PROMPT: &str = " > ";
     let available = columns.saturating_sub(PROMPT.len());
-    if available == 0 || query.chars().map(cell_width).sum::<usize>() <= available {
+    if available == 0 {
         return clip(&format!("{PROMPT}{query}"), columns).0;
     }
-
-    let mut remaining = available - cell_width('…');
-    let mut start = query.len();
-    for (index, ch) in query.char_indices().rev() {
-        let cells = cell_width(ch);
-        if cells > remaining {
-            break;
-        }
-        remaining -= cells;
-        start = index;
-    }
-    format!("{PROMPT}…{}", &query[start..])
+    format!("{PROMPT}{}", clip_tail(query, available))
 }
 
 fn last_content_row(height: u16) -> usize {
@@ -457,6 +446,25 @@ mod tests {
                 assert!(output.contains("No matching commands"));
                 palette.handle_key(key(KeyCode::Backspace), width, height);
             }
+        }
+    }
+
+    #[test]
+    fn palette_query_keeps_graphemes_and_contextual_width_before_the_caret() {
+        for (query, width, expected) in [
+            ("xy👩‍💻", 8, "…👩‍💻"),
+            ("xy👩‍💻", 7, "…"),
+            ("xye\u{301}", 7, "…e\u{301}"),
+            ("xxकक्क", 8, "…क्क"),
+            ("لا", 6, "لا"),
+        ] {
+            let mut palette = Palette::default();
+            type_query(&mut palette, query);
+            let frame = render(&palette, width, 8);
+            assert!(
+                frame.contains(&format!("\x1b[2;1H > {expected}\x1b[7m \x1b[0m")),
+                "{query:?}, {width}: {frame:?}"
+            );
         }
     }
 
