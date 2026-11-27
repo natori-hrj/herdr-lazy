@@ -14,6 +14,7 @@
 
 use std::{
     io::{self, Write},
+    sync::mpsc::{self, Receiver, TryRecvError},
     time::Duration,
 };
 
@@ -1162,6 +1163,8 @@ impl AdoptPicker {
     }
 }
 
+type MarketplaceResult = Result<(Vec<crate::registry::Entry>, String), String>;
+
 /// `Default` so tests can build one from just the rows they care about; this struct grows a
 /// field per view, and every fixture should not have to know about all of them.
 #[derive(Default)]
@@ -1184,6 +1187,7 @@ struct App {
     last_event: Option<crate::context::PluginEvent>,
     /// Present while the marketplace browser is open; the pane draws that instead of the list.
     browser: Option<crate::browse::Browser>,
+    marketplace_refresh: Option<Receiver<MarketplaceResult>>,
     /// Present while the extras picker is open, for the same reason.
     extras: Option<ExtrasPicker>,
     /// Present while the focused-agent recommendations are open.
@@ -1268,6 +1272,7 @@ impl App {
                 context_warning: context_warning.clone(),
                 last_event: last_event.clone(),
                 browser: None,
+                marketplace_refresh: None,
                 extras: None,
                 recommendations: None,
                 adopt: None,
@@ -1294,6 +1299,7 @@ impl App {
                 context_warning,
                 last_event,
                 browser: None,
+                marketplace_refresh: None,
                 extras: None,
                 recommendations: None,
                 adopt: None,
@@ -1316,6 +1322,7 @@ impl App {
     fn refresh(&mut self) {
         let (cursor, flash) = (self.cursor, self.flash.take());
         let (browser, help) = (self.browser.take(), self.help);
+        let marketplace_refresh = self.marketplace_refresh.take();
         let profile_open = self.profile_open;
         let pending_profile = self.pending_profile;
         let extras = self.extras.take();
@@ -1325,6 +1332,7 @@ impl App {
         let logs = self.log_view.take();
         *self = App::load();
         self.browser = browser;
+        self.marketplace_refresh = marketplace_refresh;
         self.profile_open = profile_open;
         self.pending_profile = pending_profile;
         self.extras = extras;
@@ -2239,20 +2247,72 @@ impl App {
         Ok(())
     }
 
-    /// `/` — open the marketplace browser.
+    /// Open immediately from disk, refreshing in the background if needed.
     fn open_browser(&mut self, force_refresh: bool) {
-        match crate::registry::load(force_refresh) {
-            Ok((entries, note)) => {
-                let listed: Vec<String> = crate::desired_plugins()
-                    .iter()
-                    .map(|l| crate::Spec::parse(l).repo)
-                    .collect();
-                self.browser = Some(crate::browse::Browser::new(entries, note, listed));
-                self.flash = None;
+        self.flash = None;
+        if self.browser.is_none() {
+            let listed = crate::desired_plugins()
+                .iter()
+                .map(|line| crate::Spec::parse(line).repo)
+                .collect();
+            let (entries, note, fresh) = match crate::registry::browser_cache() {
+                Some(cache) => (cache.entries, cache.note, cache.fresh),
+                None => (Vec::new(), String::new(), false),
+            };
+            self.browser = Some(crate::browse::Browser::new(entries, note, listed));
+            if fresh && !force_refresh {
+                return;
             }
-            // Browsing is a convenience over someone else's undocumented endpoint; failing to
-            // reach it must not look like herdr-lazy is broken.
-            Err(e) => self.flash = Some(format!("marketplace unavailable — {}", e)),
+        }
+        self.start_marketplace_refresh(move || crate::registry::load(force_refresh));
+    }
+
+    fn start_marketplace_refresh(
+        &mut self,
+        load: impl FnOnce() -> MarketplaceResult + Send + 'static,
+    ) {
+        if self.marketplace_refresh.is_some() {
+            return;
+        }
+        let (send, receive) = mpsc::channel();
+        match std::thread::Builder::new()
+            .name("marketplace".to_string())
+            .spawn(move || {
+                let _ = send.send(load());
+            }) {
+            Ok(_) => self.marketplace_refresh = Some(receive),
+            Err(error) => self.apply_marketplace_result(Err(error.to_string())),
+        }
+    }
+
+    fn poll_marketplace(&mut self) -> bool {
+        let Some(receive) = self.marketplace_refresh.as_ref() else {
+            return false;
+        };
+        let result = match receive.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => Err("refresh worker stopped".to_string()),
+        };
+        self.marketplace_refresh = None;
+        // Esc cancels delivery to the browser. Keep one worker slot until completion so
+        // reopening or holding Ctrl+R cannot fan out more requests.
+        if self.browser.is_none() {
+            return false;
+        }
+        self.apply_marketplace_result(result);
+        true
+    }
+
+    fn apply_marketplace_result(&mut self, result: MarketplaceResult) {
+        let Some(browser) = self.browser.as_mut() else {
+            return;
+        };
+        match result {
+            Ok((entries, note)) => browser.replace_entries(entries, note),
+            Err(error) => {
+                browser.source_note = format!("refresh failed: {}", sanitize_log_output(&error));
+            }
         }
     }
 
@@ -3132,7 +3192,11 @@ impl App {
             "\x1b[1m marketplace\x1b[0m  \x1b[2m{} of {} · {}\x1b[0m\r",
             results.len(),
             b.all.len(),
-            b.source_note
+            if self.marketplace_refresh.is_some() {
+                "refreshing…"
+            } else {
+                &b.source_note
+            }
         )?;
         writeln!(
             out,
@@ -3149,7 +3213,14 @@ impl App {
             0
         };
         if results.is_empty() {
-            writeln!(out, " \x1b[2mnothing matches\x1b[0m\r")?;
+            let message = if self.marketplace_refresh.is_some() && b.all.is_empty() {
+                "loading marketplace…"
+            } else if b.all.is_empty() {
+                "no plugins available · ctrl+r retries"
+            } else {
+                "nothing matches"
+            };
+            writeln!(out, " \x1b[2m{}\x1b[0m\r", message)?;
         }
         for (i, e) in results.iter().enumerate().skip(start).take(visible) {
             let selected = i == b.cursor;
@@ -4142,6 +4213,7 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
     let mut startup_redraws = STARTUP_REDRAWS;
 
     loop {
+        redraw |= app.poll_marketplace();
         let (width, height) = terminal::size().unwrap_or((80, 24));
         let size = (width, height);
         if redraw || last_size != Some(size) || startup_redraws > 0 {
@@ -4151,7 +4223,14 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             startup_redraws = startup_redraws.saturating_sub(1);
         }
 
-        let key = match event::poll(Duration::from_millis(100))? {
+        // Terminal input wakes the poll immediately. Only a visible refresh result
+        // needs a shorter timeout so its completion reaches the screen sooner.
+        let poll_timeout = if app.browser.is_some() && app.marketplace_refresh.is_some() {
+            Duration::from_millis(25)
+        } else {
+            Duration::from_millis(100)
+        };
+        let key = match event::poll(poll_timeout)? {
             false => continue,
             true => match event::read()? {
                 Event::Key(k) if k.kind == KeyEventKind::Press => {
@@ -4763,6 +4842,95 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn marketplace_entry(name: &str) -> crate::registry::Entry {
+        crate::registry::Entry {
+            full_name: name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn marketplace_completion_keeps_query_and_selected_plugin() {
+        let (send, receive) = mpsc::channel();
+        let mut app = App {
+            browser: Some(crate::browse::Browser::new(
+                vec![
+                    marketplace_entry("owner/worktree-one"),
+                    marketplace_entry("owner/worktree-two"),
+                ],
+                "cached".to_string(),
+                Vec::new(),
+            )),
+            marketplace_refresh: Some(receive),
+            ..Default::default()
+        };
+        let browser = app.browser.as_mut().unwrap();
+        browser.query = "worktree".to_string();
+        browser.category = Some("worktree");
+        browser.move_down();
+
+        assert!(!app.poll_marketplace());
+        send.send(Ok((
+            vec![
+                marketplace_entry("owner/worktree-two"),
+                marketplace_entry("owner/note"),
+            ],
+            "just refreshed".to_string(),
+        )))
+        .unwrap();
+        assert!(app.poll_marketplace());
+        let browser = app.browser.as_ref().unwrap();
+        assert_eq!(browser.query, "worktree");
+        assert_eq!(browser.category, Some("worktree"));
+        assert_eq!(browser.selected().unwrap().full_name, "owner/worktree-two");
+        assert_eq!(browser.source_note, "just refreshed");
+        assert!(!app.poll_marketplace());
+    }
+
+    #[test]
+    fn marketplace_ignores_duplicate_requests_and_completion_after_close() {
+        let (send, receive) = mpsc::channel();
+        let mut app = App {
+            marketplace_refresh: Some(receive),
+            ..Default::default()
+        };
+        app.start_marketplace_refresh(|| unreachable!("another request is already running"));
+        send.send(Ok((Vec::new(), "just refreshed".to_string())))
+            .unwrap();
+
+        assert!(!app.poll_marketplace());
+        assert!(app.browser.is_none());
+        assert!(app.marketplace_refresh.is_none());
+    }
+
+    #[test]
+    fn marketplace_distinguishes_loading_and_refresh_failure_from_no_match() {
+        let (send, receive) = mpsc::channel();
+        let mut app = App {
+            browser: Some(crate::browse::Browser::new(
+                Vec::new(),
+                String::new(),
+                Vec::new(),
+            )),
+            marketplace_refresh: Some(receive),
+            ..Default::default()
+        };
+        let mut loading = Vec::new();
+        app.draw_browser(&mut loading, 80, 24).unwrap();
+        assert!(String::from_utf8(loading)
+            .unwrap()
+            .contains("loading marketplace"));
+
+        send.send(Err("offline".to_string())).unwrap();
+        assert!(app.poll_marketplace());
+        let mut failed = Vec::new();
+        app.draw_browser(&mut failed, 80, 24).unwrap();
+        let failed = String::from_utf8(failed).unwrap();
+        assert!(failed.contains("refresh failed: offline"));
+        assert!(failed.contains("ctrl+r retries"));
+        assert!(!failed.contains("nothing matches"));
+    }
 
     #[test]
     fn footer_leaves_the_host_owned_terminal_row_visible() {
