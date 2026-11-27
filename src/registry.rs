@@ -19,7 +19,7 @@ use crate::json;
 
 const INDEX_URL: &str = "https://assets.herdr.dev/plugins/index.json";
 // The public index already approaches 2 MiB and grows as new repositories are listed.
-const MAX_INDEX_BYTES: usize = 8 * 1024 * 1024;
+const MAX_INDEX_BYTES: u64 = 8 * 1024 * 1024;
 
 /// How long a cached copy is considered good.
 ///
@@ -221,18 +221,13 @@ fn cache_path() -> PathBuf {
     base.join("herdr-lazy").join("marketplace.json")
 }
 
-fn cache_age_seconds(path: &Path) -> Option<u64> {
-    let meta = fs::metadata(path).ok()?;
-    let modified = meta.modified().ok()?;
-    modified.elapsed().ok().map(|d| d.as_secs())
-}
-
 /// Download the index. Shells out, because std has no TLS — the same reasoning that has the
 /// install script use curl.
 fn download() -> Result<String, String> {
     let deadline = Instant::now() + Duration::from_secs(20);
     let attempt = |prog: &str, args: &[&str]| -> Option<String> {
-        let (status, body) = crate::download::capture(prog, args, MAX_INDEX_BYTES, deadline)?;
+        let (status, body) =
+            crate::download::capture(prog, args, MAX_INDEX_BYTES as usize, deadline)?;
         if !status.success() {
             return None;
         }
@@ -320,17 +315,9 @@ fn load_with(
     force: bool,
     download_index: impl FnOnce() -> Result<String, String>,
 ) -> Result<(Vec<Entry>, String), String> {
-    let age = cache_age_seconds(path);
-    let fresh_enough = !force && age.map(|a| a < CACHE_SECONDS).unwrap_or(false);
-
-    let read_cache = || {
-        fs::read_to_string(path)
-            .ok()
-            .and_then(|b| parse_index(&b).ok())
-    };
-    if fresh_enough {
-        if let Some(entries) = read_cache() {
-            return Ok((entries, describe_age(age)));
+    if !force {
+        if let Some(cache) = read_cache(path, Some(CACHE_SECONDS)) {
+            return Ok((cache.entries, describe_age(cache.age)));
         }
     }
 
@@ -340,14 +327,54 @@ fn load_with(
             let _ = write_cache(path, &body);
             Ok((entries, "just refreshed".to_string()))
         }
-        Err(e) => match read_cache() {
-            Some(entries) => Ok((
-                entries,
-                format!("{} (refresh failed: {})", describe_cached_age(age), e),
+        Err(e) => match read_cache(path, None) {
+            Some(cache) => Ok((
+                cache.entries,
+                format!("{} (refresh failed: {})", describe_cached_age(cache.age), e),
             )),
             None => Err(e),
         },
     }
+}
+
+struct CachedIndex {
+    entries: Vec<Entry>,
+    age: Option<u64>,
+}
+
+fn read_cache(path: &Path, max_age: Option<u64>) -> Option<CachedIndex> {
+    // Skip known special files before opening. Check the handle as well because the path
+    // may change between calls. Regular symlink targets are valid cache files.
+    if !path.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A replacement named pipe must not block the open before it can be rejected.
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+    }
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_INDEX_BYTES {
+        return None;
+    }
+
+    let age = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .map(|duration| duration.as_secs());
+    if max_age.is_some_and(|max| age.unwrap_or(u64::MAX) >= max) {
+        return None;
+    }
+
+    // The metadata length can be stale if another writer grows the open file.
+    let bytes = crate::read_limited(file, MAX_INDEX_BYTES).ok().flatten()?;
+    let entries = parse_index(std::str::from_utf8(&bytes).ok()?).ok()?;
+    Some(CachedIndex { entries, age })
 }
 
 pub(crate) struct BrowserCache {
@@ -357,25 +384,18 @@ pub(crate) struct BrowserCache {
 }
 
 pub(crate) fn browser_cache() -> Option<BrowserCache> {
-    let path = cache_path();
-    let age = cache_age_seconds(&path);
-    let body = fs::read_to_string(path).ok()?;
-    let entries = parse_index(&body).ok()?;
+    let cache = read_cache(&cache_path(), None)?;
     Some(BrowserCache {
-        entries,
-        note: describe_age(age),
-        fresh: age.is_some_and(|seconds| seconds < CACHE_SECONDS),
+        entries: cache.entries,
+        note: describe_age(cache.age),
+        fresh: cache.age.is_some_and(|seconds| seconds < CACHE_SECONDS),
     })
 }
 
 /// Entries from the cache, or nothing. Never fetches.
-///
-/// Used by the list view, which runs on every keypress-driven redraw and must not depend on
-/// the network being there — or on someone else's CDN being willing.
 pub(crate) fn cached_entries() -> Vec<Entry> {
-    fs::read_to_string(cache_path())
-        .ok()
-        .and_then(|b| parse_index(&b).ok())
+    read_cache(&cache_path(), None)
+        .map(|cache| cache.entries)
         .unwrap_or_default()
 }
 
@@ -433,6 +453,116 @@ mod tests {
     }
 
     #[test]
+    fn cache_limits_valid_files_to_the_index_byte_budget() {
+        use std::io::{Read, Write};
+
+        let dir = cache_fixture("bounded");
+        let path = dir.join("index.json");
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(INDEX.as_bytes()).unwrap();
+        let padding = MAX_INDEX_BYTES - INDEX.len() as u64;
+        io::copy(&mut io::repeat(b' ').take(padding), &mut file).unwrap();
+        drop(file);
+
+        assert_eq!(read_cache(&path, None).unwrap().entries.len(), 2);
+        let opened = fs::File::open(&path).unwrap();
+        assert_eq!(opened.metadata().unwrap().len(), MAX_INDEX_BYTES);
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b" ").unwrap();
+        drop(file);
+        // The bounded reader must reject growth even when the handle initially fit.
+        assert!(crate::read_limited(opened, MAX_INDEX_BYTES)
+            .unwrap()
+            .is_none());
+        assert!(read_cache(&path, None).is_none());
+        assert_eq!(
+            load_with(&path, false, || Err("offline".into())).unwrap_err(),
+            "offline"
+        );
+
+        let (entries, note) = load_with(&path, false, || Ok(INDEX.to_string())).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(note, "just refreshed");
+        assert_eq!(fs::read_to_string(&path).unwrap(), INDEX);
+
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn cache_rejects_nonregular_and_invalid_utf8_inputs() {
+        let dir = cache_fixture("nonregular");
+        assert!(read_cache(&dir, None).is_none());
+        let path = dir.join("index.json");
+        fs::write(&path, b"\xff").unwrap();
+        assert!(read_cache(&path, None).is_none());
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_rejects_a_fifo_without_waiting_for_a_writer() {
+        use std::{process::Command, sync::mpsc, thread};
+
+        let dir = cache_fixture("fifo");
+        let path = dir.join("index.json");
+        assert!(Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success());
+
+        let (send, receive) = mpsc::channel();
+        let cache = path.clone();
+        let reader = thread::spawn(move || {
+            let _ = send.send(read_cache(&cache, None).is_none());
+        });
+        let result = receive.recv_timeout(Duration::from_secs(2));
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(dir).unwrap();
+
+        assert_eq!(result, Ok(true));
+        reader.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_accepts_symlinks_to_regular_files() {
+        let dir = cache_fixture("symlink");
+        let path = dir.join("index.json");
+        fs::write(&path, INDEX).unwrap();
+        let link = dir.join("linked-cache.json");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert_eq!(read_cache(&link, None).unwrap().entries.len(), 2);
+        fs::remove_file(&link).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_refresh_uses_the_age_of_the_cache_it_read() {
+        let dir = cache_fixture("replacement-age");
+        let path = dir.join("index.json");
+        fs::write(&path, r#"{"plugins":[]}"#).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(8 * 3600))
+            .unwrap();
+        let (entries, note) = load_with(&path, false, || {
+            write_cache(&path, INDEX).unwrap();
+            Err("offline".into())
+        })
+        .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(note, "cached less than 1m ago (refresh failed: offline)");
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
     fn malformed_refresh_preserves_valid_cache() {
         let dir = cache_fixture("fallback");
         let path = dir.join("index.json");
@@ -447,6 +577,29 @@ mod tests {
         assert!(note.starts_with("cached"));
         assert!(note.contains("refresh failed: marketplace index is not JSON"));
         assert!(!note.chars().any(char::is_control));
+        assert_eq!(persisted.unwrap(), INDEX);
+    }
+
+    #[test]
+    fn refresh_over_json_depth_limit_preserves_valid_cache() {
+        let dir = cache_fixture("depth");
+        let path = dir.join("index.json");
+        fs::write(&path, INDEX).unwrap();
+        let arrays = json::MAX_CONTAINER_DEPTH;
+        let response = format!(
+            r#"{{"plugins":[],"metadata":{}null{}}}"#,
+            "[".repeat(arrays),
+            "]".repeat(arrays)
+        );
+        let result = load_with(&path, true, || Ok(response));
+        let persisted = fs::read_to_string(&path);
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(dir).unwrap();
+
+        let (entries, note) = result.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(note.starts_with("cached"));
+        assert!(note.contains("JSON container depth exceeds"));
         assert_eq!(persisted.unwrap(), INDEX);
     }
 
