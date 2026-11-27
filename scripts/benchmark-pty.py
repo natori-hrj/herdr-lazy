@@ -23,7 +23,7 @@ COLUMNS, ROWS = 120, 24
 TIMEOUT_SECONDS = 5
 FRAME_START = b"\x1b[H\x1b[2J"
 LIST_FOOTERS = (b"[?]\x1b[0m more", b"[x] Remove")
-BROWSER_FOOTERS = (b"[esc]\x1b[0m back",)
+BROWSER_FOOTERS = (b"[esc]\x1b[0m back", b"[Ctrl+R] Refresh")
 
 
 def prepare_fixture(root):
@@ -72,22 +72,25 @@ def prepare_fixture(root):
     }
 
 
-def read_frame(master, marker, footers):
+def read_frame(master, markers, footers):
+    if isinstance(markers, bytes):
+        markers = (markers,)
     deadline = time.monotonic() + TIMEOUT_SECONDS
     output = b""
     while True:
-        start = output.find(marker)
-        if start >= 0 and any(footer in output[start + len(marker):] for footer in footers):
-            return
+        for marker in markers:
+            start = output.find(marker)
+            if start >= 0 and any(footer in output[start + len(marker):] for footer in footers):
+                return
         timeout = deadline - time.monotonic()
         if timeout <= 0 or not select.select([master], [], [], timeout)[0]:
-            raise RuntimeError(f"timed out waiting for {marker!r} and a frame footer")
+            raise RuntimeError(f"timed out waiting for {markers!r} and a frame footer")
         try:
             chunk = os.read(master, 65536)
         except OSError as error:
-            raise RuntimeError(f"terminal closed while waiting for {marker!r}") from error
+            raise RuntimeError(f"terminal closed while waiting for {markers!r}") from error
         if not chunk:
-            raise RuntimeError(f"terminal closed while waiting for {marker!r}")
+            raise RuntimeError(f"terminal closed while waiting for {markers!r}")
         output += chunk
 
 
@@ -105,13 +108,14 @@ def sample(binary, root, env):
         read_frame(master, FRAME_START, LIST_FOOTERS)
         startup = time.perf_counter_ns() - started
         os.write(master, b"/")
-        read_frame(master, f"{ITEMS} of {ITEMS}".encode(), BROWSER_FOOTERS)
+        counts = (f"{ITEMS} of {ITEMS}".encode(), f"{ITEMS}/{ITEMS}".encode())
+        read_frame(master, counts, BROWSER_FOOTERS)
 
         search = []
         for query in (b"f", b"fz", b"fzf"):
             started = time.perf_counter_ns()
             os.write(master, query[-1:])
-            read_frame(master, b" search: \x1b[1m" + query + b"\x1b[0m", BROWSER_FOOTERS)
+            read_frame(master, b"\x1b[1m" + query + b"\x1b[0m\x1b[7m ", BROWSER_FOOTERS)
             search.append(time.perf_counter_ns() - started)
 
         os.write(master, b"\x03")
