@@ -20,7 +20,7 @@ fn cell_width(ch: char) -> usize {
     }
 }
 
-fn clip(text: &str, columns: usize) -> (String, usize) {
+pub(super) fn clip(text: &str, columns: usize) -> (String, usize) {
     let mut line = String::new();
     let mut width = 0;
     if columns == 0 {
@@ -210,6 +210,7 @@ pub(super) fn draw(app: &App, out: &mut impl Write, width: u16, height: u16) -> 
             for hint in [
                 "[/] Browse",
                 "[?] Help",
+                "[Ctrl+P] Commands",
                 "[l] Detail",
                 "[i] Install",
                 "[u] Update",
