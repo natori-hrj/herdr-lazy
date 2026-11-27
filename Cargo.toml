@@ -20,11 +20,12 @@ name = "herdr-lazy"
 path = "src/main.rs"
 
 # The manager uses the Herdr CLI for plugin operations.
-# TUI dependencies provide raw terminal input and Unicode display-cell widths.
+# TUI dependencies provide raw terminal input, grapheme boundaries, and display-cell widths.
 #
 # crossterm provides terminal input and lets the UI draw directly to a terminal.
 [dependencies]
 crossterm = { version = "0.29", default-features = false, features = ["events"] }
+unicode-segmentation = "=1.12.0"
 unicode-width = { version = "0.2", default-features = false }
 
 [target.'cfg(unix)'.dependencies]

@@ -217,8 +217,49 @@ pub(super) fn draw(app: &App, out: &mut impl Write, width: u16, height: u16) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::super::terminal_text::cell_width;
+    use super::super::terminal_text::display_width;
     use super::*;
+
+    #[test]
+    fn managed_label_keeps_whole_graphemes_at_the_right_edge() {
+        let mut row = super::super::rows(&[crate::Spec::parse("owner/plugin")], &[])
+            .pop()
+            .unwrap();
+        for (cluster, columns) in [
+            ("👩‍💻", 4),
+            ("⌚\u{fe0e}", 3),
+            ("☀\u{fe0f}", 4),
+            ("e\u{301}", 3),
+            ("界", 4),
+            ("🇯🇵", 4),
+            ("لا", 3),
+        ] {
+            row.label = format!("{cluster}xy");
+            let render = |columns| {
+                let mut out = Vec::new();
+                row_line(&mut out, &row, true, false, columns, Theme::default()).unwrap();
+                String::from_utf8(out).unwrap()
+            };
+            assert_eq!(render(columns), format!(">{cluster}…"));
+            assert_eq!(render(columns + 1), format!(">{cluster}xy"));
+            assert_eq!(render(columns - 1), ">…");
+        }
+    }
+
+    #[test]
+    fn managed_row_pads_a_ligature_as_one_cell() {
+        let mut row = super::super::rows(&[crate::Spec::parse("owner/plugin")], &[])
+            .pop()
+            .unwrap();
+        row.commit = Some("af06d0ad3fd99dc06027de187f1369328bf2d455".into());
+        let mut render = |label: &str| {
+            row.label = label.into();
+            let mut out = Vec::new();
+            row_line(&mut out, &row, true, false, 64, Theme::default()).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        assert_eq!(render("لا"), render("x").replace("\x1b[1mx", "\x1b[1mلا"));
+    }
 
     #[test]
     fn managed_rows_stay_inside_their_columns() {
@@ -237,7 +278,7 @@ mod tests {
             for segment in segments {
                 visible.push_str(segment.split_once('m').unwrap().1);
             }
-            let width = visible.chars().map(cell_width).sum::<usize>();
+            let width = display_width(&visible);
             assert!(width <= columns, "{columns} columns: {visible}");
             if columns >= 24 {
                 assert!(visible.contains("Missing"));

@@ -27,8 +27,7 @@ change to the matcher or to `--prune` can delete work.
 - New behaviour comes with a test. Bug fixes come with a test that fails without the fix.
 - Comments explain *why*, not what. If a line looks redundant and is not, say why — the
   leading `./` in `herdr-plugin.toml` is the standing example.
-- No new dependencies without discussion. The project has exactly one (`crossterm`, because
-  std cannot set raw terminal mode) and each addition needs to clear the same bar.
+- Discuss new dependencies before adding them.
 
 Things that are held to a higher standard, because getting them wrong destroys user data:
 

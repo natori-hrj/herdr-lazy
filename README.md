@@ -747,8 +747,12 @@ the rest still needs design.
 
 - **Rust, and nearly dependency-free.** The manager is orchestration — shelling out to
   the herdr CLI — which std covers, including a small hand-written JSON reader for
-  `plugin list --json`. The UI uses `crossterm` for terminal input and `unicode-width`
-  to keep CJK names and emoji within the visible Manage columns.
+  `plugin list --json`. The UI uses `crossterm` for terminal input. In views sized by
+  display cells, `unicode-segmentation` provides forward grapheme boundaries for
+  clipping and wrapping. `unicode-width` measures whole text runs, including
+  ligatures that span graphemes. Terminal emulators can use different shaping,
+  bidirectional text handling, and cell widths for ligatures, emoji, variation
+  selectors, and ambiguous-width characters.
 - **Never parse human output.** All state comes from `herdr plugin list --json`.
 - **Long operations leave the TUI** rather than being redrawn as in-pane progress, so
   a failing plugin build shows you its actual output.

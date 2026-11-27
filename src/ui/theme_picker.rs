@@ -4,7 +4,7 @@ use crossterm::event::KeyCode;
 
 use crate::theme::{Role, Theme, INPUT_LIMIT, PRESETS};
 
-use super::terminal_text::clip;
+use super::terminal_text::{clip, clip_tail};
 
 const CUSTOM: usize = PRESETS.len();
 
@@ -187,14 +187,8 @@ impl Picker {
     }
 
     fn draw_input(&self, out: &mut impl Write, row: usize, columns: usize) -> io::Result<()> {
-        // Keep the edit caret visible after the input outgrows its line. Custom palette tokens
-        // are ASCII. An unsupported character can occupy two cells until the user removes it.
-        let reversed: String = self.custom.chars().rev().collect();
-        let tail: String = clip(&reversed, columns.saturating_sub(1))
-            .0
-            .chars()
-            .rev()
-            .collect();
+        // Keep the edit caret visible after the input outgrows its line.
+        let tail = clip_tail(&self.custom, columns.saturating_sub(1));
         write!(out, "\x1b[{row};1H{tail}\x1b[7m \x1b[0m")
     }
 
@@ -237,6 +231,18 @@ impl Picker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_input_draws_whole_graphemes_before_the_caret() {
+        let mut picker = Picker::new(Theme::default(), false);
+        picker.editing = true;
+        picker.custom = "xye\u{301}👩‍💻".into();
+        let mut out = Vec::new();
+        picker.draw(&mut out, 6, 8).unwrap();
+        assert!(String::from_utf8(out)
+            .unwrap()
+            .contains("\x1b[2;1H…e\u{301}👩‍💻\x1b[7m \x1b[0m"));
+    }
 
     #[test]
     fn previews_move_without_changing_the_current_choice() {

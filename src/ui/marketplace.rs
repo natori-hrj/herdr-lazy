@@ -4,7 +4,7 @@ use crate::browse::Browser;
 use crate::registry::{age_label, today_days, Entry};
 use crate::theme::{Color, Role, Theme};
 
-use super::terminal_text::{cell_width, clip};
+use super::terminal_text::{clip, clip_tail};
 use super::{footer_start_row, rule_line, App};
 
 pub(super) struct Window {
@@ -35,29 +35,6 @@ impl Window {
     }
 }
 
-fn query_tail(query: &str, columns: usize) -> String {
-    let mut width = 0;
-    for (index, ch) in query.char_indices().rev() {
-        let cells = if ch.is_control() { 1 } else { cell_width(ch) };
-        if width + cells > columns {
-            if columns <= 1 {
-                return "…".chars().take(columns).collect();
-            }
-            let rest = &query[index + ch.len_utf8()..];
-            // Make room to indicate that the beginning of the query is hidden.
-            let trim = usize::from(width == columns);
-            let mut suffix = rest.chars();
-            if trim > 0 {
-                while suffix.next().is_some_and(|first| cell_width(first) == 0) {}
-            }
-            let (visible, _) = clip(suffix.as_str(), columns - 1);
-            return format!("…{visible}");
-        }
-        width += cells;
-    }
-    clip(query, columns).0
-}
-
 fn search_line(out: &mut impl Write, browser: &Browser, columns: usize) -> io::Result<()> {
     if columns < 2 {
         return write!(out, "\x1b[7m \x1b[0m");
@@ -79,7 +56,7 @@ fn search_line(out: &mut impl Write, browser: &Browser, columns: usize) -> io::R
     } else {
         ""
     };
-    let query = query_tail(&browser.query, available - category.len());
+    let query = clip_tail(&browser.query, available - category.len());
     write!(
         out,
         "{prefix}\x1b[1m{query}\x1b[0m\x1b[7m \x1b[0m\x1b[2m{category}\x1b[0m"
@@ -290,6 +267,7 @@ pub(super) fn draw(
 
 #[cfg(test)]
 mod tests {
+    use super::super::terminal_text::display_width;
     use super::*;
 
     fn app() -> App {
@@ -316,11 +294,59 @@ mod tests {
     }
 
     #[test]
+    fn marketplace_search_keeps_whole_graphemes_before_the_caret() {
+        let mut app = app();
+        for (query, width, expected) in [
+            ("xy👩‍💻", 6, "…👩‍💻"),
+            ("xy👩‍💻", 5, "…"),
+            ("xy👩‍💻", 7, "xy👩‍💻"),
+            ("xy⌚\u{fe0e}", 5, "…⌚\u{fe0e}"),
+            ("xy☀\u{fe0f}", 6, "…☀\u{fe0f}"),
+            ("xy\u{301}", 4, "…"),
+            ("xy\u{301}", 5, "xy\u{301}"),
+            ("xy界", 6, "…界"),
+            ("xy🇯🇵🇺", 7, "…🇯🇵🇺"),
+            ("xy🇯🇵🇺", 6, "…🇺"),
+            ("x\r\ny", 6, "… y"),
+            ("x", 3, ""),
+        ] {
+            app.browser.as_mut().unwrap().query = query.into();
+            let rendered = frame(&app, width, 8, false);
+            let search = format!("/\x1b[1m{expected}\x1b[0m\x1b[7m \x1b[0m");
+            assert!(
+                rendered.contains(&search),
+                "{query:?}, {width}: {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_view_retains_a_forward_indic_grapheme() {
+        let mut app = app();
+        app.browser.as_mut().unwrap().query = "xxकक्क".into();
+        let rendered = frame(&app, 6, 8, false);
+        assert!(
+            rendered.contains("/\x1b[1m…क्क\x1b[0m\x1b[7m "),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn search_view_fits_a_ligature_in_one_cell() {
+        let mut app = app();
+        for (query, width, expected) in [("لا", 4, "لا"), ("xxلا", 5, "…لا")] {
+            app.browser.as_mut().unwrap().query = query.into();
+            let rendered = frame(&app, width, 8, false);
+            let search = format!("/\x1b[1m{expected}\x1b[0m\x1b[7m ");
+            assert!(rendered.contains(&search), "{rendered:?}");
+        }
+    }
+
+    #[test]
     fn marketplace_rows_and_search_fit_terminal_cells() {
         let mut app = app();
         app.browser.as_mut().unwrap().category = Some("notifications");
         app.browser.as_mut().unwrap().query = "現行の検索プラグイン💡xyz".to_string();
-        assert_eq!(query_tail("現行の検索プラグイン💡xyz", 5), "…xyz");
         for width in [1, 2, 10, 24, 40, 64, 80, 120] {
             for height in [2, 4, 5, 6, 8, 14] {
                 let frames = [
@@ -342,7 +368,7 @@ mod tests {
                         }
                         let text = &sequence[index + 1..];
                         assert!(!text.chars().any(char::is_control));
-                        cells += text.chars().map(cell_width).sum::<usize>();
+                        cells += display_width(text);
                         assert!(cells < usize::from(width), "{width}x{height}: {frame:?}");
                     }
                 }

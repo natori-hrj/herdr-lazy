@@ -2,7 +2,7 @@ use std::io::{self, Write};
 
 use super::{
     footer_start_row, rule_line,
-    terminal_text::{cell_width, clip},
+    terminal_text::{clip, one_line, wrap_line},
     App, Color, Role,
 };
 use crate::github::Changes;
@@ -36,24 +36,10 @@ impl Body {
     }
 
     fn push_wrapped_color(&mut self, text: &str, width: usize, color: Color) {
-        let mut line = String::new();
-        let mut columns = 0;
-        for ch in text.chars() {
-            let ch = if ch.is_control() { ' ' } else { ch };
-            let cells = cell_width(ch);
-            if columns + cells > width && !line.is_empty() {
-                self.push_color(std::mem::take(&mut line), color);
-                columns = 0;
-            }
-            if cells > width {
-                line.push('…');
-                columns += 1;
-            } else {
-                line.push(ch);
-                columns += cells;
-            }
+        if text.is_empty() {
+            return;
         }
-        if !line.is_empty() {
+        for line in wrap_line(&one_line(text), width) {
             self.push_color(line, color);
         }
     }
@@ -369,6 +355,22 @@ mod tests {
         let mut output = Vec::new();
         draw(app, &mut output, width, height).unwrap();
         String::from_utf8(output).unwrap()
+    }
+
+    #[test]
+    fn detail_description_wraps_whole_graphemes() {
+        let mut app = fixture();
+        let detail = app.rows[0].detail.as_mut().unwrap();
+        detail.description = "x👩‍💻⌚\u{fe0e}☀\u{fe0f}e\u{301}界🇯🇵\tZ".into();
+        let frame = render(&app, 5, 24);
+        for line in [" x👩‍💻", " ⌚\u{fe0e}☀\u{fe0f}", " e\u{301}界", " 🇯🇵 ", " Z"]
+        {
+            assert!(frame.contains(&format!(";1H{line}\x1b[0m")), "{frame:?}");
+        }
+        assert!(!frame.contains('\t'));
+        let frame = render(&app, 3, 24);
+        assert!(frame.contains(";1H …\x1b[0m"));
+        assert!(!frame.contains('💻'));
     }
 
     #[test]
