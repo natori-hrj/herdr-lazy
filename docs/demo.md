@@ -1,74 +1,54 @@
-# Reproduce the TUI demo
+# Reproduce the documentation demo
 
-The default 24-second recording uses the binary you build in a 112×24 terminal.
-Its plugin list, installed records, and Marketplace entries are fictional,
-so it runs without Herdr, network access, or any personal configuration.
+The tape drives the published herdr-lazy **v0.45.0** Linux x86-64 binary through
+ttyd and captures the terminal viewport with [VHS v0.12.1](https://github.com/charmbracelet/vhs/releases/tag/v0.12.1).
+It opens Manage, finds Marketplace with the fuzzy query `mkt`, narrows the
+catalog with `worktree`, refreshes it in the background, inspects the first
+plugin, and previews themes before applying Nord.
 
-On Linux or macOS, build with Rust 1.78 or later and run the recorder with Python 3:
+## Regenerate the media
 
-```sh
-cargo build --release --locked
-python3 scripts/record-demo.py target/release/herdr-lazy /tmp/herdr-lazy-demo.cast
-```
-
-Supply an unused output path. The recorder uses only the Python standard
-library and exits if an expected screen never appears. An asciinema player
-can replay the resulting cast, for example with `asciinema play /tmp/herdr-lazy-demo.cast`.
-Playback pauses are fixed by the recorder so that readers have time to see the
-screens. They are independent of app latency.
-
-| Playback | View | Action |
-| --- | --- | --- |
-| 0–4 s | Manage | Review two installed plugins and one missing entry |
-| 4–9 s | Detail | Press `l` to see the selected plugin's declared actions |
-| 9–11 s | Manage | Press `Esc` to return |
-| 11–21 s | Marketplace | Press `/` and type `worktree` to narrow the catalog |
-| 21–24 s | Manage | Press `Esc` and then `q` |
-
-For a PR screenshot, pause on the relevant playback frame and capture the
-terminal window. Use the same terminal font, dimensions and palette for
-before/after images. Keep screenshots of real workspaces free of private paths
-and repository names.
-
-### Theme screenshots
-
-With v0.45.0 or later, use a fixed 80×24 frame for
-comparable screenshots. Record each built-in palette and pause on the same
-view and timestamp:
+On Linux x86-64, install Bash, curl, tar, unzip, sha256sum, Python 3,
+Fontconfig, Chromium and FFmpeg. Use the same system browser and FFmpeg
+builds when comparing pixels or file sizes across runs.
 
 ```sh
-for theme in terminal catppuccin tokyo-night gruvbox nord; do
-  python3 scripts/record-demo.py target/release/herdr-lazy \
-    "/tmp/herdr-lazy-${theme}.cast" --columns 80 --theme "$theme"
-done
+./scripts/record-vhs.sh /tmp/herdr-lazy-media
+./scripts/record-vhs.sh /tmp/herdr-lazy-media-24 24   # compare 24 px type
 ```
 
-Use 0.1 seconds for the first Manage frame or 16 seconds for the completed
-Marketplace search. A pre-theme release can record the same screens with the
-terminal's default palette. The cast records color escape sequences, so use a
-true-color terminal when comparing presets.
+The script downloads official VHS, ttyd 1.7.7, JetBrains Mono 2.304, and
+herdr-lazy release binaries. It checks their pinned SHA-256 values, verifies
+the VHS and application versions, and checks that Fontconfig selects the
+temporary JetBrains Mono installation.
 
-### Command palette, theme picker, and cache refresh
+The plugin names, metadata, bundle and all 18 Marketplace entries are
+fictional. Manage shows nine plugins with Installed, Disabled, Missing and
+Unlisted states. The `worktree` search returns 12 entries. A local downloader
+stub serves the same fixture after a short delay so the real background
+refresh and its status are visible. The tape uses temporary home and XDG
+directories and the app starts with an allowlisted environment. VHS and ttyd
+communicate over loopback. The script verifies that the app saved Nord inside
+the fixture, then removes the temporary workspace.
 
-These modes use features introduced in v0.45.0. Build that version or a later
-checkout and pass its binary to the recorder:
+## Tape and outputs
 
-```sh
-cargo build --release --locked
-for mode in palette theme cached-marketplace; do
-  python3 scripts/record-demo.py target/release/herdr-lazy \
-    "/tmp/herdr-lazy-${mode}.cast" --columns 80 --mode "$mode"
-done
-```
+[`vhs/workflow.tape`](vhs/workflow.tape) uses 1280×720, 22 px JetBrains Mono,
+24 px padding, Catppuccin Mocha and a steady cursor. The terminal palette
+stays fixed while the app previews and applies its own role colors.
 
-| Mode | Feature | Frames to compare |
-| --- | --- | --- |
-| `palette` | Command palette | At 2 s, Ctrl+P opens Commands. At 5 s the query narrows to Browse Marketplace, which opens at 9 s. |
-| `theme` | Interactive theme picker | At 2 s, `T` opens the picker. At 5 s it previews Catppuccin and at 9 s Enter applies it to the fixture. |
-| `cached-marketplace` | Adaptive Marketplace with background refresh | At 2 s the cached catalog is visible. At 5 s it shows the search results, at 9 s a refresh is in flight, and at 13 s the failed refresh leaves those results visible. |
+| Files | Moment captured |
+| --- | --- |
+| `manage.png`, `manage-themed.png` | Manage before and after applying Nord |
+| `command-palette.png`, `command-palette-search.png` | Available commands and the fuzzy query |
+| `marketplace-catalog.png`, `marketplace.png`, `marketplace-refresh.png` | Full catalog, filtered results and in-progress refresh |
+| `details.png` | Repository, revision, actions, event and key binding preview |
+| `theme-catppuccin.png`, `theme-selection.png` | Different theme previews |
+| `demo.gif`, `demo.mp4` | Complete workflow and transitions |
 
-The theme mode writes only inside the disposable fixture and cannot be combined
-with `--theme`, which has environment precedence over the picker. The cached
-Marketplace mode uses a two-hour-old fictional index and a local downloader that
-returns a controlled error after the in-flight frame is captured. No network
-request is made. These playback timings are chosen for readability.
+The tape uses fixed pauses for readability. Those timings are independent of
+[the PTY benchmarks](release-v0.45.0.md#performance). Review the staged
+materials at full size and at 800 px and 390 px before updating
+`docs/media/vhs/`. The [comparison](vhs/visual-review.md) records the chosen
+settings and current layout trade-offs. Running `./scripts/record-vhs.sh`
+without an output argument writes to the tracked media directory.
