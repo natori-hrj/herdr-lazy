@@ -105,7 +105,7 @@ fn search_line(
     let query = query_tail(&browser.query, available - controls.len());
     write!(
         out,
-        "\x1b[1m{prefix}{query}\x1b[0m\x1b[7m \x1b[0m\x1b[2m{controls}\x1b[0m"
+        "\x1b[1m{prefix}\x1b[0m\x1b[1m{query}\x1b[0m\x1b[7m \x1b[0m{controls}"
     )?;
     Ok(divider_controls)
 }
@@ -188,7 +188,7 @@ fn draw_results(
                 write!(out, "{:gap$}{color}{status:<status_width$}{foreground}", "")?;
                 padding = 0;
             }
-            layout.write_tail(out, padding, metrics, &entry.description, focused)?;
+            layout.write_tail(out, padding, metrics, &entry.description)?;
         }
         if focused {
             finish_selection(out)?;
@@ -251,12 +251,7 @@ pub(super) fn draw(
         };
         write!(out, "\x1b[1m{title}\x1b[0m")?;
         if !note.is_empty() {
-            let dim = if refreshing || failed || inventory_note.is_some() {
-                ""
-            } else {
-                "\x1b[2m"
-            };
-            write!(out, "  {dim}{color}{note}\x1b[0m")?;
+            write!(out, "  {color}{note}\x1b[0m")?;
         }
         write!(out, "\x1b[2;1H")?;
     }
@@ -266,8 +261,11 @@ pub(super) fn draw(
         None
     };
     if window.top == 3 {
-        let divider = divider_controls.unwrap_or_else(|| rule_line(width));
-        write!(out, "\x1b[3;1H\x1b[2m{divider}\x1b[0m")?;
+        if let Some(controls) = divider_controls {
+            write!(out, "\x1b[3;1H{controls}")?;
+        } else {
+            write!(out, "\x1b[3;1H\x1b[2m{}\x1b[0m", rule_line(width))?;
+        }
     }
 
     let description_width = if results.is_empty() {
@@ -297,8 +295,11 @@ pub(super) fn draw(
             let (text, cells) = clip(&entry.description, columns);
             (cells > description_width && cells > 1).then_some(text)
         });
-        let divider_text = preview.unwrap_or_else(|| rule_line(width));
-        write!(out, "\x1b[{divider};1H\x1b[2m{divider_text}\x1b[0m")?;
+        if let Some(description) = preview {
+            write!(out, "\x1b[{divider};1H{description}")?;
+        } else {
+            write!(out, "\x1b[{divider};1H\x1b[2m{}\x1b[0m", rule_line(width))?;
+        }
         let primary = "[Enter] Add";
         let mut hint_line = String::new();
         for hint in [
@@ -371,15 +372,50 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("\x1b[1mSearch \x1b[0m"));
         assert!(output.contains("\x1b[1m[Enter] Add\x1b[0m"));
-        assert!(output.contains("\x1b[2mcached 2h ago\x1b[0m"));
+        assert!(output.contains("\x1b[0m  cached 2h ago\x1b[0m"));
 
         let browser = app.browser.as_mut().unwrap();
         browser.source_note = "cached 2h ago (refresh failed: offline)".into();
         browser.query = "unmatched".into();
         let empty = frame(&app, 80, 24, false);
         let danger = app.theme.color(Role::Danger);
+        assert!(empty.contains("\x1b[1mSearch \x1b[0m\x1b[1munmatched\x1b[0m\x1b[7m "));
         assert!(empty.contains(&format!("  {danger}refresh failed: offline")));
         assert!(empty.contains("\x1b[22;1H[Enter] Add"));
+    }
+
+    #[test]
+    fn marketplace_supporting_information_uses_normal_intensity() {
+        let mut app = app();
+        let browser = app.browser.as_mut().unwrap();
+        browser.all[0].description = "Workspace shortcuts".into();
+        browser.all.push(Entry {
+            full_name: "owner/other".into(),
+            description: "Navigate between workspaces".into(),
+            ..Entry::default()
+        });
+        browser.cursor = 1;
+        for preset in crate::theme::PRESETS {
+            app.theme = preset.palette;
+            let wide = frame(&app, 120, 24, false);
+            for (position, next, labels) in [
+                ("4;1H", "5;1H", ["180★", "Workspace shortcuts"]),
+                ("5;1H", "21;1H", ["0★", "Navigate between workspaces"]),
+                ("2;1H", "3;1H", ["[Tab]", "[Ctrl+N]"]),
+            ] {
+                let (_, line) = wide.split_once(&format!("\x1b[{position}")).unwrap();
+                let (line, _) = line.split_once(&format!("\x1b[{next}")).unwrap();
+                assert!(labels.iter().all(|label| line.contains(label)), "{line:?}");
+                assert!(!line.contains("\x1b[2m"), "{line:?}");
+            }
+            assert!(wide.contains("\x1b[3;1H\x1b[2m─"));
+            assert!(wide
+                .contains("\x1b[0m  [Esc] Back  [Ctrl+L] Reset  [Ctrl+O] Repo  [Ctrl+R] Refresh"));
+
+            let narrow = frame(&app, 40, 24, false);
+            assert!(narrow.contains("\x1b[3;1HTab "));
+            assert!(narrow.contains("\x1b[21;1HNavigate between workspaces\x1b[22;1H"));
+        }
     }
 
     #[test]

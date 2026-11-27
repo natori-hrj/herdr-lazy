@@ -134,7 +134,6 @@ fn draw_rows(app: &App, out: &mut impl Write, columns: usize, height: u16) -> io
                     layout.name - cells,
                     if commit.is_empty() { "-" } else { commit },
                     note,
-                    focused,
                 )?;
             }
         }
@@ -176,7 +175,7 @@ pub(super) fn draw(app: &App, out: &mut impl Write, width: u16, height: u16) -> 
         let (counts, _) = clip(&counts, columns.saturating_sub(cells));
         write!(
             out,
-            "\x1b[1m{title}\x1b[0m\x1b[2m{counts}\x1b[0m\x1b[2;1H\x1b[2m{}\x1b[0m",
+            "\x1b[1m{title}\x1b[0m{counts}\x1b[2;1H\x1b[2m{}\x1b[0m",
             rule_line(width)
         )?;
     }

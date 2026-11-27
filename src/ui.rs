@@ -4658,6 +4658,37 @@ mod tests {
     }
 
     #[test]
+    fn manage_supporting_information_uses_the_row_foreground() {
+        for preset in crate::theme::PRESETS {
+            let mut app = App {
+                rows: rows(&[Spec::parse("owner/a"), Spec::parse("owner/b")], &[]),
+                theme: preset.palette,
+                ..App::default()
+            };
+            for row in &mut app.rows {
+                row.commit = Some("af06d0ad3fd99dc06027de187f1369328bf2d455".into());
+            }
+
+            let frame = draw_list_frame(&app, 120);
+            let selection = app.theme.selection();
+            for (offset, fg) in [selection.foreground(), crate::theme::Color::Ansi(39)]
+                .into_iter()
+                .enumerate()
+            {
+                let row = list_frame_row(&frame, LIST_TOP + 1 + offset);
+                let (name, tail) = row.split_once("\x1b[22m").unwrap();
+                assert!(name.contains(&format!("{fg} ")), "{row:?}");
+                assert!(tail.contains("af06d0ad3fd9") && tail.contains("in your list"));
+                assert!(!tail.contains("\x1b[2m"), "{row:?}");
+                assert_eq!(row.starts_with(&selection.to_string()), offset == 0);
+            }
+            let header = frame.split("\x1b[2;1H").next().unwrap();
+            assert!(!header.contains("\x1b[2m"), "{header:?}");
+            assert!(list_frame_row(&frame, 2).starts_with("\x1b[2m─"));
+        }
+    }
+
+    #[test]
     fn selection_surface_keeps_custom_status_and_metadata_readable() {
         use crate::browse::Browser;
         use crate::theme::Color;
