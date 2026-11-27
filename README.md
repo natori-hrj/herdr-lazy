@@ -428,9 +428,9 @@ Press `/` and type. Enter adds the highlighted plugin to your list, closes the s
 leaves the cursor on the new entry — so `i` then installs the thing you just chose, and not
 whatever row you happened to be on before.
 
-Each result shows its star count and how long ago it was last pushed — `3d`, `2w`, `5mo` —
-because whether a plugin is still maintained matters more than how many stars it has.
-`ctrl+o` opens the repository, so you can read someone's code before installing it.
+Each result shows whether the plugin is installed or listed. When there is room, the
+pane also shows stars and the time since the repository's last push, such as `3d` or `2w`.
+Press `ctrl+o` to open the repository before installing it.
 
 Search terms are ANDed and each may match the name, description or topics, so `worktree fzf`
 finds a worktree plugin whose description mentions fzf.

@@ -18,6 +18,8 @@ use std::{
 };
 
 mod managed_list;
+mod marketplace;
+mod terminal_text;
 
 use crate::theme::{Color, Role, Theme};
 
@@ -745,7 +747,6 @@ fn rows_with_herdr_version(
 /// query, rule). Click handling and drawing must agree on this, so it lives in one place
 /// rather than being counted twice.
 const LIST_TOP: usize = 2;
-const BROWSER_TOP: usize = 3;
 
 const FOOTER_ROWS: u16 = 3;
 const STARTUP_REDRAWS: u8 = 3;
@@ -2143,17 +2144,10 @@ impl App {
                 MouseEventKind::ScrollDown => b.move_down(),
                 MouseEventKind::ScrollUp => b.move_up(),
                 MouseEventKind::Down(MouseButton::Left) => {
-                    let y = m.row as usize;
-                    if y >= BROWSER_TOP {
-                        let visible = (height as usize).saturating_sub(7).max(1);
-                        let start = if b.cursor >= visible {
-                            b.cursor - visible + 1
-                        } else {
-                            0
-                        };
-                        let idx = start + (y - BROWSER_TOP);
-                        if y - BROWSER_TOP < visible && idx < b.results().len() {
-                            b.cursor = idx;
+                    if let Some(index) = marketplace::Window::new(b.cursor, height).index_at(m.row)
+                    {
+                        if index < b.results().len() {
+                            b.cursor = index;
                         }
                     }
                 }
@@ -3121,86 +3115,8 @@ impl App {
         out.flush()
     }
 
-    /// Every key, grouped by what it acts on.
-    ///
-    /// The list's keys are deliberately paired: lowercase is the row under the cursor,
-    /// uppercase is everything. That rule is invisible in the footer, which has room for one
-    /// of each pair at most, so it is spelled out here.
-    /// The marketplace overlay: a query line, matching plugins, and what each one is.
     fn draw_browser(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
-        let success = self.theme.color(Role::Success);
-        let warning = self.theme.color(Role::Warning);
-        let accent = self.theme.color(Role::Accent);
-        let b = self.browser.as_ref().expect("checked by caller");
-        let rule = rule_line(width);
-        let results = b.results();
-        let today = crate::registry::today_days();
-
-        write!(out, "\x1b[H\x1b[2J")?;
-        writeln!(
-            out,
-            "\x1b[1m marketplace\x1b[0m  \x1b[2m{} of {} · {}\x1b[0m\r",
-            results.len(),
-            b.all.len(),
-            b.source_note
-        )?;
-        writeln!(
-            out,
-            " search: \x1b[1m{}\x1b[0m\x1b[7m \x1b[0m  \x1b[2m[tab]\x1b[0m \x1b[1m{}\x1b[0m\r",
-            b.query,
-            b.category_label()
-        )?;
-        writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
-
-        let visible = (height as usize).saturating_sub(7).max(1);
-        let start = if b.cursor >= visible {
-            b.cursor - visible + 1
-        } else {
-            0
-        };
-        if results.is_empty() {
-            writeln!(out, " \x1b[2mnothing matches\x1b[0m\r")?;
-        }
-        for (i, e) in results.iter().enumerate().skip(start).take(visible) {
-            let selected = i == b.cursor;
-            let pointer = if selected { "\x1b[7m>\x1b[0m" } else { " " };
-            // Already in the list is worth knowing before you add it a second time.
-            let (listed_color, mark) = if b.is_listed(e) {
-                (success, "✔")
-            } else {
-                (Color::Plain, " ")
-            };
-            // Last push, not stars, is what says whether a plugin still works. Four columns
-            // is enough for "3d" / "2w" / "5mo" and costs almost nothing.
-            let age = crate::registry::age_label(&e.pushed_at, today);
-            writeln!(
-                out,
-                "{pointer} {listed_color}{mark}\x1b[0m {warning}{:>4}★\x1b[0m {:<38} \x1b[2m{:<5}{}\x1b[0m\r",
-                e.stars,
-                truncate(&sanitize_log_output(&e.full_name), 38),
-                age,
-                truncate(
-                    &sanitize_log_output(&e.description),
-                    width.saturating_sub(58) as usize
-                )
-            )?;
-        }
-
-        let footer = match &self.flash {
-            Some(msg) => format!("{accent}{}\x1b[0m", msg),
-            None => "\x1b[1m[enter]\x1b[0m add to your list  \x1b[1m[tab]\x1b[0m category  \
-                     \x1b[1m[ctrl+o]\x1b[0m open repo  \x1b[1m[↑↓]\x1b[0m move  \
-                     \x1b[1m[ctrl+r]\x1b[0m refresh  \x1b[1m[esc]\x1b[0m back"
-                .to_string(),
-        };
-        write!(
-            out,
-            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r\n",
-            footer_start_row(height),
-            rule,
-            footer
-        )?;
-        out.flush()
+        marketplace::draw(self, out, width, height, false)
     }
 
     fn draw_extras(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
