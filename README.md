@@ -14,11 +14,9 @@ pane to browse the Marketplace, inspect plugins, and decide what to install or u
 [![Latest release](https://img.shields.io/github/v/release/natori-hrj/herdr-lazy)](https://github.com/natori-hrj/herdr-lazy/releases/latest)
 ![Platforms: macOS, Linux, Windows](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-informational)
 
-![herdr-lazy in Ghostty: Herdr's main screen, the manage pane, marketplace search, and adding a plugin](docs/demo.gif)
+![herdr-lazy v0.45.0 terminal demo showing Manage, details, command palette, Marketplace, and theme selection](docs/media/vhs/demo.gif)
 
-[Record the released Manage, Detail, and Marketplace workflow with an offline fixture](docs/demo.md).
-The guide also covers recordings for the command palette, theme picker,
-and cached Marketplace refresh in v0.45.0.
+[Watch the MP4](docs/media/vhs/demo.mp4) · [Regenerate the VHS recording and screenshots](docs/demo.md)
 
 ## Try it in 60 seconds
 

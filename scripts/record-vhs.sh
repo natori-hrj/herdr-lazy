@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Generate documentation media from official binaries in a disposable workspace.
+set -euo pipefail
+
+repo=$(cd "$(dirname "$0")/.." && pwd)
+output=${1:-"$repo/docs/media/vhs"}
+mkdir -p "$output"
+output=$(cd "$output" && pwd)
+work=$(mktemp -d)
+trap 'rm -rf -- "$work"' EXIT
+mkdir -p "$work"/{bin,fixture,home,config,data/fonts,cache,state,run}
+
+download() {
+    local url=$1 sha=$2 file="$work/${1##*/}"
+    curl --fail --silent --show-error --location --retry 2 --output "$file" "$url"
+    printf '%s  %s\n' "$sha" "$file" | sha256sum --check >&2
+}
+
+vhs=vhs_0.12.1_Linux_x86_64
+app=herdr-lazy-0.45.0-c7ddbb421f00-x86_64-unknown-linux-musl
+download "https://github.com/charmbracelet/vhs/releases/download/v0.12.1/$vhs.tar.gz" \
+    eb33787a5b1cebf91fe0b18bd231e2d71d36c1ff4babd99ddac1a6ab411efd10
+download https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 \
+    8a217c968aba172e0dbf3f34447218dc015bc4d5e59bf51db2f2cd12b7be4f55
+download https://github.com/JetBrains/JetBrainsMono/releases/download/v2.304/JetBrainsMono-2.304.zip \
+    6f6376c6ed2960ea8a963cd7387ec9d76e3f629125bc33d1fdcd7eb7012f7bbf
+download "https://github.com/natori-hrj/herdr-lazy/releases/download/v0.45.0/$app.tar.gz" \
+    84b56a215f9b438e9b78b5cf9b24e328a2616ec6e485a365731ce26fc6837df3
+
+tar -xzf "$work/$vhs.tar.gz" -C "$work/bin" --strip-components=1 "$vhs/vhs"
+tar -xzf "$work/$app.tar.gz" -C "$work/bin" herdr-lazy
+install "$work/ttyd.x86_64" "$work/bin/ttyd"
+for style in Regular Bold; do
+    unzip -p "$work/JetBrainsMono-2.304.zip" "fonts/ttf/JetBrainsMono-$style.ttf" \
+        > "$work/data/fonts/JetBrainsMono-$style.ttf"
+done
+
+{
+    printf '#!/bin/bash\n'
+    printf 'exec python3 %q %q %q\n' "$repo/scripts/vhs-launch.py" "$work/bin/herdr-lazy" "$work/fixture"
+} > "$work/run/launch-demo"
+chmod 700 "$work/run/launch-demo"
+
+isolated() {
+    env -i PATH="$work/bin:/usr/bin:/bin" HOME="$work/home" XDG_CONFIG_HOME="$work/config" \
+        XDG_CACHE_HOME="$work/cache" XDG_DATA_HOME="$work/data" XDG_STATE_HOME="$work/state" \
+        LC_ALL=C.UTF-8 "$@"
+}
+
+[[ $(isolated vhs --version) == 'vhs version v0.12.1 '* ]]
+[[ $(isolated herdr-lazy --version) == 'herdr-lazy 0.45.0' ]]
+[[ $(isolated fc-match -f '%{file}' 'JetBrains Mono') == "$work/data/fonts/JetBrainsMono-Regular.ttf" ]]
+(
+    cd "$work/run"
+    isolated vhs "$repo/docs/vhs/workflow.tape"
+)
+assets=(demo.gif demo.mp4 manage.png details.png command-palette.png marketplace.png theme-selection.png)
+for asset in "${assets[@]}"; do
+    test -s "$work/run/$asset"
+done
+for asset in "${assets[@]}"; do
+    install -m 644 "$work/run/$asset" "$output/$asset"
+done

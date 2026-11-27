@@ -8,23 +8,22 @@ security sources and dependency versions are unchanged. See the
 
 ## Terminal captures and recordings
 
-These 80×24 captures use the security-integrated main build `45b84cbc3044eb3848c19007812a2b04eaab9399`
-with fictional plugin data. The subsequent CLI version flags leave the TUI unchanged.
+These 1760×660 terminal captures were recorded with VHS from the published
+v0.45.0 binary using fictional plugin data.
 
-![Marketplace search using cached results](screenshots/v0450-marketplace.png)
+![Manage plugin list and selected row](media/vhs/manage.png)
 
-![Manage command palette search](screenshots/v0450-palette.png)
+![Selected plugin metadata and actions](media/vhs/details.png)
 
-![Theme picker preview](screenshots/v0450-theme.png)
+![Manage command palette search](media/vhs/command-palette.png)
 
-Download the recordings and replay them with `asciinema play`.
+![Marketplace search showing the selected row and Japanese fixture text](media/vhs/marketplace.png)
 
-- [Manage, details, and Marketplace workflow](recordings/v0450-workflow.cast)
-- [Command palette](recordings/v0450-palette.cast)
-- [Theme preview and persistence](recordings/v0450-theme.cast)
-- [Cached Marketplace during refresh](recordings/v0450-cached-marketplace.cast)
+![Theme picker preview](media/vhs/theme-selection.png)
 
-The [demo guide](demo.md) includes the recording commands and theme captures.
+The 25-second workflow is available as a [GIF](media/vhs/demo.gif) and
+[MP4](media/vhs/demo.mp4). The [VHS guide](demo.md) describes how to regenerate
+both videos and all five screenshots.
 
 ## Performance
 
