@@ -127,3 +127,27 @@ the Security tab.
 
 By contributing you agree that your work is licensed under the MIT Licence, as the rest of
 the project is.
+
+## Measuring TUI startup and local search
+
+Run the opt-in Unix PTY benchmark with Python 3 and a release build:
+
+```sh
+cargo build --release --locked
+python3 scripts/benchmark-pty.py target/release/herdr-lazy
+```
+
+The harness uses a 120×24 PTY, an isolated temporary config and cache, a minimal Herdr
+stub, and 1,000 synthetic Marketplace entries. It supplies an isolated command search
+path and does not contact the network. No additional Python packages are required.
+
+Two warm-up runs are discarded. The defaults are 30 starts and 90 search keypresses
+(`f`, `z`, `f` per start). Startup runs from process launch to the first list footer.
+Search runs from writing each byte to seeing the matching query and browser footer.
+The report includes the median and nearest-rank p95. These measurements include PTY
+I/O and exclude terminal emulator paint, real Herdr and filesystem cold-start costs.
+There are no pass/fail timing thresholds.
+
+For a before/after comparison, build both revisions in release mode and run the same
+harness with the same `--runs` on one idle machine. Record both revisions, host OS and
+CPU, Rust version, and reported medians and p95s.
