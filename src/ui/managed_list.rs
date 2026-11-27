@@ -1,7 +1,9 @@
 use std::io::{self, Write};
 
+use crate::theme::{Color, Selection};
+
 use super::list_columns::Columns;
-use super::terminal_text::clip;
+use super::terminal_text::{clip, finish_selection, start_selection};
 use super::{footer_start_row, rule_line, App, Role, Row, Status, LIST_TOP};
 
 pub(super) fn list_top(height: u16) -> usize {
@@ -72,15 +74,6 @@ fn draw_rows(app: &App, out: &mut impl Write, columns: usize, height: u16) -> io
     let state_width = status_width + usize::from(show_markers) * 3;
     let narrow = columns < 12 || columns < selector_width + state_width + 1;
     let prefix = if narrow { 1 } else { selector_width } + state_width;
-    if columns < prefix {
-        for (offset, row) in rows.iter().enumerate() {
-            let point = compact_pointer(start + offset == app.cursor, row.picked);
-            let (label, _) = clip(&row.label, columns - 1);
-            write!(out, "\x1b[{};1H{point}{label}", top + offset + 1)?;
-        }
-        return Ok(());
-    }
-
     let details: Vec<_> = rows
         .iter()
         .map(|row| {
@@ -99,6 +92,11 @@ fn draw_rows(app: &App, out: &mut impl Write, columns: usize, height: u16) -> io
     );
     for (offset, (row, (commit, note))) in rows.iter().zip(&details).enumerate() {
         let focused = start + offset == app.cursor;
+        let selection = focused.then(|| app.theme.selection());
+        write!(out, "\x1b[{};1H", top + offset + 1)?;
+        if let Some(selection) = selection {
+            start_selection(out, selection, columns)?;
+        }
         let pointer = if narrow {
             compact_pointer(focused, row.picked)
         } else if focused {
@@ -106,32 +104,42 @@ fn draw_rows(app: &App, out: &mut impl Write, columns: usize, height: u16) -> io
         } else {
             "  "
         };
-        let checkbox = match (picked && !narrow, row.picked) {
-            (true, true) => "[x] ",
-            (true, false) => "[ ] ",
-            _ => "",
-        };
-        let status = status_label(&row.status, compact);
-        let color = app.theme.color(row.status.role());
-        let (name, cells) = clip(&row.label, layout.name);
-        let emphasized = if focused { "\x1b[1m" } else { "" };
-        write!(
-            out,
-            "\x1b[{};1H{pointer}{checkbox}{color}{status:<status_width$}\x1b[0m",
-            top + offset + 1
-        )?;
-        if show_markers {
-            let [warning, disabled, update] = markers(row);
-            write!(out, "{warning}{disabled}{update}")?;
-        }
-        if columns > prefix {
-            write!(out, " {emphasized}{name}\x1b[0m")?;
-            layout.write_tail(
+        if columns < prefix {
+            let (label, _) = clip(&row.label, columns - 1);
+            write!(out, "{pointer}{label}")?;
+        } else {
+            let checkbox = match (picked && !narrow, row.picked) {
+                (true, true) => "[x] ",
+                (true, false) => "[ ] ",
+                _ => "",
+            };
+            let status = status_label(&row.status, compact);
+            let color = app.theme.color(row.status.role());
+            let color = selection.map_or(color, |selection| selection.status_color(color));
+            let foreground = selection.map_or(Color::Ansi(39), Selection::foreground);
+            write!(
                 out,
-                layout.name - cells,
-                if commit.is_empty() { "-" } else { commit },
-                note,
+                "{pointer}{checkbox}{color}{status:<status_width$}{foreground}"
             )?;
+            if show_markers {
+                let [warning, disabled, update] = markers(row);
+                write!(out, "{warning}{disabled}{update}")?;
+            }
+            if columns > prefix {
+                let (name, cells) = clip(&row.label, layout.name);
+                let emphasized = if focused { "\x1b[1m" } else { "" };
+                write!(out, " {emphasized}{name}\x1b[22m")?;
+                layout.write_tail(
+                    out,
+                    layout.name - cells,
+                    if commit.is_empty() { "-" } else { commit },
+                    note,
+                    focused,
+                )?;
+            }
+        }
+        if focused {
+            finish_selection(out)?;
         }
     }
     Ok(())
@@ -305,7 +313,7 @@ mod tests {
             app.draw(&mut frame, width, 2).unwrap();
             let frame = String::from_utf8(frame).unwrap();
             let (_, line) = frame.split_once("\x1b[1;1H").unwrap();
-            let mut segments = line.split("\x1b[");
+            let mut segments = line.rsplit("\x1b[1G").next().unwrap().split("\x1b[");
             let mut visible = segments.next().unwrap().to_string();
             for segment in segments {
                 visible.push_str(segment.split_once('m').unwrap().1);
@@ -334,7 +342,8 @@ mod tests {
             let mut output = Vec::new();
             draw_rows(&app, &mut output, columns, 2).unwrap();
             let output = String::from_utf8(output).unwrap();
-            let mut segments = output.strip_prefix("\x1b[1;1H").unwrap().split("\x1b[");
+            let line = output.strip_prefix("\x1b[1;1H").unwrap();
+            let mut segments = line.rsplit("\x1b[1G").next().unwrap().split("\x1b[");
             let mut visible = segments.next().unwrap().to_string();
             for segment in segments {
                 visible.push_str(segment.split_once('m').unwrap().1);

@@ -2,10 +2,10 @@ use std::io::{self, Write};
 
 use crate::browse::Browser;
 use crate::registry::{age_label, today_days, Entry};
-use crate::theme::{Color, Role};
+use crate::theme::{Color, Role, Selection};
 
 use super::list_columns::Columns;
-use super::terminal_text::{cell_width, clip};
+use super::terminal_text::{cell_width, clip, finish_selection, start_selection};
 use super::{footer_start_row, rule_line, App};
 
 pub(super) struct Window {
@@ -164,26 +164,35 @@ fn draw_results(
     );
     for (offset, (entry, status, metrics)) in rows.iter().enumerate() {
         let focused = window.start + offset == browser.cursor;
+        let selection = focused.then(|| app.theme.selection());
+        write!(out, "\x1b[{};1H", window.top + offset + 1)?;
+        if let Some(selection) = selection {
+            start_selection(out, selection, columns)?;
+        }
         let point = if focused { ">" } else { " " };
-        write!(out, "\x1b[{};1H{point}", window.top + offset + 1)?;
-        if columns == 1 {
-            continue;
+        write!(out, "{point}")?;
+        if columns > 1 {
+            let (name, cells) = clip(&entry.full_name, layout.name);
+            let emphasize = if focused { "\x1b[1m" } else { "" };
+            write!(out, " {emphasize}{name}\x1b[22m")?;
+            let mut padding = layout.name - cells;
+            if status_width > 0 {
+                let gap = padding + 2;
+                let color = if status.is_empty() {
+                    Color::Plain
+                } else {
+                    let color = app.theme.color(Role::Success);
+                    selection.map_or(color, |selection| selection.status_color(color))
+                };
+                let foreground = selection.map_or(Color::Ansi(39), Selection::foreground);
+                write!(out, "{:gap$}{color}{status:<status_width$}{foreground}", "")?;
+                padding = 0;
+            }
+            layout.write_tail(out, padding, metrics, &entry.description, focused)?;
         }
-        let (name, cells) = clip(&entry.full_name, layout.name);
-        let emphasize = if focused { "\x1b[1m" } else { "" };
-        write!(out, " {emphasize}{name}\x1b[0m")?;
-        let mut padding = layout.name - cells;
-        if status_width > 0 {
-            let gap = padding + 2;
-            let color = if status.is_empty() {
-                Color::Plain
-            } else {
-                app.theme.color(Role::Success)
-            };
-            write!(out, "{:gap$}{color}{status:<status_width$}\x1b[0m", "")?;
-            padding = 0;
+        if focused {
+            finish_selection(out)?;
         }
-        layout.write_tail(out, padding, metrics, &entry.description)?;
     }
     Ok(layout.trailing)
 }
@@ -449,7 +458,7 @@ mod tests {
                             .char_indices()
                             .find(|(_, ch)| ('@'..='~').contains(ch))
                             .unwrap();
-                        if final_char == 'H' {
+                        if matches!(final_char, 'H' | 'G') {
                             cells = 0;
                             if let Some((row, _)) = sequence[..index].split_once(';') {
                                 assert!(row.parse::<u16>().unwrap() <= height);
