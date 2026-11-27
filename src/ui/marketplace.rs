@@ -2,8 +2,9 @@ use std::io::{self, Write};
 
 use crate::browse::Browser;
 use crate::registry::{age_label, today_days, Entry};
-use crate::theme::{Color, Role, Theme};
+use crate::theme::{Color, Role};
 
+use super::list_columns::Columns;
 use super::terminal_text::{cell_width, clip};
 use super::{footer_start_row, rule_line, App};
 
@@ -109,69 +110,82 @@ fn search_line(
     Ok(divider_controls)
 }
 
-struct Presence {
-    installed: bool,
-    listed: bool,
-}
-
-fn result_line(
-    out: &mut impl Write,
-    entry: &Entry,
-    focused: bool,
-    presence: Presence,
-    columns: usize,
-    theme: Theme,
-    today: i64,
-) -> io::Result<()> {
-    let point = if focused { ">" } else { " " };
-    if columns == 1 {
-        return write!(out, "{point}");
+fn status(browser: &Browser, entry: &Entry, columns: usize) -> &'static str {
+    if columns < 16 {
+        return "";
     }
-    let status_width = if columns >= 32 {
-        16
-    } else if columns >= 16 {
-        10
-    } else {
-        0
-    };
-    let status = match (presence.installed, presence.listed) {
-        (true, true) if status_width >= 16 => "Installed+Listed",
+    match (browser.is_installed(entry), browser.is_listed(entry)) {
+        (true, true) if columns >= 40 => "Installed+Listed",
         (true, true) => "Inst.+List",
         (true, false) => "Installed",
         (false, true) => "Listed",
         (false, false) => "",
-    };
-    let metrics_width = if columns >= 64 { 16 } else { 0 };
-    let available = columns - 2 - metrics_width - status_width - usize::from(status_width > 0) * 2;
-    let name_width = if columns >= 96 {
-        available.min(36)
+    }
+}
+
+fn draw_results(
+    app: &App,
+    out: &mut impl Write,
+    browser: &Browser,
+    results: &[&Entry],
+    window: &Window,
+    columns: usize,
+) -> io::Result<usize> {
+    let today = today_days();
+    let rows: Vec<_> = results
+        .iter()
+        .skip(window.start)
+        .take(window.visible)
+        .map(|&entry| {
+            let status = status(browser, entry, columns);
+            let metrics = format!("{} · {}★", age_label(&entry.pushed_at, today), entry.stars);
+            (entry, status, metrics)
+        })
+        .collect();
+    let status_width = rows
+        .iter()
+        .map(|(_, status, _)| status.len())
+        .max()
+        .unwrap_or(0);
+    let status_cost = if status_width > 0 {
+        status_width + 2
     } else {
-        available
+        0
     };
-    let (name, cells) = clip(&entry.full_name, name_width);
-    let emphasize = if focused { "\x1b[1m" } else { "" };
-    write!(out, "{point} {emphasize}{name}\x1b[0m")?;
-    if status_width > 0 {
-        let pad = name_width - cells + 2;
-        let color = if status.is_empty() {
-            Color::Plain
-        } else {
-            theme.color(Role::Success)
-        };
-        write!(out, "{:pad$}{color}{status:<status_width$}\x1b[0m", "")?;
-    }
-    if metrics_width > 0 {
-        let metrics = format!("{} · {}★", age_label(&entry.pushed_at, today), entry.stars);
-        let (metrics, cells) = clip(&metrics, metrics_width - 4);
-        write!(out, "  \x1b[2m{metrics}\x1b[0m")?;
-        let description_width = available - name_width;
-        if description_width > 0 {
-            let pad = metrics_width - 2 - cells;
-            let (description, _) = clip(&entry.description, description_width);
-            write!(out, "{:pad$}\x1b[2m{description}\x1b[0m", "")?;
+    let layout = Columns::new(
+        columns.saturating_sub(2 + status_cost),
+        rows.iter().map(|(entry, _, metrics)| {
+            (
+                entry.full_name.as_str(),
+                metrics.as_str(),
+                entry.description.as_str(),
+            )
+        }),
+    );
+    for (offset, (entry, status, metrics)) in rows.iter().enumerate() {
+        let focused = window.start + offset == browser.cursor;
+        let point = if focused { ">" } else { " " };
+        write!(out, "\x1b[{};1H{point}", window.top + offset + 1)?;
+        if columns == 1 {
+            continue;
         }
+        let (name, cells) = clip(&entry.full_name, layout.name);
+        let emphasize = if focused { "\x1b[1m" } else { "" };
+        write!(out, " {emphasize}{name}\x1b[0m")?;
+        let mut padding = layout.name - cells;
+        if status_width > 0 {
+            let gap = padding + 2;
+            let color = if status.is_empty() {
+                Color::Plain
+            } else {
+                app.theme.color(Role::Success)
+            };
+            write!(out, "{:gap$}{color}{status:<status_width$}\x1b[0m", "")?;
+            padding = 0;
+        }
+        layout.write_tail(out, padding, metrics, &entry.description)?;
     }
-    Ok(())
+    Ok(layout.trailing)
 }
 
 pub(super) fn draw(
@@ -242,7 +256,7 @@ pub(super) fn draw(
         write!(out, "\x1b[3;1H\x1b[2m{divider}\x1b[0m")?;
     }
 
-    if results.is_empty() {
+    let description_width = if results.is_empty() {
         let message = if loading {
             "Loading marketplace index…"
         } else if failed && browser.all.is_empty() {
@@ -256,35 +270,21 @@ pub(super) fn draw(
         };
         let (message, _) = clip(message, columns);
         write!(out, "\x1b[{};1H{message}", window.top + 1)?;
+        0
     } else {
-        let today = today_days();
-        for (offset, entry) in results
-            .iter()
-            .skip(window.start)
-            .take(window.visible)
-            .enumerate()
-        {
-            let focused = window.start + offset == browser.cursor;
-            write!(out, "\x1b[{};1H", window.top + offset + 1)?;
-            result_line(
-                out,
-                entry,
-                focused,
-                Presence {
-                    installed: browser.is_installed(entry),
-                    listed: browser.is_listed(entry),
-                },
-                columns,
-                app.theme,
-                today,
-            )?;
-        }
-    }
+        draw_results(app, out, browser, &results, &window, columns)?
+    };
 
     if height >= 6 {
         let divider = footer_start_row(height);
         let footer = divider + 1;
-        write!(out, "\x1b[{divider};1H\x1b[2m{}\x1b[0m", rule_line(width))?;
+        // The divider can show more of the selected description without taking a result row.
+        let preview = results.get(browser.cursor).and_then(|entry| {
+            let (text, cells) = clip(&entry.description, columns);
+            (cells > description_width && cells > 1).then_some(text)
+        });
+        let divider_text = preview.unwrap_or_else(|| rule_line(width));
+        write!(out, "\x1b[{divider};1H\x1b[2m{divider_text}\x1b[0m")?;
         let mut hint_line = String::new();
         for hint in [
             "[Enter] Add",
@@ -339,6 +339,95 @@ mod tests {
         let mut output = Vec::new();
         draw(app, &mut output, width, height, refreshing).unwrap();
         String::from_utf8(output).unwrap()
+    }
+
+    #[test]
+    fn marketplace_badges_follow_the_browser_inventory() {
+        let installed = crate::parse_plugin_list(
+            r#"{"result":{"plugins":[
+                {"name":"worktree","source":{"url":"https://github.com/OWNER/worktree.git"}}
+            ]}}"#,
+        )
+        .unwrap();
+        let mut app = app();
+        let browser = app.browser.as_mut().unwrap();
+        *browser = Browser::new(
+            browser.all.clone(),
+            browser.source_note.clone(),
+            browser.listed.clone(),
+            Some(&installed),
+        );
+
+        let available = frame(&app, 80, 14, false);
+        assert!(available.contains("Installed+Listed"), "{available:?}");
+
+        // The Manage view still reflects its older snapshot.
+        app.rows = super::super::rows(&[crate::Spec::parse("owner/worktree")], &installed);
+        assert_eq!(app.rows[0].slug.as_deref(), Some("owner/worktree"));
+        assert!(app.rows[0].installed.is_some());
+        let browser = app.browser.as_mut().unwrap();
+        browser.replace_entries(browser.all.clone(), browser.source_note.clone(), None);
+
+        let unavailable = frame(&app, 80, 14, false);
+        assert!(unavailable.contains("Install state unavailable"));
+        assert!(unavailable.contains("Listed"));
+        assert!(!unavailable.contains("Installed"), "{unavailable:?}");
+    }
+
+    #[test]
+    fn adaptive_marketplace_shows_descriptions_and_keeps_click_targets() {
+        let mut app = app();
+        let browser = app.browser.as_mut().unwrap();
+        browser.all[0].description = "Workspace shortcuts".into();
+        browser.all.push(Entry {
+            full_name: "owner/a-very-long-plugin-name-that-could-take-the-entire-terminal".into(),
+            description: "Navigate between workspaces".into(),
+            ..Entry::default()
+        });
+        browser.cursor = 1;
+
+        for (width, height) in [(40, 9), (40, 11), (80, 24), (100, 30), (160, 48)] {
+            let output = frame(&app, width, height, false);
+            let (_, first) = output.split_once("\x1b[4;1H").unwrap();
+            let (first, rest) = first.split_once("\x1b[5;1H").unwrap();
+            let (second, _) = rest.split_once(";1H").unwrap();
+            assert!(first.contains("Listed") && first.contains("owner/worktree"));
+            assert!(first.contains("Workspace"), "{width}x{height}: {first:?}");
+            assert!(second.contains("owner/a-very") && second.contains("Navigate"));
+            assert!(
+                output.contains("Navigate between workspaces"),
+                "{width}x{height}: {output:?}"
+            );
+
+            let window = Window::new(1, height);
+            assert_eq!(window.index_at(3), Some(0));
+            assert_eq!(window.index_at(4), Some(1));
+            assert_eq!(window.index_at(footer_start_row(height) - 1), None);
+        }
+    }
+
+    #[test]
+    fn offscreen_marketplace_names_do_not_take_description_space() {
+        let mut app = app();
+        let browser = app.browser.as_mut().unwrap();
+        browser.all[0].description = "Workspace shortcuts".into();
+        browser.all.extend([
+            Entry {
+                full_name: "owner/brief".into(),
+                ..Entry::default()
+            },
+            Entry {
+                full_name: format!("owner/{}", "long-name".repeat(20)),
+                ..Entry::default()
+            },
+        ]);
+        let output = frame(&app, 64, 9, false);
+        let (_, rest) = output.split_once("\x1b[4;1H").unwrap();
+        let (first, _) = rest.split_once("\x1b[5;1H").unwrap();
+        assert!(first.contains("Listed"));
+        assert!(first.contains("180★"));
+        assert!(first.contains("Workspace shortcuts"), "{first:?}");
+        assert!(!output.contains("long-name"));
     }
 
     #[test]
