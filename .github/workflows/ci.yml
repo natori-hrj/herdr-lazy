@@ -9,6 +9,9 @@ permissions:
   contents: read
 
 jobs:
+  audit:
+    uses: ./.github/workflows/audit.yml
+
   test:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -19,22 +22,18 @@ jobs:
             target: x86_64-unknown-linux-musl
           - os: macos-latest
             target: aarch64-apple-darwin
-          # Windows is declared in `platforms`, so it is built here rather than taken on
-          # trust. Without the cfg(windows) crossterm entry in Cargo.toml this job is what
-          # fails: the crate stops the build with compile_error! when its `windows`
-          # feature is absent.
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      # `--component` takes one value; a bare second name is parsed as a toolchain.
       - run: |
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustup target add ${{ matrix.target }}
       - if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets --target ${{ matrix.target }} -- -D warnings
+      - run: cargo check --locked --all-targets --target ${{ matrix.target }}
+      - run: cargo clippy --locked --all-targets --target ${{ matrix.target }} -- -D warnings
       - if: runner.os == 'Windows'
         shell: bash
         run: |
@@ -43,7 +42,6 @@ jobs:
           test "$expected" = "$actual"
       - run: cargo test --locked --target ${{ matrix.target }}
 
-  # The declared MSRV is a promise; check it rather than letting it rot.
   msrv:
     runs-on: ubuntu-latest
     steps:

@@ -1,0 +1,29 @@
+name: dependency audit
+
+on:
+  workflow_call:
+  schedule:
+    - cron: '23 3 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  rustsec:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Install cargo-audit
+        working-directory: ${{ runner.temp }}
+        run: |
+          rustup toolchain install stable --profile minimal
+          cargo +stable install cargo-audit --locked --version 0.22.2 --no-default-features
+      - name: Audit Cargo.lock
+        working-directory: ${{ runner.temp }}
+        env:
+          LOCKFILE: ${{ github.workspace }}/Cargo.lock
+        run: |
+          test -f "$LOCKFILE"
+          cargo +stable audit --file "$LOCKFILE"

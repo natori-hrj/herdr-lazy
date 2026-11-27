@@ -19,8 +19,11 @@ change to the matcher or to `--prune` can delete work.
 
 ## The bar for a pull request
 
-- `cargo test`, `cargo fmt --check`, and `cargo clippy --all-targets -- -D warnings` pass.
-  CI runs these plus the MSRV build; it must be green.
+- CI runs `cargo fmt --check`, `cargo check --locked --all-targets`,
+  `cargo clippy --locked --all-targets -- -D warnings`, and `cargo test --locked`.
+  It also tests the declared minimum Rust version.
+- RustSec checks `Cargo.lock` on pull requests, pushes to `main`, daily, and before
+  releases. A known vulnerability fails the audit.
 - New behaviour comes with a test. Bug fixes come with a test that fails without the fix.
 - Comments explain *why*, not what. If a line looks redundant and is not, say why — the
   leading `./` in `herdr-plugin.toml` is the standing example.
@@ -101,6 +104,18 @@ The useful ones tend to include:
 If herdr-lazy did something destructive — removed a plugin you wanted, or wrote a list you
 did not ask for — say so plainly and it will be treated as a priority. `~/.config/herdr-lazy/`
 may still hold an older copy of your list.
+
+## Releasing
+
+Merge the pull requests for the next release into `main` and sync your local checkout.
+From a clean `main`, run `scripts/release.sh <version> --dry-run` to preview the commits
+since the previous release tag. To release that batch, run `scripts/release.sh <version>`.
+The script checks the build, bumps the version, and pushes the version commit and tag
+together.
+
+The tag starts the release workflow. After the audit and all five builds pass, the workflow
+uploads the archives and checksums to a draft, publishes it with GitHub-generated notes,
+and checks the download URLs. If an upload fails, rerun the failed job to finish the draft.
 
 ## Security
 
