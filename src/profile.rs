@@ -5,7 +5,7 @@
 //! the process cwd as a fallback.  That keeps a repository checkout from unexpectedly inheriting
 //! a profile from one of its parents.
 
-use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::{context::PluginContext, Spec};
@@ -14,7 +14,6 @@ pub(crate) const PROFILE_DIRECTORY: &str = ".herdr-lazy";
 pub(crate) const PROFILE_LIST_NAME: &str = "plugins.list";
 pub(crate) const PROFILE_LOCK_NAME: &str = "plugins.lock";
 
-const MAX_PROFILE_BYTES: usize = 64 * 1024;
 const MAX_PROFILE_ENTRIES: usize = 512;
 
 /// The state of the optional lockfile beside a workspace profile.
@@ -89,46 +88,22 @@ pub(crate) fn discover_at(root: &Path) -> Result<Option<WorkspaceProfile>, Strin
     let list_path = directory.join(PROFILE_LIST_NAME);
     let lock_path = directory.join(PROFILE_LOCK_NAME);
 
-    let metadata = match fs::metadata(&list_path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(format!(
-                "could not inspect workspace profile {}: {}",
-                list_path.display(),
-                error
-            ))
-        }
+    let specs = match read_specs(&list_path, "workspace profile") {
+        Ok(specs) => specs,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
     };
-    if !metadata.is_file() {
-        return Err(format!(
-            "workspace profile {} is not a file",
-            list_path.display()
-        ));
-    }
-
-    let specs = read_specs(&list_path, "workspace profile")?;
-    let lock_status = match fs::metadata(&lock_path) {
-        Ok(metadata) if !metadata.is_file() => {
-            LockStatus::Invalid(format!("{} is not a file", lock_path.display()))
+    let lock_status = match read_specs(&lock_path, "workspace profile lock") {
+        Ok(lock_specs) if same_repositories(&specs, &lock_specs) => {
+            LockStatus::Ready(lock_specs.len())
         }
-        Ok(_) => match read_specs(&lock_path, "workspace profile lock") {
-            Ok(lock_specs) if same_repositories(&specs, &lock_specs) => {
-                LockStatus::Ready(lock_specs.len())
-            }
-            Ok(lock_specs) => LockStatus::Invalid(format!(
-                "{} entries do not match the {} profile entries",
-                lock_specs.len(),
-                specs.len()
-            )),
-            Err(error) => LockStatus::Invalid(error),
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => LockStatus::Missing,
-        Err(error) => LockStatus::Invalid(format!(
-            "could not inspect {}: {}",
-            lock_path.display(),
-            error
+        Ok(lock_specs) => LockStatus::Invalid(format!(
+            "{} entries do not match the {} profile entries",
+            lock_specs.len(),
+            specs.len()
         )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => LockStatus::Missing,
+        Err(error) => LockStatus::Invalid(error.to_string()),
     };
 
     Ok(Some(WorkspaceProfile {
@@ -169,18 +144,10 @@ fn same_repositories(profile: &[Spec], lock: &[Spec]) -> bool {
             .all(|wanted| lock.iter().any(|recorded| recorded.repo == wanted.repo))
 }
 
-fn read_specs(path: &Path, label: &str) -> Result<Vec<Spec>, String> {
-    let bytes = fs::read(path).map_err(|error| format!("could not read {}: {}", label, error))?;
-    if bytes.len() > MAX_PROFILE_BYTES {
-        return Err(format!(
-            "{} {} exceeds {} bytes",
-            label,
-            path.display(),
-            MAX_PROFILE_BYTES
-        ));
-    }
-    let body = String::from_utf8(bytes)
-        .map_err(|_| format!("{} {} is not valid UTF-8", label, path.display()))?;
+fn read_specs(path: &Path, label: &str) -> io::Result<Vec<Spec>> {
+    let body = crate::read_local_text(path, label).map_err(|error| {
+        io::Error::new(error.kind(), format!("could not read {}: {}", label, error))
+    })?;
 
     let mut specs = Vec::new();
     for (line_number, raw) in body.lines().enumerate() {
@@ -189,32 +156,41 @@ fn read_specs(path: &Path, label: &str) -> Result<Vec<Spec>, String> {
             continue;
         }
         if specs.len() >= MAX_PROFILE_ENTRIES {
-            return Err(format!(
-                "{} {} contains more than {} entries",
-                label,
-                path.display(),
-                MAX_PROFILE_ENTRIES
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} {} contains more than {} entries",
+                    label,
+                    path.display(),
+                    MAX_PROFILE_ENTRIES
+                ),
             ));
         }
         let spec = parse_spec(line).map_err(|reason| {
-            format!(
-                "{} {} line {}: {}",
-                label,
-                path.display(),
-                line_number + 1,
-                reason
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} {} line {}: {}",
+                    label,
+                    path.display(),
+                    line_number + 1,
+                    reason
+                ),
             )
         })?;
         if specs
             .iter()
             .any(|existing: &Spec| existing.repo == spec.repo)
         {
-            return Err(format!(
-                "{} {} line {}: duplicate repository `{}`",
-                label,
-                path.display(),
-                line_number + 1,
-                spec.repo
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} {} line {}: duplicate repository `{}`",
+                    label,
+                    path.display(),
+                    line_number + 1,
+                    spec.repo
+                ),
             ));
         }
         specs.push(spec);
@@ -257,6 +233,7 @@ fn parse_spec(line: &str) -> Result<Spec, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn scratch(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(

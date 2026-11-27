@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use windows_sys::Win32::Foundation::{
-    ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_IO_PENDING, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
-    WAIT_TIMEOUT,
+    ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_IO_PENDING, ERROR_OPERATION_ABORTED,
+    INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     ReadFile, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_INBOUND,
@@ -26,6 +26,24 @@ pub(super) struct Pipe {
 
 impl Pipe {
     pub(super) fn spawn(mut command: Command) -> io::Result<(Child, Self)> {
+        let (pipe, writer) = Self::pair()?;
+        let child = command.stdout(Stdio::from(writer)).spawn()?;
+        drop(command);
+        Ok((child, pipe))
+    }
+
+    pub(super) fn spawn_both(mut command: Command) -> io::Result<(Child, Self, Self)> {
+        let (stdout, stdout_writer) = Self::pair()?;
+        let (stderr, stderr_writer) = Self::pair()?;
+        let child = command
+            .stdout(Stdio::from(stdout_writer))
+            .stderr(Stdio::from(stderr_writer))
+            .spawn()?;
+        drop(command);
+        Ok((child, stdout, stderr))
+    }
+
+    fn pair() -> io::Result<(Self, std::fs::File)> {
         static NEXT_PIPE: AtomicU32 = AtomicU32::new(0);
         let sequence = NEXT_PIPE.fetch_add(1, Ordering::Relaxed);
         let now = SystemTime::now()
@@ -63,12 +81,10 @@ impl Pipe {
         }
         // SAFETY: we own the newly created event.
         let event = unsafe { OwnedHandle::from_raw_handle(raw_event) };
-        // Opening the writer connects it to the server end. Move it to the command
-        // and drop the command after spawn so only the child owns an open writer.
+        // Opening the writer connects it to the server end. The caller moves it into one
+        // command stream, leaving the parent with only the non-inheritable reader.
         let writer = OpenOptions::new().write(true).open(path)?;
-        let child = command.stdout(Stdio::from(writer)).spawn()?;
-        drop(command);
-        Ok((child, Self { reader, event }))
+        Ok((Self { reader, event }, writer))
     }
 
     pub(super) fn read(&mut self, buffer: &mut [u8], deadline: Instant) -> io::Result<usize> {
@@ -106,7 +122,7 @@ impl Pipe {
             // SAFETY: the event handle remains owned for the duration of the wait.
             let waited = wait.map(|timeout| unsafe { WaitForSingleObject(event, timeout) });
             if !matches!(waited, Ok(WAIT_OBJECT_0)) {
-                let error = match waited {
+                let wait_error = match waited {
                     Ok(WAIT_TIMEOUT) | Err(_) => io::ErrorKind::TimedOut.into(),
                     _ => io::Error::last_os_error(),
                 };
@@ -115,10 +131,21 @@ impl Pipe {
                 // before allowing the stack operation or its buffer to be dropped.
                 unsafe {
                     CancelIoEx(reader, operation);
-                    let mut transferred = 0;
-                    GetOverlappedResult(reader, operation, &mut transferred, 1);
                 }
-                return Err(error);
+                let mut transferred = 0;
+                // SAFETY: cancellation has been requested for this operation and the wait keeps
+                // its stack state and buffer alive until Windows publishes the final result.
+                if unsafe { GetOverlappedResult(reader, operation, &mut transferred, 1) } != 0 {
+                    // The read won the race with cancellation. Those bytes belong to this slice;
+                    // returning the earlier timeout would silently discard them.
+                    return Ok(transferred as usize);
+                }
+                let completion_error = io::Error::last_os_error();
+                return match completion_error.raw_os_error().map(|code| code as u32) {
+                    Some(ERROR_OPERATION_ABORTED) => Err(wait_error),
+                    Some(ERROR_BROKEN_PIPE | ERROR_HANDLE_EOF) => Ok(0),
+                    _ => Err(completion_error),
+                };
             }
         }
         let mut transferred = 0;
