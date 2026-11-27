@@ -84,15 +84,17 @@ Install fetches a platform-matched prebuilt binary and verifies its SHA-256; if 
 your platform, or anything about the download is not exactly right, it falls back to building
 from source with [Rust](https://rustup.rs) (≥ 1.78). No toolchain is needed on the fast path.
 
-**Platform status.** Developed and verified end-to-end on macOS (arm64). Linux binaries are
-built and the test suite runs on Linux in CI, but the install has not been exercised on a
-real Linux machine. Windows now has a prebuilt x86_64 binary and keeps a source-build
-fallback; x86_64 is also the Herdr-documented path for Windows ARM64 under emulation. Earlier
-install, `probe`, and manage-pane checks were done on Windows 11 with herdr
-0.7.5-preview in Windows Terminal (ConPTY). The current unified manifest requires herdr ≥
-0.9.0 and still needs a fresh Windows validation; the pane's keymap and a real `sync --prune`
-have not been exercised there. If you run Linux or Windows, reports are very welcome — see
-the open issues.
+**Platform status for v0.45.0**
+
+| Verification | Coverage |
+| --- | --- |
+| Native Linux x86-64 host | Ran the published binary's version and list commands and exercised the TUI in a real PTY with fixture data. |
+| Isolated Herdr install on that host | Installed from GitHub with Herdr 0.9.5 and temporary configuration directories. The installed binary matched the published release asset byte for byte. |
+| GitHub Actions | CI passed on Linux x86-64, macOS arm64, and Windows x86-64. Release jobs also ran tests and checked the binary version on Linux arm64. The macOS Intel artifact was cross-built on arm64. |
+| Published artifacts | Downloaded, checked SHA-256, and extracted all five platform archives. |
+
+Manual v0.45.0 verification covered the Linux x86-64 install and the standalone
+TUI. macOS and Windows coverage comes from CI and published artifact checks. [CI](https://github.com/natori-hrj/herdr-lazy/actions/runs/45961519302) · [Release workflow](https://github.com/natori-hrj/herdr-lazy/actions/runs/45961519892) · [Release verification](docs/release-v0.45.0.md)
 
 **The first herdr start after installing sets up the route into the manager** (a `[[startup]]`
 hook): it writes the curated list and binds `prefix+shift+l` to the manage pane, but does not
