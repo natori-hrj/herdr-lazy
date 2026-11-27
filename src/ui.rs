@@ -19,6 +19,7 @@ use std::{
 };
 
 mod command_palette;
+mod list_columns;
 mod managed_list;
 mod marketplace;
 mod plugin_detail;
