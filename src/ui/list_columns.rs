@@ -59,23 +59,17 @@ impl Columns {
         mut padding: usize,
         metadata: &str,
         text: &str,
-        focused: bool,
     ) -> io::Result<()> {
-        let (dim, reset) = if focused {
-            ("", "")
-        } else {
-            ("\x1b[2m", "\x1b[22m")
-        };
         if self.metadata > 0 {
             let (metadata, cells) = clip(metadata, self.metadata);
             padding += GAP;
-            write!(out, "{:padding$}{dim}{metadata}{reset}", "")?;
+            write!(out, "{:padding$}{metadata}", "")?;
             padding = self.metadata - cells;
         }
         let (text, _) = clip(text, self.trailing);
         if !text.is_empty() {
             padding += GAP;
-            write!(out, "{:padding$}{dim}{text}{reset}", "")?;
+            write!(out, "{:padding$}{text}", "")?;
         }
         Ok(())
     }

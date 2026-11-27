@@ -423,7 +423,7 @@ mod tests {
         assert!(selected.contains("\x1b[1m Actions and panes\x1b[0m"));
         assert!(selected.contains("\x1b[1m > Action · Command 1\x1b[0m"));
         assert!(selected.contains("Pg↑/↓"));
-        assert!(selected.contains("\x1b[1mEnter\x1b[0m"));
+        assert!(selected.contains("\x1b[7;1HEsc Back · Pg↑/↓ · ↑↓ \x1b[1mEnter\x1b[0m b · L"));
 
         scroll_rows(&mut app, 40, 11, isize::MAX);
         app.rows[0].label = "owner/long-plugin-name".into();
