@@ -12,6 +12,8 @@ list and lockfile so the setup stays readable and reproducible.
 
 ![herdr-lazy in Ghostty: Herdr's main screen, the manage pane, marketplace search, and adding a plugin](docs/demo.gif)
 
+[Record the Manage, Detail, and Marketplace flow with an offline fixture](docs/demo.md).
+
 ## Try it in 60 seconds
 
 On a new Herdr setup, install the plugin, restart Herdr, and press `prefix+shift+l` to open the
@@ -61,9 +63,9 @@ manage the *other* plugins.
 
 ## Install
 
-Requires herdr ≥ 0.9.0. This is the first supported release that resolves relative plugin
-commands from the plugin root on Windows, so the manifest can use the same runtime entries on
-every platform.
+Requires Herdr 0.9.0 or later. Herdr 0.9.0 resolves the plugin manifest’s relative
+commands on Windows, which lets the same manifest run on all supported platforms.
+Check your version with `herdr --version` before installing.
 
 ```sh
 herdr plugin install natori-hrj/herdr-lazy
@@ -76,8 +78,8 @@ from source with [Rust](https://rustup.rs) (≥ 1.78). No toolchain is needed on
 **Platform status.** Developed and verified end-to-end on macOS (arm64). Linux binaries are
 built and the test suite runs on Linux in CI, but the install has not been exercised on a
 real Linux machine. Windows now has a prebuilt x86_64 binary and keeps a source-build
-fallback; x86_64 is also the Herdr-documented path for Windows ARM64 under emulation. The
-Earlier install, `probe`, and manage-pane checks were done on Windows 11 with herdr
+fallback; x86_64 is also the Herdr-documented path for Windows ARM64 under emulation. Earlier
+install, `probe`, and manage-pane checks were done on Windows 11 with herdr
 0.7.5-preview in Windows Terminal (ConPTY). The current unified manifest requires herdr ≥
 0.9.0 and still needs a fresh Windows validation; the pane's keymap and a real `sync --prune`
 have not been exercised there. If you run Linux or Windows, reports are very welcome — see
