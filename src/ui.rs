@@ -4163,7 +4163,14 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             startup_redraws = startup_redraws.saturating_sub(1);
         }
 
-        let key = match event::poll(Duration::from_millis(100))? {
+        // Terminal input wakes the poll immediately. Only a visible refresh result
+        // needs a shorter timeout so its completion reaches the screen sooner.
+        let poll_timeout = if app.browser.is_some() && app.marketplace_refresh.is_some() {
+            Duration::from_millis(25)
+        } else {
+            Duration::from_millis(100)
+        };
+        let key = match event::poll(poll_timeout)? {
             false => continue,
             true => match event::read()? {
                 Event::Key(k) if k.kind == KeyEventKind::Press => {
