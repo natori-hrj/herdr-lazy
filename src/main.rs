@@ -3697,6 +3697,7 @@ fn cmd_remove(spec: &str) -> io::Result<()> {
 fn print_help() {
     println!("herdr-lazy — be lazy: a curated plugin distro & manager for herdr\n");
     println!("USAGE: herdr-lazy <command>\n");
+    println!("  -V, --version     print the herdr-lazy version");
     println!("  probe [--raw]     verify the plugin <-> herdr CLI bridge (run this first)");
     println!("  init [--force] [--extras <id,…>] [--from <owner/repo[@ref]>] [--dry-run]");
     println!("                    write the default bundle, or adopt someone else's list");
@@ -3721,6 +3722,10 @@ fn print_help() {
 fn main() {
     let args: Vec<String> = env::args().collect();
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("help");
+    if matches!(cmd, "--version" | "-V") {
+        println!("herdr-lazy {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let rest: Vec<&str> = args.iter().skip(2).map(|s| s.as_str()).collect();
 
     let result = match cmd {
