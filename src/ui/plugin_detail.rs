@@ -1,9 +1,9 @@
 use std::io::{self, Write};
 
 use super::{
-    footer_start_row,
-    managed_list::{cell_width, clip},
-    rule_line, App, Color, Role,
+    footer_start_row, rule_line,
+    terminal_text::{cell_width, clip},
+    App, Color, Role,
 };
 use crate::github::Changes;
 

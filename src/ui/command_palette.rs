@@ -2,7 +2,7 @@ use std::io::{self, Write};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use super::{footer_start_row, managed_list::clip, App};
+use super::{footer_start_row, terminal_text::clip, App};
 use crate::theme::{Role, Theme};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -4,7 +4,7 @@ use crossterm::event::KeyCode;
 
 use crate::theme::{Role, Theme, INPUT_LIMIT, PRESETS};
 
-use super::managed_list::clip;
+use super::terminal_text::clip;
 
 const CUSTOM: usize = PRESETS.len();
 
