@@ -41,19 +41,13 @@ Restart Herdr and open Manage with `prefix+shift+l` on a fresh setup, or use
   theme picker, and cached Marketplace refresh. The default workflow remains
   available for the current release.
 
-**Performance evidence for the Marketplace refresh candidate.** On Linux x86_64,
-five alternating runs per build used real HTTPS, a stale 2,108-entry cache, a stub
-Herdr process, and a 120×24 PTY. The median time from `/` to the first usable
-Marketplace frame was 449.482 ms on the synchronous build and 28.990 ms on the
-background-refresh build. The median time to the successful refresh message was
-449.498 ms and 536.845 ms, respectively. The first-frame measure captures
-stale-cache usability. Completion includes the network request and the wait before
-the UI paints the status.
+The candidate also bounds JSON nesting, Marketplace cache reads, response
+sizes, and shared downloader deadlines. A failed refresh preserves a valid cache.
 
-A separate 30-run Linux PTY comparison used staggered mock downloads. When the
-shorter visible-refresh poll was included, p95 from downloader output readiness
-to the completed refresh footer moved from 97.898 ms to 29.888 ms. This measures
-the interface's reaction to a completed download under controlled conditions.
+See [the final candidate report](release-v0.45.0.md) for the build SHA,
+alternating local PTY comparison, recordings, and verification results. The
+Marketplace first-frame measurement reflects access to cached results while
+refresh runs. The completion measurement includes the simulated downloader.
 
 ## X draft
 

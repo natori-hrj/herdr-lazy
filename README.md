@@ -1,6 +1,6 @@
 # herdr-lazy
 
-> The default branch includes the v0.45.0 release candidate. Check [GitHub Releases](https://github.com/natori-hrj/herdr-lazy/releases/latest) for the current published version. [Candidate changelog](CHANGELOG.md) · [Screenshots and measurements](docs/release-v0.45.0.md).
+> The default branch includes the v0.45.0 release candidate. Check [GitHub Releases](https://github.com/natori-hrj/herdr-lazy/releases/latest) for the current published version. [Candidate changelog](CHANGELOG.md) · [Candidate verification, recordings, and measurements](docs/release-v0.45.0.md).
 
 > Find, install, and update Herdr plugins from one pane.
 

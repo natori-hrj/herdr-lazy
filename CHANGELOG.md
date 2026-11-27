@@ -17,6 +17,12 @@
 
 - Reject or bound malformed external responses before processing them. Keep the last valid Marketplace cache when a refresh fails or contains an invalid index. [#80](https://github.com/natori-hrj/herdr-lazy/pull/80) [#88](https://github.com/natori-hrj/herdr-lazy/pull/88)
 
+### Security
+
+- Limit JSON nesting to 64 containers, including arrays, objects, and unknown fields. [#120](https://github.com/natori-hrj/herdr-lazy/pull/120)
+- Enforce the 8 MiB Marketplace limit when reading cached data and recover invalid caches during refresh. [#122](https://github.com/natori-hrj/herdr-lazy/pull/122)
+- Share one deadline across downloader fallbacks: 15 seconds for GitHub and 20 seconds for Marketplace. Keep response limits and reap the directly started downloader on failure. [#123](https://github.com/natori-hrj/herdr-lazy/pull/123)
+
 ### Contributors
 
 - Reproduce UI latency measurements in a fixture-backed PTY. Record offline demos of the Manage and Marketplace workflows, command palette, theme preview, and cached refresh. [#95](https://github.com/natori-hrj/herdr-lazy/pull/95) [#106](https://github.com/natori-hrj/herdr-lazy/pull/106)
