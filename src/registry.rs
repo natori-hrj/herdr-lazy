@@ -639,6 +639,29 @@ mod tests {
     }
 
     #[test]
+    fn refresh_over_json_depth_limit_preserves_valid_cache() {
+        let dir = cache_fixture("depth");
+        let path = dir.join("index.json");
+        fs::write(&path, INDEX).unwrap();
+        let arrays = json::MAX_CONTAINER_DEPTH;
+        let response = format!(
+            r#"{{"plugins":[],"metadata":{}null{}}}"#,
+            "[".repeat(arrays),
+            "]".repeat(arrays)
+        );
+        let result = load_with(&path, true, || Ok(response));
+        let persisted = fs::read_to_string(&path);
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(dir).unwrap();
+
+        let (entries, note) = result.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(note.starts_with("cached"));
+        assert!(note.contains("JSON container depth exceeds"));
+        assert_eq!(persisted.unwrap(), INDEX);
+    }
+
+    #[test]
     fn malformed_refresh_without_usable_cache_returns_original_error() {
         let dir = cache_fixture("corrupt");
         let path = dir.join("index.json");
