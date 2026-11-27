@@ -1,19 +1,4 @@
 #!/bin/sh
-# Cut a release: bump the version, commit, tag, push.
-#
-#   scripts/release.sh 0.12.0
-#   scripts/release.sh 0.12.0 --dry-run
-#
-# The steps have been the same every time, and two of them are easy to get half-right in ways
-# that are not obvious afterwards:
-#
-#   - the version lives in BOTH herdr-plugin.toml (which herdr reads, and which names the
-#     release assets) and Cargo.toml (which the build fingerprint is computed from). Bumping
-#     one without the other publishes assets nobody will look for.
-#   - bumping the version without pushing the tag leaves every install compiling from source,
-#     silently, because the prebuilt binary for that fingerprint does not exist yet.
-#
-# So this refuses to start unless the tree is in a state where the whole sequence can finish.
 
 set -eu
 
@@ -40,7 +25,6 @@ run() {
     fi
 }
 
-# --- checks, before touching anything -------------------------------------------------
 
 case "$VERSION" in
     [0-9]*.[0-9]*.[0-9]*) ;;
@@ -51,8 +35,6 @@ CURRENT=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' herdr-plugin.toml | head -1
 [ -n "$CURRENT" ] || die "cannot read the current version from herdr-plugin.toml"
 [ "$CURRENT" != "$VERSION" ] || die "already at $VERSION"
 
-# Compare as numbers, not strings: "0.9.0" > "0.10.0" lexically, and releasing backwards
-# would publish assets that older installs then prefer.
 newer=$(printf '%s\n%s\n' "$CURRENT" "$VERSION" | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
 [ "$newer" = "$VERSION" ] || die "$VERSION is not newer than the current $CURRENT"
 
@@ -63,21 +45,21 @@ BRANCH=$(git rev-parse --abbrev-ref HEAD)
 
 [ -z "$(git status --porcelain)" ] || die "working tree is dirty; commit or stash first"
 
-git fetch --quiet origin main 2>/dev/null || true
-if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main 2>/dev/null || echo none)" ]; then
-    die "main and origin/main differ; pull or push first"
-fi
+TAG="v$VERSION"
+remote_refs=$(git ls-remote --exit-code origin refs/heads/main "refs/tags/$TAG") ||
+    die "cannot verify main and $TAG on origin"
+remote_main=$(printf '%s\n' "$remote_refs" | awk '$2 == "refs/heads/main" { print $1 }')
+[ "$(git rev-parse HEAD)" = "$remote_main" ] || die "main and origin/main differ; pull or push first"
 
-git rev-parse "v$VERSION" >/dev/null 2>&1 && die "tag v$VERSION already exists"
-if command -v gh >/dev/null 2>&1; then
-    gh release view "v$VERSION" >/dev/null 2>&1 && die "release v$VERSION already exists"
+if git show-ref --verify --quiet "refs/tags/$TAG" ||
+    printf '%s\n' "$remote_refs" | awk -v tag="refs/tags/$TAG" '$2 == tag { found = 1 } END { exit !found }'; then
+    die "tag $TAG already exists"
 fi
 
 echo "release $CURRENT -> $VERSION"
 [ -n "$DRY_RUN" ] && echo "(dry run: nothing will be changed)"
 echo
 
-# --- the release ----------------------------------------------------------------------
 
 step "checking the build is green first"
 run cargo fmt --check
@@ -87,8 +69,6 @@ run cargo test --locked
 step "bumping the version in herdr-plugin.toml and Cargo.toml"
 if [ -z "$DRY_RUN" ]; then
     for f in herdr-plugin.toml Cargo.toml; do
-        # Only the first `version =` line, which is the package's own; a dependency further
-        # down the file must not be rewritten.
         awk -v v="$VERSION" '
             !done && /^version *= *"/ { sub(/"[^"]*"/, "\"" v "\""); done = 1 }
             { print }
