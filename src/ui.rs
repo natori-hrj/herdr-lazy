@@ -19,6 +19,7 @@ use std::{
 };
 
 mod managed_list;
+mod plugin_detail;
 
 use crate::theme::{Color, Role, Theme};
 
@@ -1203,6 +1204,7 @@ struct App {
     detail_of: Option<usize>,
     /// Which action is highlighted in the details view.
     detail_cursor: usize,
+    detail_scroll: usize,
     /// Changes fetched for the currently open details, and which row they belong to. Keyed by
     /// row so reopening the same plugin does not re-hit the network, and a stale result for a
     /// different plugin never shows.
@@ -1283,6 +1285,7 @@ impl App {
                 help: None,
                 detail_of: None,
                 detail_cursor: 0,
+                detail_scroll: 0,
                 detail_changes: None,
                 log_view: None,
                 machine_view: None,
@@ -1311,6 +1314,7 @@ impl App {
                 help: None,
                 detail_of: None,
                 detail_cursor: 0,
+                detail_scroll: 0,
                 detail_changes: None,
                 log_view: None,
                 machine_view: None,
@@ -1778,6 +1782,7 @@ impl App {
         };
         self.detail_of = Some(self.cursor);
         self.detail_cursor = 0;
+        self.detail_scroll = 0;
         self.flash = None;
 
         // Fetch only for a plugin the offline marker already flagged. Opening the details of
@@ -2645,7 +2650,7 @@ impl App {
             return self.draw_logs(out, width, height);
         }
         if self.detail_of.is_some() {
-            return self.draw_detail(out, width, height);
+            return plugin_detail::draw(self, out, width, height);
         }
         if self.browser.is_some() {
             return self.draw_browser(out, width, height);
@@ -2997,196 +3002,6 @@ impl App {
         out.flush()
     }
 
-    /// What this plugin does, and how to actually use it.
-    ///
-    /// A distro that installs seven plugins in one go leaves the user holding seven things
-    /// they did not choose individually and cannot obviously operate. herdr already knows the
-    /// answer — every manifest declares its actions, panes and events — so the pane can just
-    /// show it, and run the actions too.
-    fn draw_detail(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
-        let warning = self.theme.color(Role::Warning);
-        let accent = self.theme.color(Role::Accent);
-        let rule = rule_line(width);
-        let idx = self.detail_of.expect("checked by caller");
-        let Some(row) = self.rows.get(idx) else {
-            return Ok(());
-        };
-        write!(out, "\x1b[H\x1b[2J")?;
-        writeln!(out, "\x1b[1m {}\x1b[0m\r", row.label)?;
-        writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
-
-        let Some(d) = row.detail.as_ref() else {
-            writeln!(
-                out,
-                " \x1b[2mnot installed yet — press i to install, then look again\x1b[0m\r"
-            )?;
-            let footer = self
-                .flash
-                .as_deref()
-                .map(|message| format!("{accent}{}\x1b[0m", message))
-                .unwrap_or_else(|| "\x1b[2many key goes back\x1b[0m".to_string());
-            write!(
-                out,
-                "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r\n",
-                footer_start_row(height),
-                rule,
-                footer
-            )?;
-            return out.flush();
-        };
-
-        let items = Self::bindable(d);
-
-        if !d.description.is_empty() {
-            for line in wrap(&d.description, (width as usize).saturating_sub(3).max(20)) {
-                writeln!(out, " {}\r", line)?;
-            }
-            writeln!(out, "\r")?;
-        }
-
-        if let Some(maintenance) = row.maintenance.as_ref() {
-            if let Some(age) = maintenance.age() {
-                let quiet = if maintenance.is_quiet() {
-                    " · quiet (fact only)"
-                } else {
-                    ""
-                };
-                writeln!(out, " maintenance: last pushed {} ago{}\r", age, quiet)?;
-            }
-        }
-
-        if items.is_empty() && d.events.is_empty() {
-            writeln!(
-                out,
-                " \x1b[2mthis plugin declares no actions, panes or events — it may work \
-                 entirely on its own\x1b[0m\r"
-            )?;
-        }
-
-        // Actions and panes in one list, because `enter` and `b` treat them the same way and
-        // the cursor indexes into it. Two separate sections would mean two things claiming to
-        // be "the highlighted one".
-        if !items.is_empty() {
-            writeln!(
-                out,
-                " \x1b[1mthings you can run\x1b[0m  \x1b[2m(enter runs it · b binds it to a key)\x1b[0m\r"
-            )?;
-            for (i, (target, label)) in items.iter().enumerate() {
-                let sel = if i == self.detail_cursor {
-                    "\x1b[7m>"
-                } else {
-                    " "
-                };
-                let kind = match target {
-                    crate::BindTarget::Action(_) => "action",
-                    crate::BindTarget::Pane(_) => "pane",
-                };
-                writeln!(
-                    out,
-                    "{}\x1b[0m  {:<44} \x1b[2m{:<7}{}\x1b[0m\r",
-                    sel,
-                    truncate(label, 44),
-                    kind,
-                    target.id()
-                )?;
-            }
-            writeln!(out, "\r")?;
-        }
-
-        if !d.events.is_empty() {
-            writeln!(
-                out,
-                " \x1b[1mruns by itself on\x1b[0m  \x1b[2m{}\x1b[0m\r",
-                d.events.join(", ")
-            )?;
-            writeln!(out, "\r")?;
-        }
-
-        // What changed since install — the point of the whole feature. Only present when this
-        // plugin was flagged and the fetch happened on open; a plugin with no marker shows
-        // nothing here, which is correct.
-        if let Some((row_idx, changes)) = &self.detail_changes {
-            if *row_idx == idx {
-                use crate::github::Changes;
-                match changes {
-                    Changes::Commits(cs) if !cs.is_empty() => {
-                        writeln!(
-                            out,
-                            " \x1b[1m{warning}{} new commit(s) since you installed\x1b[0m  \
-                             \x1b[2m(press u to update)\x1b[0m\r",
-                            cs.len()
-                        )?;
-                        for subject in cs.iter().take(8) {
-                            writeln!(
-                                out,
-                                "   \x1b[2m·\x1b[0m {}\r",
-                                truncate(subject, width.saturating_sub(6) as usize)
-                            )?;
-                        }
-                        if cs.len() > 8 {
-                            writeln!(out, "   \x1b[2m… and {} more\x1b[0m\r", cs.len() - 8)?;
-                        }
-                        writeln!(out, "\r")?;
-                    }
-                    Changes::Commits(_) => {} // marker was stale; nothing actually newer
-                    Changes::ManyPlus(n) => {
-                        writeln!(
-                            out,
-                            " {warning}{}+ commits behind\x1b[0m \x1b[2m— more than one page; \
-                             press u to catch up\x1b[0m\r\r",
-                            n
-                        )?;
-                    }
-                    Changes::Unknown(why) => {
-                        writeln!(
-                            out,
-                            " \x1b[2mcould not check for changes: {}\x1b[0m\r\r",
-                            why
-                        )?;
-                    }
-                }
-            }
-        }
-
-        if let Some((target, _)) = items.get(self.detail_cursor) {
-            // Show the lines that `b` would actually write, not a fixed example — panes and
-            // actions produce different `type` values, and a wrong example here would send
-            // someone to hand-write a binding herdr ignores.
-            let (kind, command) = crate::bind_toml_fields(target, &d.plugin_id);
-            writeln!(
-                out,
-                " \x1b[2mb binds the highlighted one:  type = \"{}\"  command = \"{}\"\x1b[0m\r",
-                kind, command
-            )?;
-        }
-
-        let footer = if self.awaiting_bind {
-            format!("{warning}press a letter to bind this to prefix+shift+<letter>, or esc\x1b[0m")
-        } else {
-            match &self.flash {
-                Some(m) => format!("{accent}{}\x1b[0m", m),
-                None => "\x1b[1m[enter]\x1b[0m run  \x1b[1m[b]\x1b[0m bind to a key  \
-                         \x1b[1m[L]\x1b[0m logs  \x1b[1m[j/k]\x1b[0m move  \
-                         \x1b[1m[esc]\x1b[0m back"
-                    .to_string(),
-            }
-        };
-        write!(
-            out,
-            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m{}\r\n",
-            footer_start_row(height),
-            rule,
-            footer
-        )?;
-        out.flush()
-    }
-
-    /// Every key, grouped by what it acts on.
-    ///
-    /// The list's keys are deliberately paired: lowercase is the row under the cursor,
-    /// uppercase is everything. That rule is invisible in the footer, which has room for one
-    /// of each pair at most, so it is spelled out here.
-    /// The marketplace overlay: a query line, matching plugins, and what each one is.
     fn draw_browser(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
         let success = self.theme.color(Role::Success);
         let warning = self.theme.color(Role::Warning);
@@ -4166,6 +3981,19 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                             MouseEventKind::ScrollUp => app.scroll_logs(-1, visible, width),
                             _ => {}
                         }
+                    } else if app.detail_of.is_some() {
+                        use crossterm::event::MouseEventKind;
+                        if !app.awaiting_bind && app.pending_bind.is_none() {
+                            match m.kind {
+                                MouseEventKind::ScrollDown => {
+                                    plugin_detail::scroll_rows(&mut app, width, height, 1);
+                                }
+                                MouseEventKind::ScrollUp => {
+                                    plugin_detail::scroll_rows(&mut app, width, height, -1);
+                                }
+                                _ => {}
+                            }
+                        }
                     } else {
                         app.handle_mouse(m, height)?;
                     }
@@ -4373,7 +4201,11 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             // later arm would never see it.
             if key.modifiers.contains(KeyModifiers::CONTROL) {
                 match key.code {
-                    KeyCode::Char('j') | KeyCode::Char('m') => app.run_detail_action(),
+                    KeyCode::Char('j') | KeyCode::Char('m') if !app.awaiting_bind => {
+                        if plugin_detail::confirm_selection_visible(&mut app, width, height) {
+                            app.run_detail_action();
+                        }
+                    }
                     KeyCode::Char('c') => return Ok(()),
                     _ => {}
                 }
@@ -4383,7 +4215,11 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             if app.awaiting_bind {
                 app.awaiting_bind = false;
                 match key.code {
-                    KeyCode::Char(c) if c.is_ascii_alphabetic() => app.bind_selected(c),
+                    KeyCode::Char(c) if c.is_ascii_alphabetic() => {
+                        if plugin_detail::confirm_selection_visible(&mut app, width, height) {
+                            app.bind_selected(c);
+                        }
+                    }
                     KeyCode::Esc => app.flash = Some("not bound".to_string()),
                     _ => app.flash = Some("that is not a letter — nothing bound".to_string()),
                 }
@@ -4392,15 +4228,7 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
 
             match key.code {
                 KeyCode::Char('b') => {
-                    if app
-                        .rows
-                        .get(idx)
-                        .and_then(|r| r.detail.as_ref())
-                        .map(|d| App::bindable(d).is_empty())
-                        .unwrap_or(true)
-                    {
-                        app.flash = Some("no actions to bind".to_string());
-                    } else {
+                    if plugin_detail::confirm_selection_visible(&mut app, width, height) {
                         app.awaiting_bind = true;
                         app.flash = None;
                     }
@@ -4412,12 +4240,20 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                 KeyCode::Char('j') | KeyCode::Down => {
                     if app.detail_cursor + 1 < n {
                         app.detail_cursor += 1;
+                        plugin_detail::reveal_selection(&mut app, width, height);
                     }
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    app.detail_cursor = app.detail_cursor.saturating_sub(1)
+                    app.detail_cursor = app.detail_cursor.saturating_sub(1);
+                    plugin_detail::reveal_selection(&mut app, width, height);
                 }
-                KeyCode::Enter => app.run_detail_action(),
+                KeyCode::PageDown => plugin_detail::scroll_page(&mut app, width, height, true),
+                KeyCode::PageUp => plugin_detail::scroll_page(&mut app, width, height, false),
+                KeyCode::Enter => {
+                    if plugin_detail::confirm_selection_visible(&mut app, width, height) {
+                        app.run_detail_action();
+                    }
+                }
                 KeyCode::Char('L') => app.open_logs_for(idx),
                 _ => {}
             }
