@@ -6,7 +6,7 @@ section applies only to changes included in the selected release.
 
 ## GitHub release draft
 
-**herdr-lazy {version}**
+**herdr-lazy v0.45.0**
 
 herdr-lazy lets you manage Herdr plugins from one pane. Use `/` to browse the
 Marketplace, `l` to inspect a plugin's declared actions, and `?` to see the
@@ -25,7 +25,7 @@ herdr plugin install natori-hrj/herdr-lazy
 Restart Herdr and open Manage with `prefix+shift+l` on a fresh setup, or use
 `herdr plugin pane open --plugin herdr-lazy --entrypoint manage --focus`.
 
-### Candidate changes to include after merge
+### What's new in v0.45.0
 
 - Manage adapts to terminal width, with explicit text statuses and a visible selection.
   Help scrolls in short panes.
@@ -35,25 +35,19 @@ Restart Herdr and open Manage with `prefix+shift+l` on a fresh setup, or use
 - Detail scrolls while preserving action focus. You can inspect the locally known
   repository, resolved commit, listed ref, and Herdr version compatibility.
 - Terminal default, Catppuccin, Tokyo Night, Gruvbox, Nord, and custom color presets
-  are available through `HERDR_LAZY_THEME`. If included in the verified build,
-  `T` previews and saves a theme and Ctrl+P opens the command palette.
-- The offline recorder has separate candidate-only flows for the command palette,
-  theme picker, and cached Marketplace refresh. The default workflow remains
-  available for the current release.
+  are available through `HERDR_LAZY_THEME`. Use `T` to preview and save a theme, or Ctrl+P to open the command palette.
+- The offline recorder has separate flows for the command palette,
+  theme picker, and cached Marketplace refresh. The default workflow covers Manage, details, and Marketplace.
 
-**Performance evidence for the Marketplace refresh candidate.** On Linux x86_64,
-five alternating runs per build used real HTTPS, a stale 2,108-entry cache, a stub
-Herdr process, and a 120×24 PTY. The median time from `/` to the first usable
-Marketplace frame was 449.482 ms on the synchronous build and 28.990 ms on the
-background-refresh build. The median time to the successful refresh message was
-449.498 ms and 536.845 ms, respectively. The first-frame measure captures
-stale-cache usability. Completion includes the network request and the wait before
-the UI paints the status.
+Run `herdr-lazy --version` or `herdr-lazy -V` to check your installed build.
 
-A separate 30-run Linux PTY comparison used staggered mock downloads. When the
-shorter visible-refresh poll was included, p95 from downloader output readiness
-to the completed refresh footer moved from 97.898 ms to 29.888 ms. This measures
-the interface's reaction to a completed download under controlled conditions.
+This release also bounds JSON nesting, Marketplace cache reads, response
+sizes, and shared downloader deadlines. A failed refresh preserves a valid cache.
+
+See [the final candidate report](release-v0.45.0.md) for the build SHA,
+alternating local PTY comparison, recordings, and verification results. The
+Marketplace first-frame measurement reflects access to cached results while
+refresh runs. The completion measurement includes the simulated downloader.
 
 ## X draft
 

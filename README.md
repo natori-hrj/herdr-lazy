@@ -1,5 +1,9 @@
 # herdr-lazy
 
+> See [GitHub Releases](https://github.com/natori-hrj/herdr-lazy/releases/latest) for the published version. [Changelog](CHANGELOG.md) · [v0.45.0 verification, recordings, and measurements](docs/release-v0.45.0.md).
+
+With v0.45.0 or later, run `herdr-lazy --version` or `herdr-lazy -V` to identify your installed build.
+
 > Find, install, and update Herdr plugins from one pane.
 
 When you set up Herdr on another machine, a plain-text plugin list records what you want
@@ -13,8 +17,8 @@ pane to browse the Marketplace, inspect plugins, and decide what to install or u
 ![herdr-lazy in Ghostty: Herdr's main screen, the manage pane, marketplace search, and adding a plugin](docs/demo.gif)
 
 [Record the released Manage, Detail, and Marketplace workflow with an offline fixture](docs/demo.md).
-The guide also covers candidate-only recordings for the command palette, theme picker,
-and cached Marketplace refresh.
+The guide also covers recordings for the command palette, theme picker,
+and cached Marketplace refresh in v0.45.0.
 
 ## Try it in 60 seconds
 
