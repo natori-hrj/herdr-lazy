@@ -20,6 +20,8 @@ use std::{
 
 mod managed_list;
 
+use crate::theme::{Color, Role, Theme};
+
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
 
@@ -63,16 +65,14 @@ impl Status {
         }
     }
 
-    /// ANSI colour. Written directly rather than via crossterm's style API — one escape code
-    /// is simpler to read here than a builder chain.
-    fn colour(&self) -> &'static str {
+    fn role(&self) -> Role {
         match self {
-            Status::Ok => "\x1b[32m",                               // green
-            Status::Missing | Status::Drifted { .. } => "\x1b[33m", // yellow
-            Status::Unverifiable | Status::Disabled => "\x1b[36m",  // cyan
-            Status::Extra => "\x1b[31m",                            // red
-            Status::ExtraLocal => "\x1b[35m",                       // magenta
-            Status::SelfEntry => "\x1b[34m",                        // blue
+            Status::Ok => Role::Success,
+            Status::Missing | Status::Drifted { .. } => Role::Warning,
+            Status::Unverifiable | Status::Disabled => Role::Accent,
+            Status::Extra => Role::Danger,
+            Status::ExtraLocal => Role::Local,
+            Status::SelfEntry => Role::Info,
         }
     }
 
@@ -150,11 +150,11 @@ impl Row {
         }
     }
 
-    fn colour(&self) -> &'static str {
+    fn color(&self, theme: Theme) -> Color {
         if self.herdr_warning.is_some() {
-            "\x1b[33m"
+            theme.color(Role::Warning)
         } else {
-            self.status.colour()
+            theme.color(self.status.role())
         }
     }
 
@@ -1171,6 +1171,7 @@ type MarketplaceResult = Result<(Vec<crate::registry::Entry>, String), String>;
 /// field per view, and every fixture should not have to know about all of them.
 #[derive(Default)]
 struct App {
+    theme: Theme,
     rows: Vec<Row>,
     /// The point-in-time workspace in which Herdr opened this pane, when available.
     workspace_context: Option<crate::context::PluginContext>,
@@ -1240,7 +1241,7 @@ enum ProfileAction {
 }
 
 impl App {
-    fn load() -> App {
+    fn load(theme: Theme) -> App {
         let context = crate::context::read_context_from_env();
         let last_event = context
             .context
@@ -1265,6 +1266,7 @@ impl App {
         let market = crate::registry::cached_entries();
         match installed_plugins() {
             Ok(installed) => App {
+                theme,
                 rows: rows_with_herdr_version(&desired, &installed, &market, herdr_version),
                 workspace_context: workspace_context.clone(),
                 workspace_profile: workspace_profile.clone(),
@@ -1292,6 +1294,7 @@ impl App {
                 flash: None,
             },
             Err(e) => App {
+                theme,
                 rows: Vec::new(),
                 workspace_context,
                 workspace_profile,
@@ -1332,7 +1335,7 @@ impl App {
         let adopt = self.adopt.take();
         let changes = self.detail_changes.take();
         let logs = self.log_view.take();
-        *self = App::load();
+        *self = App::load(self.theme);
         self.browser = browser;
         self.marketplace_refresh = marketplace_refresh;
         self.profile_open = profile_open;
@@ -2667,6 +2670,7 @@ impl App {
 
     /// Show the exact change before making it.
     fn draw_bind_confirm(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        let success = self.theme.color(Role::Success);
         let rule = rule_line(width);
         let (target, key) = self.pending_bind.clone().expect("checked by caller");
         let plugin_id = self
@@ -2692,7 +2696,7 @@ impl App {
             format!("type = \"{}\"", kind),
             format!("command = \"{}\"", command),
         ] {
-            writeln!(out, "   \x1b[32m{}\x1b[0m\r", line)?;
+            writeln!(out, "   {success}{}\x1b[0m\r", line)?;
         }
         writeln!(out, "\r")?;
         writeln!(
@@ -2722,6 +2726,7 @@ impl App {
         width: u16,
         height: u16,
     ) -> io::Result<()> {
+        let warning = self.theme.color(Role::Warning);
         let rule = rule_line(width);
         let action = self.pending_profile.expect("checked by caller");
         let profile_path = self
@@ -2733,7 +2738,7 @@ impl App {
         write!(out, "\x1b[H\x1b[2J")?;
         writeln!(
             out,
-            "\x1b[1m workspace profile\x1b[0m  \x1b[33mconfirm\x1b[0m\r"
+            "\x1b[1m workspace profile\x1b[0m  {warning}confirm\x1b[0m\r"
         )?;
         writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
         writeln!(
@@ -2796,16 +2801,18 @@ impl App {
 
     /// Show the project-scoped diff and its safe, explicit actions.
     fn draw_profile(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        let danger = self.theme.color(Role::Danger);
+        let accent = self.theme.color(Role::Accent);
         let rule = rule_line(width);
         write!(out, "\x1b[H\x1b[2J")?;
         writeln!(
             out,
-            "\x1b[1m workspace profile\x1b[0m  \x1b[36mproject-scoped\x1b[0m\r"
+            "\x1b[1m workspace profile\x1b[0m  {accent}project-scoped\x1b[0m\r"
         )?;
         writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
 
         let Some(profile) = self.workspace_profile.as_ref() else {
-            writeln!(out, " \x1b[31mprofile is unavailable:\x1b[0m\r")?;
+            writeln!(out, " {danger}profile is unavailable:\x1b[0m\r")?;
             writeln!(
                 out,
                 "   {}\r",
@@ -2915,8 +2922,9 @@ impl App {
         height: u16,
         rule: &str,
     ) -> io::Result<()> {
+        let accent = self.theme.color(Role::Accent);
         let footer = match &self.flash {
-            Some(message) => format!("\x1b[36m{}\x1b[0m", message),
+            Some(message) => format!("{accent}{}\x1b[0m", message),
             None => "\x1b[1m[s]\x1b[0m sync  \x1b[1m[r]\x1b[0m restore lock  \
                      \x1b[1m[m]\x1b[0m merge into global  \x1b[1m[esc/q]\x1b[0m back"
                 .to_string(),
@@ -2933,6 +2941,7 @@ impl App {
 
     /// Show the native herdr log response without leaving the manage pane.
     fn draw_logs(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        let danger = self.theme.color(Role::Danger);
         let view = self.log_view.as_ref().expect("checked by caller");
         let rule = rule_line(width);
         let content_width = (width as usize).saturating_sub(2).max(1);
@@ -2951,7 +2960,7 @@ impl App {
         writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
 
         if view.error.is_some() {
-            writeln!(out, " \x1b[31mcould not read plugin logs:\x1b[0m\r")?;
+            writeln!(out, " {danger}could not read plugin logs:\x1b[0m\r")?;
             for line in lines.iter().skip(start).take(visible) {
                 writeln!(out, "   {}\r", line)?;
             }
@@ -2995,6 +3004,8 @@ impl App {
     /// answer — every manifest declares its actions, panes and events — so the pane can just
     /// show it, and run the actions too.
     fn draw_detail(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        let warning = self.theme.color(Role::Warning);
+        let accent = self.theme.color(Role::Accent);
         let rule = rule_line(width);
         let idx = self.detail_of.expect("checked by caller");
         let Some(row) = self.rows.get(idx) else {
@@ -3012,7 +3023,7 @@ impl App {
             let footer = self
                 .flash
                 .as_deref()
-                .map(|message| format!("\x1b[36m{}\x1b[0m", message))
+                .map(|message| format!("{accent}{}\x1b[0m", message))
                 .unwrap_or_else(|| "\x1b[2many key goes back\x1b[0m".to_string());
             write!(
                 out,
@@ -3101,7 +3112,7 @@ impl App {
                     Changes::Commits(cs) if !cs.is_empty() => {
                         writeln!(
                             out,
-                            " \x1b[1m\x1b[33m{} new commit(s) since you installed\x1b[0m  \
+                            " \x1b[1m{warning}{} new commit(s) since you installed\x1b[0m  \
                              \x1b[2m(press u to update)\x1b[0m\r",
                             cs.len()
                         )?;
@@ -3121,7 +3132,7 @@ impl App {
                     Changes::ManyPlus(n) => {
                         writeln!(
                             out,
-                            " \x1b[33m{}+ commits behind\x1b[0m \x1b[2m— more than one page; \
+                            " {warning}{}+ commits behind\x1b[0m \x1b[2m— more than one page; \
                              press u to catch up\x1b[0m\r\r",
                             n
                         )?;
@@ -3150,11 +3161,10 @@ impl App {
         }
 
         let footer = if self.awaiting_bind {
-            "\x1b[33mpress a letter to bind this to prefix+shift+<letter>, or esc\x1b[0m"
-                .to_string()
+            format!("{warning}press a letter to bind this to prefix+shift+<letter>, or esc\x1b[0m")
         } else {
             match &self.flash {
-                Some(m) => format!("\x1b[36m{}\x1b[0m", m),
+                Some(m) => format!("{accent}{}\x1b[0m", m),
                 None => "\x1b[1m[enter]\x1b[0m run  \x1b[1m[b]\x1b[0m bind to a key  \
                          \x1b[1m[L]\x1b[0m logs  \x1b[1m[j/k]\x1b[0m move  \
                          \x1b[1m[esc]\x1b[0m back"
@@ -3178,6 +3188,9 @@ impl App {
     /// of each pair at most, so it is spelled out here.
     /// The marketplace overlay: a query line, matching plugins, and what each one is.
     fn draw_browser(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        let success = self.theme.color(Role::Success);
+        let warning = self.theme.color(Role::Warning);
+        let accent = self.theme.color(Role::Accent);
         let b = self.browser.as_ref().expect("checked by caller");
         let rule = rule_line(width);
         let results = b.results();
@@ -3223,19 +3236,17 @@ impl App {
             let selected = i == b.cursor;
             let pointer = if selected { "\x1b[7m>\x1b[0m" } else { " " };
             // Already in the list is worth knowing before you add it a second time.
-            let mark = if b.is_listed(e) {
-                "\x1b[32m✔\x1b[0m"
+            let (listed_color, mark) = if b.is_listed(e) {
+                (success, "✔")
             } else {
-                " "
+                (Color::Plain, " ")
             };
             // Last push, not stars, is what says whether a plugin still works. Four columns
             // is enough for "3d" / "2w" / "5mo" and costs almost nothing.
             let age = crate::registry::age_label(&e.pushed_at, today);
             writeln!(
                 out,
-                "{} {} \x1b[33m{:>4}★\x1b[0m {:<38} \x1b[2m{:<5}{}\x1b[0m\r",
-                pointer,
-                mark,
+                "{pointer} {listed_color}{mark}\x1b[0m {warning}{:>4}★\x1b[0m {:<38} \x1b[2m{:<5}{}\x1b[0m\r",
                 e.stars,
                 truncate(&sanitize_log_output(&e.full_name), 38),
                 age,
@@ -3247,7 +3258,7 @@ impl App {
         }
 
         let footer = match &self.flash {
-            Some(msg) => format!("\x1b[36m{}\x1b[0m", msg),
+            Some(msg) => format!("{accent}{}\x1b[0m", msg),
             None => "\x1b[1m[enter]\x1b[0m add to your list  \x1b[1m[tab]\x1b[0m category  \
                      \x1b[1m[ctrl+o]\x1b[0m open repo  \x1b[1m[↑↓]\x1b[0m move  \
                      \x1b[1m[ctrl+r]\x1b[0m refresh  \x1b[1m[esc]\x1b[0m back"
@@ -3264,6 +3275,8 @@ impl App {
     }
 
     fn draw_extras(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        let success = self.theme.color(Role::Success);
+        let accent = self.theme.color(Role::Accent);
         let p = self.extras.as_ref().expect("checked by caller");
         let rule = rule_line(width);
 
@@ -3301,7 +3314,11 @@ impl App {
                     } else {
                         "[ ]"
                     };
-                    let mark = if it.listed { "\x1b[32m✔\x1b[0m" } else { " " };
+                    let (listed_color, mark) = if it.listed {
+                        (success, "✔")
+                    } else {
+                        (Color::Plain, " ")
+                    };
                     // One of yours reads differently from one that shipped with the tool.
                     let id = if it.extra.source == crate::extras::Source::Local {
                         format!("{}*", truncate(&it.extra.id, 11))
@@ -3310,10 +3327,7 @@ impl App {
                     };
                     writeln!(
                         out,
-                        "{} {} {} {:<12} \x1b[2m{}\x1b[0m\r",
-                        pointer,
-                        tick,
-                        mark,
+                        "{pointer} {tick} {listed_color}{mark}\x1b[0m {:<12} \x1b[2m{}\x1b[0m\r",
                         id,
                         truncate(&it.extra.description, width.saturating_sub(24) as usize)
                     )?;
@@ -3322,7 +3336,7 @@ impl App {
         }
 
         let footer = match &self.flash {
-            Some(msg) => format!("\x1b[36m{}\x1b[0m", msg),
+            Some(msg) => format!("{accent}{}\x1b[0m", msg),
             None => "\x1b[1m[space]\x1b[0m tick  \x1b[1m[enter]\x1b[0m add to your list  \
                      \x1b[1m[↑↓]\x1b[0m move  \x1b[1m[esc]\x1b[0m back"
                 .to_string(),
@@ -3343,6 +3357,8 @@ impl App {
         width: u16,
         height: u16,
     ) -> io::Result<()> {
+        let success = self.theme.color(Role::Success);
+        let accent = self.theme.color(Role::Accent);
         let p = self.recommendations.as_ref().expect("checked by caller");
         let rule = rule_line(width);
 
@@ -3374,14 +3390,14 @@ impl App {
             } else {
                 "[ ]"
             };
-            let mark = if item.listed {
-                "\x1b[32m✔\x1b[0m"
+            let (listed_color, mark) = if item.listed {
+                (success, "✔")
             } else {
-                " "
+                (Color::Plain, " ")
             };
             writeln!(
                 out,
-                "{} {} {} {:<14} \x1b[2m{} — {}\x1b[0m\r",
+                "{} {} {listed_color}{}\x1b[0m {:<14} \x1b[2m{} — {}\x1b[0m\r",
                 pointer,
                 tick,
                 mark,
@@ -3392,7 +3408,7 @@ impl App {
         }
 
         let footer = match &self.flash {
-            Some(msg) => format!("\x1b[36m{}\x1b[0m", msg),
+            Some(msg) => format!("{accent}{}\x1b[0m", msg),
             None => "\x1b[1m[space]\x1b[0m tick  \x1b[1m[enter]\x1b[0m add to review list  \
                      \x1b[1m[d]\x1b[0m dismiss  \x1b[1m[↑↓]\x1b[0m move  \
                      \x1b[1m[esc]\x1b[0m back"
@@ -3409,6 +3425,10 @@ impl App {
     }
 
     fn draw_adopt(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        let danger = self.theme.color(Role::Danger);
+        let success = self.theme.color(Role::Success);
+        let warning = self.theme.color(Role::Warning);
+        let accent = self.theme.color(Role::Accent);
         let a = self.adopt.as_ref().expect("checked by caller");
         let rule = rule_line(width);
 
@@ -3422,7 +3442,7 @@ impl App {
             writeln!(out, " from: \x1b[1m{}\x1b[0m\x1b[7m \x1b[0m\r", a.spec)?;
             writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
             if let Some(e) = &a.error {
-                writeln!(out, " \x1b[31m{}\x1b[0m\r", e)?;
+                writeln!(out, " {danger}{}\x1b[0m\r", e)?;
             } else {
                 writeln!(
                     out,
@@ -3450,25 +3470,21 @@ impl App {
                 };
                 let tick = if r.picked { "\x1b[1m[x]\x1b[0m" } else { "[ ]" };
                 // What your machine already says about it, so "taking" means something.
-                let (mark, note) = match r.held {
-                    Held::Listed => ("\x1b[32m✔\x1b[0m", "already in your list"),
-                    Held::Installed => ("\x1b[33m·\x1b[0m", "installed, not in your list"),
-                    Held::Fresh => (" ", ""),
+                let (listed_color, mark, note) = match r.held {
+                    Held::Listed => (success, "✔", "already in your list"),
+                    Held::Installed => (warning, "·", "installed, not in your list"),
+                    Held::Fresh => (Color::Plain, " ", ""),
                 };
                 writeln!(
                     out,
-                    "{} {} {} {:<44} \x1b[2m{}\x1b[0m\r",
-                    pointer,
-                    tick,
-                    mark,
+                    "{pointer} {tick} {listed_color}{mark}\x1b[0m {:<44} \x1b[2m{note}\x1b[0m\r",
                     truncate(&r.entry, 44),
-                    note
                 )?;
             }
         }
 
         let footer = match &self.flash {
-            Some(msg) => format!("\x1b[36m{}\x1b[0m", msg),
+            Some(msg) => format!("{accent}{}\x1b[0m", msg),
             None if a.asking() => {
                 "\x1b[1m[enter]\x1b[0m read it  \x1b[1m[esc]\x1b[0m back".to_string()
             }
@@ -3488,6 +3504,8 @@ impl App {
 
     /// Show the machine picker or the selected machine's plugin health snapshot.
     fn draw_machines(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        let warning = self.theme.color(Role::Warning);
+        let accent = self.theme.color(Role::Accent);
         let view = self.machine_view.as_ref().expect("checked by caller");
         if view.detail_of.is_some() {
             return self.draw_machine_detail(out, width, height);
@@ -3512,7 +3530,7 @@ impl App {
             " {}\r",
             view.notice
                 .as_deref()
-                .map(|notice| format!("\x1b[33m{}\x1b[0m", notice))
+                .map(|notice| format!("{warning}{}\x1b[0m", notice))
                 .unwrap_or_else(|| {
                     "\x1b[2mread-only status; Enter inspects the selected target\x1b[0m".to_string()
                 })
@@ -3559,7 +3577,7 @@ impl App {
         }
 
         let footer = match &self.flash {
-            Some(message) => format!("\x1b[36m{}\x1b[0m", message),
+            Some(message) => format!("{accent}{}\x1b[0m", message),
             None => "\x1b[1m[enter]\x1b[0m inspect  \x1b[1m[j/k]\x1b[0m target  \
                      \x1b[1m[r]\x1b[0m refresh  \x1b[1m[esc/q]\x1b[0m back"
                 .to_string(),
@@ -3575,6 +3593,9 @@ impl App {
     }
 
     fn draw_machine_detail(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        let danger = self.theme.color(Role::Danger);
+        let warning = self.theme.color(Role::Warning);
+        let accent = self.theme.color(Role::Accent);
         let view = self.machine_view.as_ref().expect("checked by caller");
         let index = view.detail_of.expect("detail view has a target");
         let Some(entry) = view.entries.get(index) else {
@@ -3625,7 +3646,7 @@ impl App {
         if let Some(error) = entry.health.error.as_deref() {
             writeln!(
                 out,
-                " \x1b[33mnote:\x1b[0m {}\r",
+                " {warning}note:\x1b[0m {}\r",
                 truncate(error, width.saturating_sub(10) as usize)
             )?;
         } else {
@@ -3641,7 +3662,7 @@ impl App {
         if !entry.health.plugin_list_available {
             writeln!(
                 out,
-                " \x1b[31mplugin state unavailable for this target\x1b[0m\r"
+                " {danger}plugin state unavailable for this target\x1b[0m\r"
             )?;
             writeln!(
                 out,
@@ -3668,7 +3689,7 @@ impl App {
                     out,
                     "{}\x1b[0m {}{}\x1b[0m {:<44} \x1b[2m{:<12}\x1b[0m {}\r",
                     pointer,
-                    row.colour(),
+                    row.color(self.theme),
                     row.marker(),
                     truncate(&row.label, 44),
                     commit,
@@ -3678,7 +3699,7 @@ impl App {
         }
 
         let footer = match &self.flash {
-            Some(message) => format!("\x1b[36m{}\x1b[0m", message),
+            Some(message) => format!("{accent}{}\x1b[0m", message),
             None => "\x1b[1m[i]\x1b[0m sync this target  \x1b[1m[u]\x1b[0m update this target  \
                      \x1b[1m[r]\x1b[0m refresh  \x1b[1m[esc/q]\x1b[0m back"
                 .to_string(),
@@ -3699,6 +3720,7 @@ impl App {
         width: u16,
         height: u16,
     ) -> io::Result<()> {
+        let warning = self.theme.color(Role::Warning);
         let view = self
             .machine_view
             .as_ref()
@@ -3713,7 +3735,7 @@ impl App {
         write!(out, "\x1b[H\x1b[2J")?;
         writeln!(
             out,
-            "\x1b[1m machine {}\x1b[0m  \x1b[33mconfirm\x1b[0m\r",
+            "\x1b[1m machine {}\x1b[0m  {warning}confirm\x1b[0m\r",
             action.label()
         )?;
         writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
@@ -4086,7 +4108,11 @@ pub(crate) fn run() -> io::Result<()> {
 }
 
 fn event_loop(out: &mut impl Write) -> io::Result<()> {
-    let mut app = App::load();
+    let (theme, theme_error) = Theme::configured();
+    let mut app = App::load(theme);
+    if let Some(error) = theme_error {
+        app.flash = Some(format!("Using terminal theme: {error}"));
+    }
     let mut last_size = None;
     let mut redraw = true;
     let mut startup_redraws = STARTUP_REDRAWS;
@@ -4998,7 +5024,7 @@ mod tests {
         let r = rows_with_herdr_version(&desired, &[p], &[], Some(version("0.7.4")));
         assert_eq!(r[0].status, Status::Ok);
         assert_eq!(r[0].marker(), "⚠");
-        assert_eq!(r[0].colour(), "\x1b[33m");
+        assert_eq!(r[0].color(Theme::default()).to_string(), "\x1b[33m");
         assert_eq!(r[0].trailing_text(), "needs herdr 0.8.0, running 0.7.4");
     }
 
@@ -6036,7 +6062,10 @@ mod tests {
             Status::ExtraLocal,
         ] {
             assert!(!s.marker().is_empty());
-            assert!(s.colour().starts_with("\x1b["));
+            assert!(Theme::default()
+                .color(s.role())
+                .to_string()
+                .starts_with("\x1b["));
         }
     }
 

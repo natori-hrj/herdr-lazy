@@ -160,6 +160,23 @@ herdr-lazy init --extras worktrunk   # defaults plus a chosen extra
 herdr-lazy init --from owner/repo    # start from someone else's list instead
 ```
 
+### Terminal themes
+
+The Manage and Workspace Starter panes use your terminal's ANSI colors by default.
+Set `HERDR_LAZY_THEME` in the environment that starts the pane to select a truecolor
+palette. Available values are `terminal`, `catppuccin` (Mocha), `tokyo-night`, `gruvbox`,
+and `nord`. The palettes change status and accent colors while keeping the terminal's
+background and main text. They are designed for dark backgrounds.
+
+```sh
+HERDR_LAZY_THEME=nord herdr-lazy ui
+HERDR_LAZY_THEME='success=#80c7a2,warning=#f3bc78' herdr-lazy ui
+```
+
+A custom palette accepts any combination of `danger`, `success`, `warning`, `info`,
+`local`, and `accent` with six-digit `#RRGGBB` values. Omitted roles use ANSI colors.
+Invalid settings use the terminal palette and show a message when the pane opens.
+
 ### Workspace context
 
 When Herdr opens the manage pane, herdr-lazy reads the point-in-time
