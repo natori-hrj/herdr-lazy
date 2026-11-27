@@ -204,9 +204,10 @@ pub(super) fn draw(app: &App, out: &mut impl Write, width: u16, height: u16) -> 
             let accent = app.theme.color(Role::Accent);
             write!(out, "\x1b[{footer};1H{accent}{message}\x1b[0m")?;
         } else {
+            let primary = "[/] Browse";
             let mut legend = String::new();
             for hint in [
-                "[/] Browse",
+                primary,
                 "[?] Help",
                 "[Ctrl+P] Commands",
                 "[l] Detail",
@@ -240,7 +241,12 @@ pub(super) fn draw(app: &App, out: &mut impl Write, width: u16, height: u16) -> 
                     }
                 }
             }
-            write!(out, "\x1b[{footer};1H{legend}")?;
+            write!(out, "\x1b[{footer};1H")?;
+            if let Some(rest) = legend.strip_prefix(primary) {
+                write!(out, "\x1b[1m{primary}\x1b[0m{rest}")?;
+            } else {
+                write!(out, "{legend}")?;
+            }
         }
     }
     out.flush()
@@ -250,6 +256,18 @@ pub(super) fn draw(app: &App, out: &mut impl Write, width: u16, height: u16) -> 
 mod tests {
     use super::super::terminal_text::cell_width;
     use super::*;
+
+    #[test]
+    fn manage_visual_hierarchy_emphasizes_browse() {
+        let app = App {
+            rows: super::super::rows(&[crate::Spec::parse("owner/plugin")], &[]),
+            ..App::default()
+        };
+        let mut output = Vec::new();
+        app.draw(&mut output, 40, 9).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("\x1b[1m[/] Browse\x1b[0m  [?] Help"));
+    }
 
     #[test]
     fn adaptive_manage_shows_notes_alongside_short_and_long_names() {

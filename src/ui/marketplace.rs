@@ -105,7 +105,7 @@ fn search_line(
     let query = query_tail(&browser.query, available - controls.len());
     write!(
         out,
-        "{prefix}\x1b[1m{query}\x1b[0m\x1b[7m \x1b[0m\x1b[2m{controls}\x1b[0m"
+        "\x1b[1m{prefix}\x1b[0m\x1b[1m{query}\x1b[0m\x1b[7m \x1b[0m\x1b[2m{controls}\x1b[0m"
     )?;
     Ok(divider_controls)
 }
@@ -251,7 +251,12 @@ pub(super) fn draw(
         };
         write!(out, "\x1b[1m{title}\x1b[0m")?;
         if !note.is_empty() {
-            write!(out, "  {color}{note}\x1b[0m")?;
+            let dim = if refreshing || failed || inventory_note.is_some() {
+                ""
+            } else {
+                "\x1b[2m"
+            };
+            write!(out, "  {dim}{color}{note}\x1b[0m")?;
         }
         write!(out, "\x1b[2;1H")?;
     }
@@ -294,9 +299,10 @@ pub(super) fn draw(
         });
         let divider_text = preview.unwrap_or_else(|| rule_line(width));
         write!(out, "\x1b[{divider};1H\x1b[2m{divider_text}\x1b[0m")?;
+        let primary = "[Enter] Add";
         let mut hint_line = String::new();
         for hint in [
-            "[Enter] Add",
+            primary,
             "[Esc] Back",
             "[Ctrl+L] Reset",
             "[Ctrl+O] Repo",
@@ -312,12 +318,19 @@ pub(super) fn draw(
         if hint_line.is_empty() {
             hint_line = clip("[Esc] Back", columns).0;
         }
-        let (label, color) = if let Some(flash) = &app.flash {
-            (clip(flash, columns).0, app.theme.color(Role::Accent))
+        write!(out, "\x1b[{footer};1H")?;
+        if let Some(flash) = &app.flash {
+            let (label, _) = clip(flash, columns);
+            let accent = app.theme.color(Role::Accent);
+            write!(out, "{accent}{label}\x1b[0m")?;
+        } else if let Some(rest) = hint_line
+            .strip_prefix(primary)
+            .filter(|_| !results.is_empty())
+        {
+            write!(out, "\x1b[1m{primary}\x1b[0m{rest}")?;
         } else {
-            (hint_line, Color::Plain)
-        };
-        write!(out, "\x1b[{footer};1H{color}{label}\x1b[0m")?;
+            write!(out, "{hint_line}\x1b[0m")?;
+        }
     }
     out.flush()
 }
@@ -348,6 +361,26 @@ mod tests {
         let mut output = Vec::new();
         draw(app, &mut output, width, height, refreshing).unwrap();
         String::from_utf8(output).unwrap()
+    }
+
+    #[test]
+    fn marketplace_visual_hierarchy_emphasizes_search_and_available_add() {
+        let mut app = app();
+        let mut output = Vec::new();
+        app.draw(&mut output, 80, 24).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("\x1b[1mSearch \x1b[0m"));
+        assert!(output.contains("\x1b[1m[Enter] Add\x1b[0m"));
+        assert!(output.contains("\x1b[2mcached 2h ago\x1b[0m"));
+
+        let browser = app.browser.as_mut().unwrap();
+        browser.source_note = "cached 2h ago (refresh failed: offline)".into();
+        browser.query = "unmatched".into();
+        let empty = frame(&app, 80, 24, false);
+        let danger = app.theme.color(Role::Danger);
+        assert!(empty.contains("\x1b[1mSearch \x1b[0m\x1b[1munmatched\x1b[0m\x1b[7m "));
+        assert!(empty.contains(&format!("  {danger}refresh failed: offline")));
+        assert!(empty.contains("\x1b[22;1H[Enter] Add"));
     }
 
     #[test]
