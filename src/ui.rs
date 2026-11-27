@@ -1195,7 +1195,7 @@ struct App {
     /// Present while reading someone else's list.
     adopt: Option<AdoptPicker>,
     /// `?` — the full keymap. The footer only has room for the common half.
-    help: bool,
+    help: Option<usize>,
     /// Open details for the row at this index: what the plugin does and how to reach it.
     detail_of: Option<usize>,
     /// Which action is highlighted in the details view.
@@ -1276,7 +1276,7 @@ impl App {
                 extras: None,
                 recommendations: None,
                 adopt: None,
-                help: false,
+                help: None,
                 detail_of: None,
                 detail_cursor: 0,
                 detail_changes: None,
@@ -1303,7 +1303,7 @@ impl App {
                 extras: None,
                 recommendations: None,
                 adopt: None,
-                help: false,
+                help: None,
                 detail_of: None,
                 detail_cursor: 0,
                 detail_changes: None,
@@ -1530,9 +1530,9 @@ impl App {
 
     fn profile_suffix(&self) -> String {
         if self.workspace_profile.is_some() {
-            " · \x1b[36m[p] project profile\x1b[2m".to_string()
+            " · [p] project profile".to_string()
         } else if self.profile_error.is_some() {
-            " · \x1b[31m[p] invalid project profile\x1b[2m".to_string()
+            " · [p] invalid project profile".to_string()
         } else {
             String::new()
         }
@@ -1562,12 +1562,16 @@ impl App {
         } else {
             "recommendations"
         };
-        format!(
-            " · \x1b[36m[n] {} {} for {}\x1b[2m",
-            count,
-            noun,
-            agent.label()
-        )
+        format!(" · [n] {} {} for {}", count, noun, agent.label())
+    }
+
+    fn help_context(&self) -> String {
+        [
+            self.context_suffix(),
+            self.profile_suffix(),
+            self.recommendation_suffix(),
+        ]
+        .concat()
     }
 
     fn global_specs(&self) -> Vec<Spec> {
@@ -2625,8 +2629,8 @@ impl App {
     }
 
     fn draw(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
-        if self.help {
-            return self.draw_help(out, width, height);
+        if let Some(offset) = self.help {
+            return draw_help(out, width, height, offset, &self.help_context());
         }
         if self.pending_bind.is_some() {
             return self.draw_bind_confirm(out, width, height);
@@ -3026,7 +3030,7 @@ impl App {
         let items = Self::bindable(d);
 
         if !d.description.is_empty() {
-            for line in wrap(&d.description, (width as usize).saturating_sub(3)) {
+            for line in wrap(&d.description, (width as usize).saturating_sub(3).max(20)) {
                 writeln!(out, " {}\r", line)?;
             }
             writeln!(out, "\r")?;
@@ -3175,145 +3179,6 @@ impl App {
     /// The list's keys are deliberately paired: lowercase is the row under the cursor,
     /// uppercase is everything. That rule is invisible in the footer, which has room for one
     /// of each pair at most, so it is spelled out here.
-    fn draw_help(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
-        let rule = rule_line(width);
-        write!(out, "\x1b[H\x1b[2J")?;
-        // The one rule the whole keymap follows, stated before any of the keys.
-        writeln!(
-            out,
-            "\x1b[1m keys\x1b[0m   \x1b[2mlowercase acts on the selected row ·              UPPERCASE means bulk or special actions\x1b[0m\r"
-        )?;
-        writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
-
-        let optional_status = [
-            self.context_suffix(),
-            self.profile_suffix(),
-            self.recommendation_suffix(),
-        ]
-        .into_iter()
-        .filter(|status| !status.is_empty())
-        .collect::<String>();
-        if !optional_status.is_empty() {
-            writeln!(out, " \x1b[2moptional context{}\x1b[0m\r", optional_status)?;
-        }
-
-        let section = |out: &mut dyn Write, title: &str, keys: &[(&str, &str)]| -> io::Result<()> {
-            writeln!(out, " \x1b[1m{}\x1b[0m\r", title)?;
-            for (k, desc) in keys {
-                writeln!(out, "   \x1b[1m{:<12}\x1b[0m {}\r", k, desc)?;
-            }
-            writeln!(out, "\r")
-        };
-
-        section(
-            out,
-            "choosing what to act on",
-            &[
-                ("space", "tick or untick this row (click does the same)"),
-                ("esc", "clear the selection"),
-                (
-                    "",
-                    "with nothing ticked, every action below uses the cursor row",
-                ),
-            ],
-        )?;
-        section(
-            out,
-            "acting on it",
-            &[
-                (
-                    "i / I",
-                    "install what is missing, and put drifted pins back",
-                ),
-                (
-                    "u / U",
-                    "update to the latest commit (pinned entries are skipped)",
-                ),
-                ("x / X", "uninstall — X removes everything not in your list"),
-                ("r / R", "restore to the commits recorded in the lockfile"),
-                ("E", "enable selected installed plugin(s)"),
-                (
-                    "D",
-                    "disable selected installed plugin(s) — herdr-lazy is protected",
-                ),
-                (
-                    "L",
-                    "show the selected installed plugin's recent command logs",
-                ),
-            ],
-        )?;
-        section(
-            out,
-            "optional tools and your list",
-            &[
-                ("a", "add the selected installed plugin(s) to your list"),
-                ("d", "remove this entry (does not uninstall)"),
-                (
-                    "/",
-                    "search the marketplace — enter adds, ctrl+o opens the repo",
-                ),
-                (
-                    "e",
-                    "extras — opt-in picks, ticked with space and added with enter",
-                ),
-                (
-                    "f",
-                    "read someone else's list — tick what you want, enter takes it",
-                ),
-                (
-                    "p",
-                    "review the workspace profile — sync, restore its lock, or merge explicitly",
-                ),
-                (
-                    "w",
-                    "open the workspace starter — preview, sync, then launch declared targets",
-                ),
-                (
-                    "n",
-                    "show recommendations for the focused agent — add to the review list only",
-                ),
-                (
-                    "m",
-                    "inspect plugin health on the local and saved SSH machines",
-                ),
-            ],
-        )?;
-        section(
-            out,
-            "finding your way",
-            &[
-                (
-                    "l / →",
-                    "what this plugin does — its actions, and (if ↑) what changed since install",
-                ),
-                (
-                    "↑",
-                    "beside a commit: the repo moved since you installed; open with l",
-                ),
-                (
-                    "L",
-                    "open the selected plugin's logs; j/k scroll and r reloads",
-                ),
-                ("j / k", "down / up  (arrows and the wheel work too)"),
-                ("g / G", "first / last row"),
-                (
-                    "A",
-                    "toggle auto-sync: install missing plugins when herdr starts",
-                ),
-                ("ctrl+r", "re-read the list and what is installed"),
-                ("? / q", "close this help / quit"),
-            ],
-        )?;
-
-        write!(
-            out,
-            "\x1b[{};1H\x1b[2m{}\r\n \x1b[0m\x1b[2many key closes this\x1b[0m\r\n",
-            footer_start_row(height),
-            rule
-        )?;
-        out.flush()
-    }
-
     /// The marketplace overlay: a query line, matching plugins, and what each one is.
     fn draw_browser(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
         let b = self.browser.as_ref().expect("checked by caller");
@@ -4022,14 +3887,204 @@ impl App {
     }
 }
 
-/// Cut a label to `max` *characters*.
-///
-/// Not display columns: a CJK or emoji label counts as one char per glyph while occupying two
-/// terminal cells, so such a row's trailing columns drift right. Plugin slugs are ASCII in
-/// practice, and the alternative is a unicode-width dependency for a cosmetic case.
+fn add_help_line(lines: &mut Vec<(bool, String)>, bold: bool, text: &str, columns: usize) {
+    for line in wrap(text, columns) {
+        let chars: Vec<char> = line.chars().collect();
+        lines.extend(
+            chars
+                .chunks(columns)
+                .map(|chunk| (bold, chunk.iter().collect())),
+        );
+    }
+}
+
+fn help_lines(columns: usize, context: &str) -> Vec<(bool, String)> {
+    let mut lines = Vec::new();
+    add_help_line(
+        &mut lines,
+        false,
+        "Lowercase acts on the selected row. UPPERCASE means bulk or special actions.",
+        columns,
+    );
+    if !context.is_empty() {
+        // Workspace labels can contain full-width characters.
+        let columns = (columns / 2).max(1);
+        add_help_line(
+            &mut lines,
+            false,
+            &format!("Optional context{context}"),
+            columns,
+        );
+    }
+    let mut section = |title: &str, keys: &[(&str, &str)]| {
+        add_help_line(&mut lines, true, title, columns);
+        for (key, description) in keys {
+            if key.is_empty() {
+                add_help_line(&mut lines, false, description, columns);
+            } else {
+                add_help_line(&mut lines, false, &format!("{key}  {description}"), columns);
+            }
+        }
+    };
+    section(
+        "choosing what to act on",
+        &[
+            ("space", "tick or untick this row (click does the same)"),
+            ("esc", "clear the selection"),
+            (
+                "",
+                "with nothing ticked, every action below uses the cursor row",
+            ),
+        ],
+    );
+    section(
+        "acting on it",
+        &[
+            (
+                "i / I",
+                "install what is missing, and put drifted pins back",
+            ),
+            (
+                "u / U",
+                "update to the latest commit (pinned entries are skipped)",
+            ),
+            ("x / X", "uninstall — X removes everything not in your list"),
+            ("r / R", "restore to the commits recorded in the lockfile"),
+            ("E", "enable selected installed plugin(s)"),
+            (
+                "D",
+                "disable selected installed plugin(s) — herdr-lazy is protected",
+            ),
+        ],
+    );
+    section(
+        "optional tools and your list",
+        &[
+            ("a", "add the selected installed plugin(s) to your list"),
+            ("d", "remove this entry (does not uninstall)"),
+            (
+                "/",
+                "search the marketplace — enter adds, ctrl+o opens the repo",
+            ),
+            (
+                "e",
+                "extras — opt-in picks, ticked with space and added with enter",
+            ),
+            (
+                "f",
+                "read someone else's list — tick what you want, enter takes it",
+            ),
+            (
+                "p",
+                "review the workspace profile — sync, restore its lock, or merge explicitly",
+            ),
+            (
+                "w",
+                "open the workspace starter — preview, sync, then launch declared targets",
+            ),
+            (
+                "n",
+                "show recommendations for the focused agent — add to the review list only",
+            ),
+            (
+                "m",
+                "inspect plugin health on the local and saved SSH machines",
+            ),
+        ],
+    );
+    section(
+        "finding your way",
+        &[
+            (
+                "l / →",
+                "what this plugin does — its actions, and (if ↑) what changed since install",
+            ),
+            (
+                "↑",
+                "beside a commit: the repo moved since you installed; open with l",
+            ),
+            (
+                "L",
+                "open the selected plugin's logs; j/k scroll and r reloads",
+            ),
+            ("j / k", "down / up  (arrows and the wheel work too)"),
+            ("g / G", "first / last row"),
+            (
+                "A",
+                "toggle auto-sync: install missing plugins when herdr starts",
+            ),
+            ("ctrl+r", "re-read the list and what is installed"),
+            ("q", "quit from the plugin list"),
+        ],
+    );
+
+    lines
+}
+
+fn help_viewport(width: u16, height: u16) -> (usize, usize, u16) {
+    let columns = usize::from(width.saturating_sub(1)).max(1);
+    let footer = footer_start_row(height);
+    let first_row = if footer >= 3 { 2 } else { 1 };
+    let visible = usize::from(footer.saturating_sub(first_row)).max(1);
+    (columns, visible, first_row)
+}
+
+fn draw_help(
+    out: &mut impl Write,
+    width: u16,
+    height: u16,
+    offset: usize,
+    context: &str,
+) -> io::Result<()> {
+    write!(out, "\x1b[H\x1b[2J")?;
+    if width < 2 || height == 0 {
+        return out.flush();
+    }
+    let (columns, visible, first_row) = help_viewport(width, height);
+    let lines = help_lines(columns, context);
+    let start = offset.min(lines.len().saturating_sub(visible));
+    if first_row == 2 {
+        write!(
+            out,
+            "\x1b[1m{}\x1b[0m",
+            truncate("Keyboard shortcuts", columns)
+        )?;
+    }
+    for (index, (bold, line)) in lines.iter().skip(start).take(visible).enumerate() {
+        let row = index + usize::from(first_row);
+        if *bold {
+            write!(out, "\x1b[{row};1H\x1b[1m{line}\x1b[0m")?;
+        } else {
+            write!(out, "\x1b[{row};1H{line}")?;
+        }
+    }
+    let footer = footer_start_row(height);
+    if footer > first_row {
+        let end = (start + visible).min(lines.len());
+        let hint = format!("Esc close · ↑↓ scroll · {end}/{}", lines.len());
+        write!(out, "\x1b[{footer};1H{}", truncate(&hint, columns))?;
+    }
+    out.flush()
+}
+
+fn help_scroll(offset: usize, key: KeyCode, width: u16, height: u16, context: &str) -> usize {
+    let (columns, visible, _) = help_viewport(width, height);
+    let last = help_lines(columns, context).len().saturating_sub(visible);
+    let offset = offset.min(last);
+    match key {
+        KeyCode::Up | KeyCode::Char('k') => offset.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => offset.saturating_add(1).min(last),
+        KeyCode::PageUp => offset.saturating_sub(visible),
+        KeyCode::PageDown => offset.saturating_add(visible).min(last),
+        KeyCode::Home | KeyCode::Char('g') => 0,
+        KeyCode::End | KeyCode::Char('G') => last,
+        _ => offset,
+    }
+}
+
 /// Break text to a width, on spaces where possible.
 fn wrap(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(20);
+    let width = width.max(1);
     let mut out = Vec::new();
     let mut line = String::new();
     for word in text.split_whitespace() {
@@ -4047,6 +4102,11 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     out
 }
 
+/// Cut a label to `max` *characters*.
+///
+/// Not display columns: a CJK or emoji label counts as one char per glyph while occupying two
+/// terminal cells, so such a row's trailing columns drift right. Plugin slugs are ASCII in
+/// practice, and the alternative is a unicode-width dependency for a cosmetic case.
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -4178,8 +4238,18 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                     k
                 }
                 Event::Mouse(m) => {
-                    if app.log_view.is_some() {
-                        use crossterm::event::MouseEventKind;
+                    use crossterm::event::MouseEventKind;
+                    if let Some(offset) = app.help {
+                        let key = match m.kind {
+                            MouseEventKind::ScrollUp => Some(KeyCode::Up),
+                            MouseEventKind::ScrollDown => Some(KeyCode::Down),
+                            _ => None,
+                        };
+                        if let Some(key) = key {
+                            app.help =
+                                Some(help_scroll(offset, key, width, height, &app.help_context()));
+                        }
+                    } else if app.log_view.is_some() {
                         let visible = app
                             .log_view
                             .as_ref()
@@ -4214,9 +4284,19 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
         // pty sends Ctrl+D at end of input — which silently ran "drop from list" on whatever
         // the cursor happened to be on. Destructive actions must not be reachable by a
         // modifier chord the user did not intend.
-        // Help is modal and closes on anything, so it is checked before every other keymap.
-        if app.help {
-            app.help = false;
+        if let Some(offset) = app.help {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                return Ok(());
+            }
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
+                app.help = match key.code {
+                    KeyCode::Esc | KeyCode::Char('?' | 'q') => None,
+                    key => Some(help_scroll(offset, key, width, height, &app.help_context())),
+                };
+            }
             continue;
         }
 
@@ -4371,7 +4451,7 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                 KeyCode::Char('i') if detail => app.request_machine_action(MachineAction::Sync),
                 KeyCode::Char('u') if detail => app.request_machine_action(MachineAction::Update),
                 KeyCode::Char('r') => app.reload_machine_view(),
-                KeyCode::Char('?') => app.help = true,
+                KeyCode::Char('?') => app.help = Some(0),
                 _ => {}
             }
             continue;
@@ -4738,7 +4818,7 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                 app.flash = Some(crate::open_starter_pane());
             }
             KeyCode::Char('n') => app.open_recommendations(),
-            KeyCode::Char('?') => app.help = true,
+            KeyCode::Char('?') => app.help = Some(0),
 
             // Keys lazy.nvim has that this does not. Rather than doing nothing — which reads
             // as "the pane is broken" to someone whose fingers know lazy — say where the
@@ -4864,6 +4944,57 @@ mod tests {
         assert_eq!(rule_line(200).chars().count(), 199);
         assert_eq!(rule_line(240).chars().count(), 200);
         assert!(rule_line(80).chars().count() < 80);
+    }
+
+    #[test]
+    fn help_layout_fits_short_panes_and_reaches_the_final_shortcut() {
+        let (width, height) = (40, 9);
+        let (columns, _, _) = help_viewport(width, height);
+        assert!(help_lines(columns, "")
+            .iter()
+            .all(|(_, line)| line.chars().count() <= columns));
+
+        let frame = |offset| {
+            let mut output = Vec::new();
+            draw_help(&mut output, width, height, offset, "").unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert!(!output.contains('\n'));
+            for movement in output
+                .split("\x1b[")
+                .filter(|part| part.starts_with(|c: char| c.is_ascii_digit()))
+            {
+                if let Some((row, _)) = movement.split_once(";1H") {
+                    assert!(row.parse::<u16>().unwrap() <= footer_start_row(height));
+                }
+            }
+            output
+        };
+        let first = frame(0);
+        assert!(first.contains("Keyboard shortcuts"));
+        assert!(first.contains("Lowercase acts"));
+        assert!(!first.contains("quit from the plugin list"));
+        let last = help_scroll(0, KeyCode::End, width, height, "");
+        assert!(frame(last).contains("quit from the plugin list"));
+        assert_eq!(frame(usize::MAX), frame(last));
+    }
+
+    #[test]
+    fn help_navigation_clamps_after_page_and_terminal_resize() {
+        let (width, height) = (24, 10);
+        let (_, visible, _) = help_viewport(width, height);
+        let page = help_scroll(0, KeyCode::PageDown, width, height, "");
+        assert_eq!(page, visible);
+        assert_eq!(help_scroll(page, KeyCode::PageUp, width, height, ""), 0);
+        assert_eq!(help_scroll(0, KeyCode::Up, width, height, ""), 0);
+
+        let narrow_end = help_scroll(0, KeyCode::End, width, height, "");
+        let wide_end = help_scroll(0, KeyCode::End, 80, 24, "");
+        assert!(narrow_end > wide_end);
+        assert_eq!(
+            help_scroll(narrow_end, KeyCode::Up, 80, 24, ""),
+            wide_end - 1
+        );
+        assert_eq!(help_scroll(narrow_end, KeyCode::Home, 80, 24, ""), 0);
     }
 
     fn github(owner: &str, repo: &str, commit: &str, enabled: bool) -> Installed {

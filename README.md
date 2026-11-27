@@ -120,7 +120,8 @@ herdr plugin pane open --plugin herdr-lazy --entrypoint manage --focus
 ## Use
 
 Everything below is also in the manage pane, which is the normal way to use this: open it and
-press `?` for the keymap. The CLI exists for scripting and for things you would rather not do
+press `?` for the keymap. Scroll it with the arrow keys, `j` / `k`, Page Up / Page Down,
+or the mouse wheel. Home / End jump to the first / last page, and Esc closes it. The CLI exists for scripting and for things you would rather not do
 interactively.
 
 **`herdr-lazy` is not on your PATH.** It lives inside herdr's plugin directory, whose name
