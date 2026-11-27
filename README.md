@@ -2,15 +2,19 @@
 
 > Find, install, and update Herdr plugins from one pane.
 
-A simple plugin **manager** for [herdr](https://herdr.dev). Search the marketplace, install
-what you need, update it later, or remove it when you are done. Underneath, it keeps a plain
-list and lockfile so the setup stays readable and reproducible.
+When you set up Herdr on another machine, a plain-text plugin list records what you want
+and a lockfile records the commits you installed. In your workspace, Manage gives you one
+pane to browse the Marketplace, inspect plugins, and decide what to install or update.
 
 [![CI](https://github.com/natori-hrj/herdr-lazy/actions/workflows/ci.yml/badge.svg)](https://github.com/natori-hrj/herdr-lazy/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/natori-hrj/herdr-lazy)](https://github.com/natori-hrj/herdr-lazy/releases/latest)
 ![Platforms: macOS, Linux, Windows](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-informational)
 
 ![herdr-lazy in Ghostty: Herdr's main screen, the manage pane, marketplace search, and adding a plugin](docs/demo.gif)
+
+[Record the released Manage, Detail, and Marketplace workflow with an offline fixture](docs/demo.md).
+The guide also covers candidate-only recordings for the command palette, theme picker,
+and cached Marketplace refresh.
 
 ## Try it in 60 seconds
 
@@ -61,9 +65,9 @@ manage the *other* plugins.
 
 ## Install
 
-Requires herdr ≥ 0.9.0. This is the first supported release that resolves relative plugin
-commands from the plugin root on Windows, so the manifest can use the same runtime entries on
-every platform.
+Requires herdr ≥ 0.9.0. Herdr 0.9.0 resolves the plugin manifest’s relative
+commands on Windows, which lets the same manifest run on all supported platforms.
+Check your version with `herdr --version` before installing.
 
 ```sh
 herdr plugin install natori-hrj/herdr-lazy
@@ -76,8 +80,8 @@ from source with [Rust](https://rustup.rs) (≥ 1.78). No toolchain is needed on
 **Platform status.** Developed and verified end-to-end on macOS (arm64). Linux binaries are
 built and the test suite runs on Linux in CI, but the install has not been exercised on a
 real Linux machine. Windows now has a prebuilt x86_64 binary and keeps a source-build
-fallback; x86_64 is also the Herdr-documented path for Windows ARM64 under emulation. The
-Earlier install, `probe`, and manage-pane checks were done on Windows 11 with herdr
+fallback; x86_64 is also the Herdr-documented path for Windows ARM64 under emulation. Earlier
+install, `probe`, and manage-pane checks were done on Windows 11 with herdr
 0.7.5-preview in Windows Terminal (ConPTY). The current unified manifest requires herdr ≥
 0.9.0 and still needs a fresh Windows validation; the pane's keymap and a real `sync --prune`
 have not been exercised there. If you run Linux or Windows, reports are very welcome — see
