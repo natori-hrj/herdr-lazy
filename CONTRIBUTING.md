@@ -105,6 +105,18 @@ If herdr-lazy did something destructive — removed a plugin you wanted, or wrot
 did not ask for — say so plainly and it will be treated as a priority. `~/.config/herdr-lazy/`
 may still hold an older copy of your list.
 
+## Releasing
+
+Merge the pull requests for the next release into `main` and sync your local checkout.
+From a clean `main`, run `scripts/release.sh <version> --dry-run` to preview the commits
+since the previous release tag. To release that batch, run `scripts/release.sh <version>`.
+The script checks the build, bumps the version, and pushes the version commit and tag
+together.
+
+The tag starts the release workflow. After the audit and all five builds pass, the workflow
+uploads the archives and checksums to a draft, publishes it with GitHub-generated notes,
+and checks the download URLs. If an upload fails, rerun the failed job to finish the draft.
+
 ## Security
 
 Do not open a public issue for a vulnerability in the install path (checksum handling,

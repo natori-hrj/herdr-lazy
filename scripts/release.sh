@@ -4,14 +4,17 @@ set -eu
 
 usage() {
     echo "usage: scripts/release.sh <version> [--dry-run]" >&2
-    echo "   e.g. scripts/release.sh 0.12.0" >&2
     exit 2
 }
 
 VERSION="${1:-}"
 [ -n "$VERSION" ] || usage
 DRY_RUN=""
-[ "${2:-}" = "--dry-run" ] && DRY_RUN=1
+case "$#:${2:-}" in
+    1:) ;;
+    2:--dry-run) DRY_RUN=1 ;;
+    *) usage ;;
+esac
 
 cd "$(dirname "$0")/.."
 
@@ -25,11 +28,11 @@ run() {
     fi
 }
 
-
 case "$VERSION" in
-    [0-9]*.[0-9]*.[0-9]*) ;;
-    *) die "version must look like 1.2.3, got '$VERSION'" ;;
+    *[!0-9.]*) die "version must look like 1.2.3, got '$VERSION'" ;;
 esac
+printf '%s\n' "$VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' ||
+    die "version must look like 1.2.3, got '$VERSION'"
 
 CURRENT=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' herdr-plugin.toml | head -1)
 [ -n "$CURRENT" ] || die "cannot read the current version from herdr-plugin.toml"
@@ -56,10 +59,15 @@ if git show-ref --verify --quiet "refs/tags/$TAG" ||
     die "tag $TAG already exists"
 fi
 
-echo "release $CURRENT -> $VERSION"
-[ -n "$DRY_RUN" ] && echo "(dry run: nothing will be changed)"
-echo
+previous_tag="v$CURRENT"
+git merge-base --is-ancestor "refs/tags/$previous_tag" HEAD ||
+    die "release tag $previous_tag is missing or outside main history; check your local tags"
 
+echo "release $CURRENT -> $VERSION"
+[ -n "$DRY_RUN" ] && echo "(dry run)"
+step "changes since $previous_tag"
+git --no-pager log --first-parent --oneline "$previous_tag..HEAD"
+echo
 
 step "checking the build is green first"
 run cargo fmt --check
@@ -90,13 +98,12 @@ if [ -z "$DRY_RUN" ]; then
 fi
 
 step "committing"
-run git add -A
+run git add -- Cargo.toml Cargo.lock herdr-plugin.toml
 run git commit -m "chore: release $VERSION"
 
 step "tagging and pushing"
-run git tag -a "v$VERSION" -m "v$VERSION"
-run git push origin main
-run git push origin "v$VERSION"
+run git tag -a "$TAG" -m "$TAG"
+run git push --atomic origin main "refs/tags/$TAG"
 
 echo
 if [ -n "$DRY_RUN" ]; then
@@ -107,9 +114,8 @@ fi
 cat <<EOF
 pushed. The release workflow is building now.
 
-  gh run watch \$(gh run list --workflow=release.yml --limit 1 --json databaseId -q '.[0].databaseId')
+  gh run watch \$(gh run list --workflow=release.yml --branch=$TAG --limit 1 --json databaseId -q '.[0].databaseId')
   gh release view v$VERSION --json isDraft,assets -q '"draft: \(.isDraft) | assets: \(.assets|length)"'
 
-Expect draft: false and 10 assets. The workflow verifies each asset is actually downloadable
-at its published URL, so a green run means installs will find it.
+The release is published after all five archives and their checksums are ready.
 EOF
