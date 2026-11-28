@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.47.0 — Resource Safety & Reliability
+
+### Changed
+
+- Bound captured Herdr CLI output and give requests a deadline. After both streams close, check for the directly launched child's exit with adaptive backoff. On timeout or capture failure, cancel the request and attempt to reap that child.
+- Bound reads of local plugin lists, locks, workspace profiles, and relevant configuration. Report unreadable or oversized inputs instead of treating them as an empty list in Manage.
+- Validate generated locks and their history before writing. Coordinate readers and writers, reject unsupported file or permission states, and preserve verified permission policies during publication.
+
+See [#146](https://github.com/natori-hrj/herdr-lazy/pull/146) and the [v0.47.0 release notes](docs/release-v0.47.0.md) for limits, platform boundaries, and the measured first-frame cost. Requires Herdr 0.9.0 or later.
+
 ## v0.46.0
 
 ### Added

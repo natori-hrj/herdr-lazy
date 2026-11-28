@@ -7,7 +7,10 @@ for `worktree`, and refreshes the catalog in the background. It then combines
 category, installation, and sort controls, resets the search, shows the empty
 state, inspects a plugin with a Unicode description, and saves Nord.
 
-## Record the v0.46.0 candidate
+## Reproduce the v0.46.0 recording
+
+Use a v0.46.0 checkout for the commands below. The checked-in screenshots, GIF,
+and MP4 show v0.46.0; they were retained for the v0.47.0 reliability release.
 
 On Linux x86-64, install Bash, curl, tar, unzip, sha256sum, Python 3,
 Fontconfig, Chromium, and FFmpeg. Build with the x86-64 Linux musl Rust
