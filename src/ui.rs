@@ -5162,6 +5162,12 @@ mod tests {
             enabled,
             source_kind: "github".to_string(),
             slug: Some(format!("{}/{}", owner, repo)),
+            source_scope: crate::plugin_trust::SourceScope::from_fields(
+                "github",
+                Some(&crate::json::Value::Str(owner.to_owned())),
+                Some(&crate::json::Value::Str(repo.to_owned())),
+                None,
+            ),
             resolved_commit: Some(commit.to_string()),
             source_values: vec![owner.to_string(), repo.to_string()],
             ..Default::default()

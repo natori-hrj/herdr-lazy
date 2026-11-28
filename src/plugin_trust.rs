@@ -80,6 +80,10 @@ fn repository(value: &str) -> Option<String> {
         Some(path) => alias_slug(path)?,
         None => value,
     };
+    raw_repository(slug)
+}
+
+fn raw_repository(slug: &str) -> Option<String> {
     if slug.len() > 255
         || slug.starts_with('-')
         || !slug
@@ -130,10 +134,71 @@ fn full_digest(value: &str) -> Option<&str> {
 enum RegistryIdentity {
     Known(String, &'static str),
     Conflict {
-        structured: String,
+        structured: Option<String>,
         alias: Option<String>,
     },
     Unidentified,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) enum SourceScope {
+    #[default]
+    Absent,
+    // A recognizable root can rule out another claim but cannot establish provenance.
+    Invalid(Option<String>),
+    GitHub(String),
+}
+
+impl SourceScope {
+    pub(crate) fn from_fields(
+        kind: &str,
+        owner: Option<&crate::json::Value>,
+        repo: Option<&crate::json::Value>,
+        subdir: Option<&crate::json::Value>,
+    ) -> Self {
+        if owner.is_none() && repo.is_none() && subdir.is_none() {
+            return Self::Absent;
+        }
+        let (Some(owner), Some(repo)) = (
+            owner.and_then(crate::json::Value::as_str),
+            repo.and_then(crate::json::Value::as_str),
+        ) else {
+            return Self::Invalid(None);
+        };
+        let invalid = || {
+            let repo = repo.split('/').next().unwrap_or_default();
+            Self::Invalid(join_raw_scope(owner, repo).map(|slug| crate::repo_root(&slug)))
+        };
+        if kind != "github" || owner.contains('/') {
+            return invalid();
+        }
+        let Some(embedded) = join_raw_scope(owner, repo) else {
+            return invalid();
+        };
+        let Some(subdir) = subdir else {
+            return Self::GitHub(embedded);
+        };
+        let Some(subdir) = subdir.as_str() else {
+            return invalid();
+        };
+        let root = crate::repo_root(&embedded);
+        let Some(canonical) = join_raw_scope(&root, subdir) else {
+            return invalid();
+        };
+        // Herdr reports its canonical subdir separately. Older inputs can embed it in repo;
+        // those two representations must agree, including the case of every path component.
+        if embedded != root && embedded != canonical {
+            return invalid();
+        }
+        Self::GitHub(canonical)
+    }
+}
+
+fn join_raw_scope(prefix: &str, suffix: &str) -> Option<String> {
+    if prefix.len().saturating_add(suffix.len()) >= 255 {
+        return None;
+    }
+    raw_repository(&format!("{prefix}/{suffix}"))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -165,29 +230,26 @@ impl SourceUrl {
 }
 
 fn registry_identity(plugin: &Installed) -> RegistryIdentity {
-    if plugin.source_kind == "local" {
-        return RegistryIdentity::Unidentified;
-    }
-    let structured = if plugin.source_kind == "github" {
-        plugin.slug.as_deref().and_then(repository)
-    } else {
-        None
-    };
     let alias = plugin.source_url.alias();
-    match (structured, alias) {
-        (Some(structured), alias)
-            if plugin.source_owner_has_path
-                || (!matches!(plugin.source_url, SourceUrl::Absent)
-                    && alias != Some(crate::repo_root(&structured).as_str())) =>
+    match &plugin.source_scope {
+        SourceScope::Invalid(root) => RegistryIdentity::Conflict {
+            structured: root.clone(),
+            alias: alias.map(str::to_owned),
+        },
+        SourceScope::GitHub(structured)
+            if !matches!(plugin.source_url, SourceUrl::Absent)
+                && alias != Some(crate::repo_root(structured).as_str()) =>
         {
             RegistryIdentity::Conflict {
-                structured,
+                structured: Some(structured.clone()),
                 alias: alias.map(str::to_owned),
             }
         }
-        (Some(slug), _) => RegistryIdentity::Known(slug, REGISTRY),
-        (None, Some(slug)) => RegistryIdentity::Known(slug.to_owned(), "installed registry URL"),
-        (None, None) => RegistryIdentity::Unidentified,
+        SourceScope::GitHub(slug) => RegistryIdentity::Known(slug.clone(), REGISTRY),
+        SourceScope::Absent if plugin.source_kind != "local" => alias
+            .map(|slug| RegistryIdentity::Known(slug.to_owned(), "installed registry URL"))
+            .unwrap_or(RegistryIdentity::Unidentified),
+        SourceScope::Absent => RegistryIdentity::Unidentified,
     }
 }
 
@@ -251,6 +313,12 @@ impl Report {
             Some((slug, requested)) => (Some((slug, BUNDLE)), requested),
             None => (None, None),
         };
+        if installed.iter().any(|p| p.registry_duplicate_observed) {
+            return (
+                Self::from_evidence(repository, requested, None, market),
+                None,
+            );
+        }
         let wanted = repository.as_ref().map(|(slug, _)| slug.as_str());
         let root = wanted.map(crate::repo_root);
         let mut evidence = None;
@@ -267,11 +335,11 @@ impl Report {
                     }
                 }
                 RegistryIdentity::Conflict { structured, alias } => {
-                    ambiguous_or_conflicting |= wanted == Some(structured.as_str())
-                        || root.as_deref() == Some(structured.as_str())
-                        || root
-                            .as_ref()
-                            .is_some_and(|root| alias.as_ref() == Some(root));
+                    ambiguous_or_conflicting |= structured.as_deref().is_some_and(|scope| {
+                        wanted == Some(scope) || root.as_deref() == Some(scope)
+                    }) || root
+                        .as_ref()
+                        .is_some_and(|root| alias.as_ref() == Some(root));
                 }
                 RegistryIdentity::Unidentified => {}
             }
@@ -296,6 +364,9 @@ impl Report {
         installed: &[Installed],
         market: &[registry::Entry],
     ) -> (Self, Option<&'a Installed>) {
+        if plugin.registry_duplicate_observed {
+            return (Self::default(), None);
+        }
         let identity = registry_identity(plugin);
         let authorized = (!matches!(identity, RegistryIdentity::Conflict { .. })
             && unique_id(plugin, installed))
@@ -451,6 +522,7 @@ mod tests {
             plugin_id: "fixture.plugin".into(),
             source_kind: "github".to_string(),
             slug: Some(slug.to_string()),
+            source_scope: SourceScope::GitHub(raw_repository(slug).unwrap()),
             resolved_commit: Some(revision.to_string()),
             installed_unix_ms: Some(123),
             ..Installed::default()

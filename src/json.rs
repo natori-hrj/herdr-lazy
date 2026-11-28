@@ -70,20 +70,30 @@ impl Value {
 }
 
 pub fn parse(input: &str) -> Result<Value, String> {
+    parse_with_duplicates(input).map(|(value, _)| value)
+}
+
+/// Return the last-wins value and whether any object repeated a decoded key.
+pub(crate) fn parse_with_duplicates(input: &str) -> Result<(Value, bool), String> {
     let bytes: Vec<char> = input.chars().collect();
-    let mut p = Parser { b: &bytes, i: 0 };
+    let mut p = Parser {
+        b: &bytes,
+        i: 0,
+        duplicate_observed: false,
+    };
     p.ws();
     let v = p.value(0)?;
     p.ws();
     if p.i != p.b.len() {
         return Err(format!("trailing input at char {}", p.i));
     }
-    Ok(v)
+    Ok((v, p.duplicate_observed))
 }
 
 struct Parser<'a> {
     b: &'a [char],
     i: usize,
+    duplicate_observed: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -159,7 +169,9 @@ impl<'a> Parser<'a> {
             self.expect(':')?;
             self.ws();
             let v = self.value(depth)?;
-            map.insert(k, v);
+            if map.insert(k, v).is_some() {
+                self.duplicate_observed = true;
+            }
             self.ws();
             match self.bump() {
                 Some(',') => continue,
@@ -287,6 +299,30 @@ mod tests {
         assert_eq!(p.str_field("id"), None, "plugin has no bare `id` field");
         let action = &p.get("actions").unwrap().as_array().unwrap()[0];
         assert_eq!(action.str_field("id"), Some("init"));
+    }
+
+    #[test]
+    fn duplicate_decoded_keys_are_reported_without_changing_last_wins() {
+        for (input, expected) in [
+            (
+                r#"{"source":{"url":null,"u\u0072l":"valid"}}"#,
+                Some("valid"),
+            ),
+            (r#"{"source":{"u\u0072l":"valid","url":null}}"#, None),
+        ] {
+            let (value, duplicate_observed) = parse_with_duplicates(input).unwrap();
+            assert!(duplicate_observed);
+            assert_eq!(value.path(&["source", "url"]).unwrap().as_str(), expected);
+            assert_eq!(parse(input).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn repeated_field_names_in_distinct_objects_are_not_duplicates() {
+        let input =
+            r#"{"id":"list","plugins":[{"id":"plugin","actions":[{"id":"one"},{"id":"two"}]}]}"#;
+        let (_, duplicate_observed) = parse_with_duplicates(input).unwrap();
+        assert!(!duplicate_observed);
     }
 
     #[test]
