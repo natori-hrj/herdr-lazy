@@ -112,12 +112,7 @@ fn capture_response(
                             Stream::Stderr => "stderr",
                         };
                         stop_child(child);
-                        drain_stderr(
-                            pipes,
-                            &mut stderr,
-                            max_stream_bytes,
-                            Instant::now() + Duration::from_millis(100),
-                        );
+                        drain_stderr(pipes, &mut stderr, max_stream_bytes, deadline);
                         break 'capture Err(response_error(
                             format!("Herdr {name} exceeded {max_stream_bytes} bytes"),
                             &stderr,
@@ -158,12 +153,17 @@ fn stop_child(child: &mut Child) {
     let _ = child.wait();
 }
 
+fn stderr_drain_deadline(now: Instant, response_deadline: Instant) -> Instant {
+    response_deadline.min(now + Duration::from_millis(100))
+}
+
 fn drain_stderr(
     pipes: &mut crate::download::ResponsePipes,
     stderr: &mut Vec<u8>,
     max_bytes: usize,
-    deadline: Instant,
+    response_deadline: Instant,
 ) {
+    let deadline = stderr_drain_deadline(Instant::now(), response_deadline);
     let mut buffer = [0; 8192];
     loop {
         match pipes.read_stderr(&mut buffer, deadline) {
@@ -296,6 +296,24 @@ mod tests {
                 assert_eq!(next_child_delay(&mut backoff, remaining), remaining);
             }
         }
+    }
+
+    #[test]
+    fn overflow_stderr_drain_respects_response_deadline_and_local_cap() {
+        let expired_deadline = Instant::now();
+        let now = expired_deadline + Duration::from_millis(1);
+        let near_deadline = now + Duration::from_millis(25);
+        let far_deadline = now + Duration::from_secs(1);
+
+        assert_eq!(
+            stderr_drain_deadline(now, expired_deadline),
+            expired_deadline
+        );
+        assert_eq!(stderr_drain_deadline(now, near_deadline), near_deadline);
+        assert_eq!(
+            stderr_drain_deadline(now, far_deadline),
+            now + Duration::from_millis(100)
+        );
     }
 
     #[test]
