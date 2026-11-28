@@ -74,10 +74,10 @@ fn body(app: &App, width: u16) -> Body {
 
     let text_width = usize::from(width).saturating_sub(2).max(1);
     let detail = row.plugin_detail();
-    let ref_problem = row.trust.bundle_ref_problem();
+    let bundle_problem = row.trust.bundle_problem();
     if row.installed.is_some() && detail.is_none() {
         body.push_color("Installation · Unknown", app.theme.color(Role::Warning));
-        if let Some(problem) = ref_problem {
+        if let Some(problem) = bundle_problem {
             body.push_wrapped(problem, text_width);
             body.push_wrapped(
                 "Manifest, actions, compatibility, logs, and Changes are unavailable here.",
@@ -99,7 +99,7 @@ fn body(app: &App, width: u16) -> Body {
         (true, None) => ("Installed", Role::Success),
     };
     body.push_color(status, app.theme.color(role));
-    if let Some(problem) = ref_problem {
+    if let Some(problem) = bundle_problem {
         body.push_wrapped_color(problem, text_width, app.theme.color(Role::Warning));
     }
     if let Some(warning) = row.herdr_warning {
@@ -375,11 +375,29 @@ pub(super) fn draw(app: &App, out: &mut impl Write, width: u16, height: u16) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::super::{rows, rows_with_herdr_version, ChangesTarget, Row};
+    use super::super::{
+        bundle_read_error, rows, rows_from_bundle, rows_with_herdr_version, ChangesTarget, Row,
+    };
     use super::*;
     use crate::{Installed, Spec};
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    struct ScratchDir(std::path::PathBuf);
+
+    impl ScratchDir {
+        fn new() -> Self {
+            let path = crate::lock_temp_path(&std::env::temp_dir().join("herdr-lazy-details"));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn fixture() -> App {
         let plugin = Installed {
@@ -936,6 +954,108 @@ mod tests {
         assert!(frame.contains("Other action"));
         assert!(frame.contains("Binding preview"));
         assert!(frame.contains("L Logs"));
+    }
+
+    #[test]
+    fn rejected_bundle_bytes_never_authorize_direct_details() {
+        let dir = ScratchDir::new();
+        let path = dir.0.join("plugins.list");
+        let records = [
+            registry_fixture("plugin", "fixture.plugin", ""),
+            Installed {
+                plugin_id: "local-plugin".into(),
+                source_kind: "local".into(),
+                actions: vec![("local.action".into(), "Local action".into())],
+                ..Default::default()
+            },
+        ];
+        let prefix = b"other/plugin@v1\n";
+        let mut invalid = prefix.to_vec();
+        invalid.push(0xff);
+        let mut oversized = prefix.to_vec();
+        oversized.resize(crate::MAX_LOCAL_INPUT_BYTES as usize + 1, b'a');
+        for rejected in [invalid, oversized] {
+            std::fs::write(&path, rejected).unwrap();
+            let error = crate::read_local_text(&path, "plugin list").unwrap_err();
+            let desired = Err(error);
+            let mut app = App {
+                rows: rows_from_bundle(&desired, &records, &[], None),
+                bundle_error: bundle_read_error(&desired),
+                ..App::default()
+            };
+            assert_eq!(app.rows.len(), 2);
+            assert_eq!(app.rows[0].label, "example/plugin");
+            let list = render(&app, 120, 24);
+            assert!(list.contains("Cannot read plugin list"));
+            assert!(!list.contains("other/plugin"));
+            assert!(!list.contains("Unlisted"));
+            app.detail_of = Some(0);
+            let frame = render(&app, 120, 24);
+            assert!(frame.contains("bundle snapshot rejected"));
+            assert!(frame.contains(&format!("Resolved revision · {SHA} (installed registry)")));
+            for index in 0..app.rows.len() {
+                assert!(app.rows[index].plugin_detail().is_none());
+                assert!(app.rows[index].changes_target().is_none());
+                app.detail_of = Some(index);
+                assert!(!confirm_selection_visible(&mut app, 120, 24));
+                app.flash = None;
+                app.run_detail_action();
+                assert!(app.flash.is_none());
+                app.bind_selected('t');
+                assert!(app.pending_bind.is_none());
+                app.open_logs_for(index);
+                assert!(app.log_view.is_none());
+                assert_eq!(
+                    app.flash.as_deref(),
+                    Some("Logs unavailable · bundle snapshot rejected")
+                );
+            }
+        }
+        let empty = rows_from_bundle(&Ok(Vec::new()), &records, &[], None);
+        assert!(empty.iter().all(|row| row.plugin_detail().is_some()));
+    }
+
+    #[test]
+    fn details_reject_invalid_or_aliased_lock_snapshots_without_revoking_payload() {
+        let dir = ScratchDir::new();
+        let lock = dir.0.join("plugins.lock");
+        let actual = format!("example/plugin@{SHA}\n");
+        let mut app = fixture();
+        std::fs::write(&lock, actual.as_bytes()).unwrap();
+        app.open_detail_with_lock(&lock);
+        assert!(render(&app, 120, 45).contains("Registry revision matches lock"));
+
+        let mut invalid = actual.as_bytes().to_vec();
+        invalid.push(0xff);
+        let mut oversized = actual.as_bytes().to_vec();
+        oversized.resize(crate::MAX_LOCAL_INPUT_BYTES as usize + 1, b'a');
+        let assert_unknown = |app: &App| {
+            let frame = render(app, 120, 45);
+            assert!(frame.contains("Lockfile ref · Unknown"), "{frame:?}");
+            assert!(frame.contains("Locked revision · Unknown"), "{frame:?}");
+            assert!(frame.contains("Lock consistency · Unknown"), "{frame:?}");
+            assert!(frame.contains("Binding preview"), "{frame:?}");
+            assert!(frame.contains("L Logs"), "{frame:?}");
+        };
+        for bytes in [invalid, oversized] {
+            std::fs::write(&lock, bytes).unwrap();
+            app.open_detail_with_lock(&lock);
+            assert_unknown(&app);
+        }
+
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&lock).unwrap();
+            let target = dir.0.join("alias-target");
+            std::fs::write(&target, actual).unwrap();
+            std::os::unix::fs::symlink(&target, &lock).unwrap();
+            app.open_detail_with_lock(&lock);
+            assert_unknown(&app);
+            std::fs::remove_file(&lock).unwrap();
+            std::fs::hard_link(&target, &lock).unwrap();
+            app.open_detail_with_lock(&lock);
+            assert_unknown(&app);
+        }
     }
 
     #[test]

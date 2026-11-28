@@ -42,7 +42,7 @@ use crate::{
 /// What the list says about one plugin.
 #[derive(Debug, Clone, PartialEq)]
 enum Status {
-    /// In the bundle and installed at the expected commit.
+    /// Installed at the expected commit, or installed when bundle membership is unknown.
     Ok,
     /// In the bundle, not installed.
     Missing,
@@ -376,6 +376,7 @@ struct MachineView {
     detail_of: Option<usize>,
     plugin_cursor: usize,
     notice: Option<String>,
+    bundle_error: Option<String>,
 }
 
 const MACHINE_LIST_TOP: usize = 3;
@@ -384,7 +385,7 @@ const MACHINE_DETAIL_TOP: usize = 7;
 impl MachineView {
     fn new(
         collection: crate::machine::MachineCollection,
-        desired: &[Spec],
+        desired: &io::Result<Vec<String>>,
         market: &[crate::registry::Entry],
     ) -> Self {
         let entries = collection
@@ -392,12 +393,7 @@ impl MachineView {
             .into_iter()
             .map(|health| {
                 let rows = if health.plugin_list_available {
-                    rows_with_herdr_version(
-                        desired,
-                        &health.installed,
-                        market,
-                        health.herdr_version,
-                    )
+                    rows_from_bundle(desired, &health.installed, market, health.herdr_version)
                 } else {
                     Vec::new()
                 };
@@ -410,6 +406,7 @@ impl MachineView {
             detail_of: None,
             plugin_cursor: 0,
             notice: collection.notice,
+            bundle_error: bundle_read_error(desired),
         }
     }
 
@@ -483,9 +480,12 @@ fn machine_connection_label(
     }
 }
 
-fn machine_summary(entry: &MachineEntry) -> String {
+fn machine_summary(entry: &MachineEntry, bundle_available: bool) -> String {
     if !entry.health.plugin_list_available {
         return "plugin health unavailable".to_string();
+    }
+    if !bundle_available {
+        return format!("{} installed · bundle unknown", entry.rows.len());
     }
     if entry.rows.is_empty() {
         return "no plugins".to_string();
@@ -659,8 +659,30 @@ fn rows_with_updates(
 ///
 /// The version is supplied by the caller instead of being read here so building rows stays a
 /// pure operation and the UI shells out to `herdr --version` only once per refresh.
+#[cfg(test)]
 fn rows_with_herdr_version(
     desired: &[Spec],
+    installed: &[Installed],
+    market: &[crate::registry::Entry],
+    running_herdr: Option<HerdrVersion>,
+) -> Vec<Row> {
+    rows_from_bundle(
+        &Ok(desired.iter().map(Spec::display).collect()),
+        installed,
+        market,
+        running_herdr,
+    )
+}
+
+fn bundle_read_error(desired: &io::Result<Vec<String>>) -> Option<String> {
+    desired
+        .as_ref()
+        .err()
+        .map(|error| format!("Cannot read plugin list · {error}"))
+}
+
+fn rows_from_bundle(
+    desired: &io::Result<Vec<String>>,
     installed: &[Installed],
     market: &[crate::registry::Entry],
     running_herdr: Option<HerdrVersion>,
@@ -672,11 +694,20 @@ fn rows_with_herdr_version(
         (required > running).then_some(HerdrVersionWarning { required, running })
     };
     let mut rows = Vec::new();
-    let displays: Vec<_> = desired.iter().map(Spec::display).collect();
-    let bundle = crate::plugin_trust::BundleEvidence::new(displays.iter().map(String::as_str));
+    use crate::plugin_trust::BundleEvidence;
+    let (bundle, specs) = match desired {
+        Ok(lines) => (
+            BundleEvidence::new(lines.iter().map(String::as_str)),
+            lines
+                .iter()
+                .map(|line| Spec::parse(line))
+                .collect::<Vec<_>>(),
+        ),
+        Err(_) => (BundleEvidence::rejected(), Vec::new()),
+    };
     let snapshot = crate::plugin_trust::InstalledSnapshot::new(installed);
 
-    for (index, (spec, display)) in desired.iter().zip(displays).enumerate() {
+    for (index, spec) in specs.iter().enumerate() {
         let hit = installed
             .iter()
             .map(|p| (p, p.matches(spec)))
@@ -697,6 +728,7 @@ fn rows_with_herdr_version(
             }
         };
         let (trust, authorized) = bundle.for_row(index, &snapshot, hit.map(|(p, _)| p), market);
+        let display = spec.display();
         rows.push(Row {
             label: display.clone(),
             commit,
@@ -718,7 +750,7 @@ fn rows_with_herdr_version(
     }
 
     for (index, p) in installed.iter().enumerate() {
-        let claimed = desired.iter().any(|s| p.matches(s) != Match::None);
+        let claimed = specs.iter().any(|s| p.matches(s) != Match::None);
         if claimed {
             continue;
         }
@@ -726,7 +758,13 @@ fn rows_with_herdr_version(
         rows.push(Row {
             label: p.slug.clone().unwrap_or_else(|| p.plugin_id.clone()),
             commit: p.resolved_commit.clone(),
-            status: if crate::is_self_id(&p.plugin_id) {
+            status: if desired.is_err() {
+                if p.enabled {
+                    Status::Ok
+                } else {
+                    Status::Disabled
+                }
+            } else if crate::is_self_id(&p.plugin_id) {
                 Status::SelfEntry
             } else if p.source_kind == "local" {
                 Status::ExtraLocal
@@ -1245,6 +1283,8 @@ struct App {
     cursor: usize,
     /// Set when a refresh fails, so the pane explains itself instead of showing an empty list.
     error: Option<String>,
+    /// A rejected bundle is not empty; only independent installed facts can be shown.
+    bundle_error: Option<String>,
     /// Result of the last instant action (`a`/`d`), shown until the next keypress. Editing the
     /// list is fast and touches only a file, so it stays in the pane rather than dropping out
     /// of the alternate screen the way `sync` does.
@@ -1272,10 +1312,8 @@ impl App {
                 Ok(profile) => (profile, None),
                 Err(error) => (None, Some(error)),
             };
-        let desired: Vec<Spec> = crate::desired_plugins()
-            .iter()
-            .map(|l| Spec::parse(l))
-            .collect();
+        let desired = crate::desired_plugins_result();
+        let bundle_error = bundle_read_error(&desired);
         // The compatibility check is local, but the version comes from herdr itself. Read it
         // once for the whole refresh rather than once per installed plugin.
         let herdr_version = current_herdr_version();
@@ -1287,7 +1325,7 @@ impl App {
                 theme,
                 palette: None,
                 theme_picker: None,
-                rows: rows_with_herdr_version(&desired, &installed, &market, herdr_version),
+                rows: rows_from_bundle(&desired, &installed, &market, herdr_version),
                 workspace_context: workspace_context.clone(),
                 workspace_profile: workspace_profile.clone(),
                 profile_error: profile_error.clone(),
@@ -1296,7 +1334,6 @@ impl App {
                 context_warning: context_warning.clone(),
                 last_event: last_event.clone(),
                 browser: None,
-                marketplace_installed: Some(installed),
                 marketplace_refresh: None,
                 extras: None,
                 recommendations: None,
@@ -1312,7 +1349,13 @@ impl App {
                 awaiting_bind: false,
                 pending_bind: None,
                 cursor: 0,
-                error: None,
+                error: desired
+                    .as_ref()
+                    .err()
+                    .filter(|_| installed.is_empty())
+                    .map(ToString::to_string),
+                marketplace_installed: Some(installed),
+                bundle_error,
                 flash: None,
             },
             Err(e) => App {
@@ -1344,7 +1387,11 @@ impl App {
                 awaiting_bind: false,
                 pending_bind: None,
                 cursor: 0,
-                error: Some(e),
+                error: Some(match desired.as_ref().err() {
+                    Some(bundle) => format!("{bundle}; installed registry: {e}"),
+                    None => e,
+                }),
+                bundle_error,
                 flash: None,
             },
         }
@@ -1370,8 +1417,10 @@ impl App {
         self.recommendations = recommendations;
         self.adopt = adopt;
         self.help = help;
-        self.detail_changes = changes;
-        self.log_view = logs;
+        if self.bundle_error.is_none() {
+            self.detail_changes = changes;
+            self.log_view = logs;
+        }
         self.cursor = cursor.min(self.rows.len().saturating_sub(1));
         self.flash = flash;
     }
@@ -1387,10 +1436,7 @@ impl App {
                 return;
             }
         };
-        let desired: Vec<Spec> = crate::desired_plugins()
-            .iter()
-            .map(|line| Spec::parse(line))
-            .collect();
+        let desired = crate::desired_plugins_result();
         let market = crate::registry::cached_entries();
         let collection =
             crate::machine::collect_machine_health(&installed, current_herdr_version());
@@ -1402,7 +1448,11 @@ impl App {
     fn reload_machine_view(&mut self) {
         self.machine_view = None;
         self.open_machine_view();
-        if self.machine_view.is_some() {
+        if self
+            .machine_view
+            .as_ref()
+            .is_some_and(|view| view.bundle_error.is_none())
+        {
             self.flash = Some("re-read local and saved-machine status".to_string());
         }
     }
@@ -1415,6 +1465,10 @@ impl App {
         let Some(entry) = view.entries.get(index) else {
             return;
         };
+        if entry.health.profile.is_none() && view.bundle_error.is_some() {
+            self.flash = Some("Local operation unavailable · bundle snapshot rejected".into());
+            return;
+        }
         match entry.health.connection {
             crate::machine::MachineConnection::Local
             | crate::machine::MachineConnection::Connected => {}
@@ -1737,7 +1791,9 @@ impl App {
     fn open_logs_for(&mut self, idx: usize) {
         let row = self.rows.get(idx);
         let Some(detail) = row.and_then(Row::plugin_detail) else {
-            let message = if row.is_some_and(|row| row.trust.bundle_ref_problem().is_some()) {
+            let message = if self.bundle_error.is_some() {
+                "Logs unavailable · bundle snapshot rejected"
+            } else if row.is_some_and(|row| row.trust.bundle_problem().is_some()) {
                 "Logs unavailable · bundle ref evidence was rejected"
             } else if row.is_some_and(|row| row.installed.is_some()) {
                 "Logs unavailable · plugin identity is uncertain"
@@ -1800,11 +1856,16 @@ impl App {
     }
 
     fn open_detail(&mut self) {
+        self.open_detail_with_lock(&crate::lock_path());
+    }
+
+    fn open_detail_with_lock(&mut self, path: &std::path::Path) {
         let Some(row) = self.rows.get_mut(self.cursor) else {
             return;
         };
-        let lock = crate::plugin_trust::read_lock(&crate::lock_path());
-        row.trust.set_lock(lock.as_deref());
+        // Lock facts are observational and never change the row's authorized payload.
+        let lock = crate::lockfile::read_text(path, false);
+        row.trust.set_lock(lock.as_deref().ok());
         self.detail_of = Some(self.cursor);
         self.detail_cursor = 0;
         self.detail_scroll = 0;
@@ -1962,8 +2023,20 @@ impl App {
         }
     }
 
+    fn refuse_rejected_bundle(&mut self) -> bool {
+        if self.bundle_error.is_some() {
+            self.flash = Some("Operation unavailable · bundle snapshot rejected".into());
+            true
+        } else {
+            false
+        }
+    }
+
     /// Install every target that needs it, in one pass out of the alternate screen.
     fn install_targets(&mut self) -> io::Result<()> {
+        if self.refuse_rejected_bundle() {
+            return Ok(());
+        }
         let repos: Vec<String> = self
             .targets()
             .iter()
@@ -1985,6 +2058,9 @@ impl App {
     }
 
     fn update_targets(&mut self) -> io::Result<()> {
+        if self.refuse_rejected_bundle() {
+            return Ok(());
+        }
         let repos: Vec<String> = self
             .targets()
             .iter()
@@ -2008,6 +2084,9 @@ impl App {
     /// Uninstall every target. The only bulk operation that destroys anything, so it reports
     /// what it refused as well as what it did.
     fn uninstall_targets(&mut self) {
+        if self.refuse_rejected_bundle() {
+            return;
+        }
         let picked: Vec<(String, String, String)> = self
             .targets()
             .iter()
@@ -2044,6 +2123,9 @@ impl App {
     /// Enable or disable every selected installed plugin. The command changes herdr's local
     /// plugin state only; it never rewrites the bundle or lockfile.
     fn set_enabled_targets(&mut self, enabled: bool) {
+        if self.refuse_rejected_bundle() {
+            return;
+        }
         let mut ids = Vec::new();
         for i in self.targets() {
             let Some(row) = self.rows.get(i) else {
@@ -2083,6 +2165,9 @@ impl App {
 
     /// Adopt every target that is installed but unlisted.
     fn adopt_targets(&mut self) {
+        if self.refuse_rejected_bundle() {
+            return;
+        }
         let names: Vec<String> = self
             .targets()
             .iter()
@@ -2107,6 +2192,9 @@ impl App {
 
     /// `r` — put the targets back to the commits in the lockfile.
     fn restore_targets(&mut self) -> io::Result<()> {
+        if self.refuse_rejected_bundle() {
+            return Ok(());
+        }
         let repos: Vec<String> = self
             .targets()
             .iter()
@@ -2663,6 +2751,9 @@ impl App {
 
     /// `d` — stop managing an entry. Never uninstalls; that is `x`.
     fn drop_selected(&mut self) {
+        if self.refuse_rejected_bundle() {
+            return;
+        }
         let Some(row) = self.selected() else { return };
         let Some(line) = row.listed_as.clone() else {
             self.flash = Some(format!("{} is not in your list", row.label));
@@ -2688,7 +2779,10 @@ impl App {
             ManageCommand::Starter => self.flash = Some(crate::open_starter_pane()),
             ManageCommand::Refresh => {
                 self.refresh();
-                self.flash = Some("re-read your list and what is installed".to_string());
+                self.flash = self
+                    .bundle_error
+                    .is_none()
+                    .then(|| "re-read your list and what is installed".to_string());
             }
             ManageCommand::Help => self.help = Some(0),
         }
@@ -3329,9 +3423,13 @@ impl App {
         writeln!(
             out,
             " {}\r",
-            view.notice
+            view.bundle_error
                 .as_deref()
-                .map(|notice| format!("{warning}{}\x1b[0m", notice))
+                .or(view.notice.as_deref())
+                .map(|notice| {
+                    let (text, _) = clip(notice, width.saturating_sub(2) as usize);
+                    format!("{warning}{text}\x1b[0m")
+                })
                 .unwrap_or_else(|| {
                     "\x1b[2mread-only status; Enter inspects the selected target\x1b[0m".to_string()
                 })
@@ -3362,7 +3460,7 @@ impl App {
                 Some(false) => "incompatible",
                 None => "compat ?",
             };
-            let summary = machine_summary(entry);
+            let summary = machine_summary(entry, view.bundle_error.is_none());
             let label = machine_target(entry);
             writeln!(
                 out,
@@ -3444,11 +3542,15 @@ impl App {
             " last sync: {}\r",
             sync_result_text(entry.health.last_sync.as_ref())
         )?;
-        if let Some(error) = entry.health.error.as_deref() {
+        if let Some(error) = view
+            .bundle_error
+            .as_deref()
+            .or(entry.health.error.as_deref())
+        {
             writeln!(
                 out,
                 " {warning}note:\x1b[0m {}\r",
-                truncate(error, width.saturating_sub(10) as usize)
+                clip(error, width.saturating_sub(10) as usize).0
             )?;
         } else {
             writeln!(out, "\r")?;
@@ -3457,7 +3559,7 @@ impl App {
         writeln!(
             out,
             " \x1b[1mplugin health\x1b[0m  \x1b[2m{}\x1b[0m\r",
-            machine_summary(entry)
+            machine_summary(entry, view.bundle_error.is_none())
         )?;
 
         if !entry.health.plugin_list_available {
@@ -3501,6 +3603,9 @@ impl App {
 
         let footer = match &self.flash {
             Some(message) => format!("{accent}{}\x1b[0m", message),
+            None if entry.health.profile.is_none() && view.bundle_error.is_some() => {
+                "\x1b[1m[r]\x1b[0m refresh  \x1b[1m[esc/q]\x1b[0m back".to_string()
+            }
             None => "\x1b[1m[i]\x1b[0m sync this target  \x1b[1m[u]\x1b[0m update this target  \
                      \x1b[1m[r]\x1b[0m refresh  \x1b[1m[esc/q]\x1b[0m back"
                 .to_string(),
@@ -3587,7 +3692,21 @@ impl App {
     }
 
     fn draw_list(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
-        managed_list::draw(self, out, width, height)
+        managed_list::draw(self, out, width, height)?;
+        if let Some(error) = self
+            .bundle_error
+            .as_deref()
+            .filter(|_| width > 1 && height > 0 && !self.rows.is_empty())
+        {
+            // Keep independent rows and the transient footer; replace the divider with
+            // the persistent diagnostic. Empty views already show an error in the body.
+            let line = footer_start_row(height).max(2).min(height);
+            let (message, _) = clip(error, width.saturating_sub(1) as usize);
+            let danger = self.theme.color(Role::Danger);
+            write!(out, "\x1b[{line};1H\x1b[2K{danger}{message}\x1b[0m")?;
+            out.flush()?;
+        }
+        Ok(())
     }
 }
 
@@ -5324,7 +5443,7 @@ mod tests {
         ] {
             let r = rows(&specs.map(Spec::parse), &roots);
             assert!(r[0].plugin_detail().is_some(), "{specs:?}");
-            assert!(r.iter().all(|row| row.trust.bundle_ref_problem().is_none()));
+            assert!(r.iter().all(|row| row.trust.bundle_problem().is_none()));
         }
 
         let mut child = github("owner", "plugin/Tools", SHA, true);
@@ -5333,7 +5452,45 @@ mod tests {
         let r = rows(&desired, &[child]);
         assert!(r[0].plugin_detail().is_some());
         assert!(r[1].plugin_detail().is_none());
-        assert!(r.iter().all(|row| row.trust.bundle_ref_problem().is_none()));
+        assert!(r.iter().all(|row| row.trust.bundle_problem().is_none()));
+    }
+
+    #[test]
+    fn observed_transport_whitespace_cannot_fabricate_a_competing_request() {
+        let installed = [github("owner", "plugin", SHA, true)];
+        let wanted = "owner/plugin@v1";
+        let normalized = "git@github.com:owner/plugin.git@v2";
+        let malformed = "git @github.com:owner/plugin.git@v2";
+        for lines in [[malformed, wanted], [wanted, malformed]] {
+            let desired = Ok(lines.map(str::to_string).to_vec());
+            let rows = rows_from_bundle(&desired, &installed, &[], None);
+            assert_eq!(rows.len(), 2);
+            for (line, row) in lines.into_iter().zip(&rows) {
+                if line == wanted {
+                    assert!(row.plugin_detail().is_some());
+                    assert_eq!(row.trust.bundle_problem(), None);
+                    assert!(row
+                        .trust
+                        .lines()
+                        .contains(&"Requested ref · v1 (bundle list)".into()));
+                } else {
+                    assert_eq!(row.label, normalized);
+                    assert_eq!(row.status, Status::Missing);
+                    assert!(row.plugin_detail().is_none());
+                    assert!(row
+                        .trust
+                        .lines()
+                        .contains(&"Requested ref · Unknown".into()));
+                }
+            }
+        }
+        let genuine = Ok(vec![wanted.into(), normalized.into()]);
+        let rows = rows_from_bundle(&genuine, &installed, &[], None);
+        assert!(rows.iter().all(|row| row.plugin_detail().is_none()));
+        assert!(rows[0]
+            .trust
+            .lines()
+            .contains(&"Requested ref · Ambiguous request (bundle list)".into()));
     }
 
     #[test]
@@ -5348,7 +5505,7 @@ mod tests {
                 assert_eq!(r.len(), 2);
                 for (row, spec) in r.iter().zip(specs) {
                     assert_eq!(row.plugin_detail().is_none(), spec == malformed);
-                    assert_eq!(row.trust.bundle_ref_problem().is_some(), spec == malformed);
+                    assert_eq!(row.trust.bundle_problem().is_some(), spec == malformed);
                 }
             }
         }
@@ -5385,7 +5542,7 @@ mod tests {
             for row in &r[specs.len()..] {
                 let reject = row.label == blocked;
                 assert_eq!(row.plugin_detail().is_none(), reject, "{}", row.label);
-                assert_eq!(row.trust.bundle_ref_problem().is_some(), reject);
+                assert_eq!(row.trust.bundle_problem().is_some(), reject);
                 assert_eq!(
                     row.status,
                     if row.label == "local-plugin" {
@@ -6650,7 +6807,7 @@ mod tests {
         connection: crate::machine::MachineConnection,
         plugin_list_available: bool,
     ) -> MachineView {
-        let desired = [Spec::parse("owner/repo")];
+        let desired = Ok(vec!["owner/repo".into()]);
         let installed = vec![github("owner", "repo", SHA, true)];
         MachineView::new(
             crate::machine::MachineCollection {
@@ -6677,6 +6834,43 @@ mod tests {
             &desired,
             &[],
         )
+    }
+
+    #[test]
+    fn machine_health_with_rejected_bundle_uses_only_installed_facts() {
+        let desired = Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid fixture",
+        ));
+        let mut view = MachineView::new(
+            crate::machine::MachineCollection {
+                machines: vec![machine_health(
+                    None,
+                    crate::machine::MachineConnection::Local,
+                    true,
+                    vec![github("owner", "repo", SHA, true)],
+                )],
+                notice: None,
+            },
+            &desired,
+            &[],
+        );
+        let row = &view.entries[0].rows[0];
+        assert!(row.plugin_detail().is_none());
+        assert_eq!(row.label, "owner/repo");
+        view.open_selected();
+        let mut app = App {
+            machine_view: Some(view),
+            ..App::default()
+        };
+        let mut output = Vec::new();
+        app.draw_machines(&mut output, 120, 24).unwrap();
+        let frame = String::from_utf8(output).unwrap();
+        assert!(frame.contains("Cannot read plugin list"));
+        assert!(frame.contains("1 installed · bundle unknown"));
+        assert!(frame.contains("owner/repo"));
+        app.request_machine_action(MachineAction::Sync);
+        assert!(app.pending_machine.is_none());
     }
 
     #[test]
