@@ -672,8 +672,11 @@ fn rows_with_herdr_version(
         (required > running).then_some(HerdrVersionWarning { required, running })
     };
     let mut rows = Vec::new();
+    let displays: Vec<_> = desired.iter().map(Spec::display).collect();
+    let bundle = crate::plugin_trust::BundleEvidence::new(displays.iter().map(String::as_str));
+    let snapshot = crate::plugin_trust::InstalledSnapshot::new(installed);
 
-    for spec in desired {
+    for (index, (spec, display)) in desired.iter().zip(displays).enumerate() {
         let hit = installed
             .iter()
             .map(|p| (p, p.matches(spec)))
@@ -693,13 +696,7 @@ fn rows_with_herdr_version(
                 (status, commit)
             }
         };
-        let display = spec.display();
-        let (trust, authorized) = crate::plugin_trust::Report::for_bundle(
-            &display,
-            installed,
-            hit.map(|(p, _)| p),
-            market,
-        );
+        let (trust, authorized) = bundle.for_row(index, &snapshot, hit.map(|(p, _)| p), market);
         rows.push(Row {
             label: display.clone(),
             commit,
@@ -720,12 +717,12 @@ fn rows_with_herdr_version(
         });
     }
 
-    for p in installed {
+    for (index, p) in installed.iter().enumerate() {
         let claimed = desired.iter().any(|s| p.matches(s) != Match::None);
         if claimed {
             continue;
         }
-        let (trust, authorized) = crate::plugin_trust::Report::for_install(p, installed, market);
+        let (trust, authorized) = bundle.for_direct(index, &snapshot, market);
         rows.push(Row {
             label: p.slug.clone().unwrap_or_else(|| p.plugin_id.clone()),
             commit: p.resolved_commit.clone(),
@@ -1740,7 +1737,9 @@ impl App {
     fn open_logs_for(&mut self, idx: usize) {
         let row = self.rows.get(idx);
         let Some(detail) = row.and_then(Row::plugin_detail) else {
-            let message = if row.is_some_and(|row| row.installed.is_some()) {
+            let message = if row.is_some_and(|row| row.trust.bundle_ref_problem().is_some()) {
+                "Logs unavailable · bundle ref evidence was rejected"
+            } else if row.is_some_and(|row| row.installed.is_some()) {
                 "Logs unavailable · plugin identity is uncertain"
             } else {
                 "logs are only available for an installed plugin"
@@ -5273,6 +5272,144 @@ mod tests {
                 .contains(&"Resolved revision · Unknown".to_string()));
             assert!(r[0].plugin_detail().is_none());
         }
+    }
+
+    #[test]
+    fn row_payload_ids_are_unique_across_the_snapshot_and_case_sensitive() {
+        let desired = [Spec::parse("owner/plugin")];
+        let exact = github("owner", "plugin", SHA, true);
+        for (id, unique) in [("plugin", false), ("Plugin", true)] {
+            let mut malformed = local(id);
+            malformed.name = "unrelated".into();
+            malformed.source_scope = crate::plugin_trust::SourceScope::Invalid(None);
+            for candidates in [
+                [exact.clone(), malformed.clone()],
+                [malformed, exact.clone()],
+            ] {
+                for specs in [&[][..], &desired[..]] {
+                    let r = rows(specs, &candidates);
+                    let row = r
+                        .iter()
+                        .find(|row| row.slug.as_deref() == Some("owner/plugin"))
+                        .unwrap();
+                    assert_eq!(row.plugin_detail().is_some(), unique, "{id}, {specs:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bundle_ref_competition_is_order_independent_and_exact_scope_only() {
+        let roots = [github("owner", "plugin", SHA, true)];
+        let ambiguous = "Requested ref · Ambiguous request (bundle list)".to_owned();
+        let resolved = format!("Resolved revision · {SHA} (installed registry)");
+        for second in ["git@github.com:OWNER/PLUGIN.git@v2", "OWNER/PLUGIN"] {
+            for specs in [["owner/plugin@v1", second], [second, "owner/plugin@v1"]] {
+                let desired = specs.map(Spec::parse);
+                let r = rows(&desired, &roots);
+                assert_eq!(r.len(), 2);
+                for row in &r {
+                    assert!(row.plugin_detail().is_none());
+                    let facts = row.trust.lines();
+                    assert!(facts.contains(&ambiguous));
+                    assert!(facts.contains(&resolved));
+                }
+            }
+        }
+
+        for specs in [
+            ["owner/plugin@v1", "https://github.com/OWNER/PLUGIN.git@v1"],
+            ["owner/plugin@v1", "owner/plugin@v1"],
+            ["owner/plugin", "git@github.com:OWNER/PLUGIN.git"],
+        ] {
+            let r = rows(&specs.map(Spec::parse), &roots);
+            assert!(r[0].plugin_detail().is_some(), "{specs:?}");
+            assert!(r.iter().all(|row| row.trust.bundle_ref_problem().is_none()));
+        }
+
+        let mut child = github("owner", "plugin/Tools", SHA, true);
+        child.plugin_id = "upper-tools".into();
+        let desired = ["owner/plugin/Tools@v1", "OWNER/PLUGIN/tools@v2"].map(Spec::parse);
+        let r = rows(&desired, &[child]);
+        assert!(r[0].plugin_detail().is_some());
+        assert!(r[1].plugin_detail().is_none());
+        assert!(r.iter().all(|row| row.trust.bundle_ref_problem().is_none()));
+    }
+
+    #[test]
+    fn malformed_bundle_ref_blocks_only_its_own_bundle_payload() {
+        let installed = [github("owner", "plugin", SHA, true)];
+        for malformed in ["owner/plugin@v1@{1}", "OWNER/PLUGIN@"] {
+            for specs in [
+                [malformed, "owner/plugin@stable@rc"],
+                ["owner/plugin@stable@rc", malformed],
+            ] {
+                let r = rows(&specs.map(Spec::parse), &installed);
+                assert_eq!(r.len(), 2);
+                for (row, spec) in r.iter().zip(specs) {
+                    assert_eq!(row.plugin_detail().is_none(), spec == malformed);
+                    assert_eq!(row.trust.bundle_ref_problem().is_some(), spec == malformed);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_bundle_refs_close_only_exact_direct_fallbacks() {
+        let mut installed = [
+            github("alias", "root", SHA, true),
+            github("owner", "plugin/Tools", SHA, true),
+            github("owner", "plugin/tools", SHA, true),
+            github("other", "unrelated", SHA, true),
+            local("local-plugin"),
+        ];
+        installed[1].plugin_id = "upper-tools".into();
+        installed[2].plugin_id = "lower-tools".into();
+        for (specs, blocked) in [
+            (vec!["OWNER/PLUGIN/Tools@"], "owner/plugin/Tools"),
+            (
+                vec![
+                    "git@github.com:ALIAS/ROOT.git@v1",
+                    "ssh://git@github.com/alias/root@v2",
+                ],
+                "alias/root",
+            ),
+        ] {
+            let desired: Vec<_> = specs.iter().map(|spec| Spec::parse(spec)).collect();
+            let r = rows(&desired, &installed);
+            assert_eq!(r.len(), specs.len() + installed.len());
+            for row in &r[..specs.len()] {
+                assert_eq!(row.status, Status::Missing);
+                assert!(row.plugin_detail().is_none());
+            }
+            for row in &r[specs.len()..] {
+                let reject = row.label == blocked;
+                assert_eq!(row.plugin_detail().is_none(), reject, "{}", row.label);
+                assert_eq!(row.trust.bundle_ref_problem().is_some(), reject);
+                assert_eq!(
+                    row.status,
+                    if row.label == "local-plugin" {
+                        Status::ExtraLocal
+                    } else {
+                        Status::Extra
+                    }
+                );
+                if reject {
+                    assert!(row
+                        .trust
+                        .lines()
+                        .contains(&format!("Repository · {blocked} (installed registry)")));
+                }
+            }
+        }
+        let identical = [
+            "git@github.com:ALIAS/ROOT.git@v1",
+            "ssh://git@github.com/alias/root@v1",
+        ]
+        .map(Spec::parse);
+        let r = rows(&identical, &installed);
+        assert_eq!(r[2].label, "alias/root");
+        assert!(r[2].plugin_detail().is_some());
     }
 
     /// A local link must never be shown as prunable: `--prune` protects it, and a UI that

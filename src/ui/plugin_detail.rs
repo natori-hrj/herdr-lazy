@@ -74,12 +74,21 @@ fn body(app: &App, width: u16) -> Body {
 
     let text_width = usize::from(width).saturating_sub(2).max(1);
     let detail = row.plugin_detail();
+    let ref_problem = row.trust.bundle_ref_problem();
     if row.installed.is_some() && detail.is_none() {
         body.push_color("Installation · Unknown", app.theme.color(Role::Warning));
-        body.push_wrapped(
-            "The installed record cannot be attributed to this entry. Manifest, actions, compatibility, logs, and Changes are unavailable here.",
-            text_width,
-        );
+        if let Some(problem) = ref_problem {
+            body.push_wrapped(problem, text_width);
+            body.push_wrapped(
+                "Manifest, actions, compatibility, logs, and Changes are unavailable here.",
+                text_width,
+            );
+        } else {
+            body.push_wrapped(
+                "The installed record cannot be attributed to this entry. Manifest, actions, compatibility, logs, and Changes are unavailable here.",
+                text_width,
+            );
+        }
         push_trust(&mut body, &row.trust, text_width);
         return body;
     }
@@ -90,6 +99,9 @@ fn body(app: &App, width: u16) -> Body {
         (true, None) => ("Installed", Role::Success),
     };
     body.push_color(status, app.theme.color(role));
+    if let Some(problem) = ref_problem {
+        body.push_wrapped_color(problem, text_width, app.theme.color(Role::Warning));
+    }
     if let Some(warning) = row.herdr_warning {
         body.push_wrapped_color(
             &format!(
@@ -613,6 +625,63 @@ mod tests {
             id,
             &format!(r#","kind":"github","owner":"example","repo":"{repo}"{fields}"#),
         )
+    }
+
+    #[test]
+    fn rejected_bundle_ref_keeps_facts_but_hides_and_blocks_the_payload() {
+        let plugin = registry_fixture("plugin", "fixture.plugin", r#","installed_unix_ms":123"#);
+        let market = [crate::registry::Entry {
+            full_name: "example/plugin".into(),
+            pushed_at: "2024-01-02T00:00:00Z".into(),
+            ..Default::default()
+        }];
+        let desired = [Spec::parse("example/plugin@stable@{1}")];
+        let mut app = App {
+            rows: rows_with_herdr_version(
+                &desired,
+                &[plugin],
+                &market,
+                crate::HerdrVersion::parse("0.9.5"),
+            ),
+            detail_of: Some(0),
+            ..App::default()
+        };
+        let row = &mut app.rows[0];
+        row.trust.set_lock(Some(&format!("example/plugin@{SHA}")));
+        assert!(row.maintenance.is_some());
+        assert!(row.changes_target().is_none());
+        let frame = render(&app, 120, 24);
+        for fact in [
+            "Requested ref · Invalid suffix (bundle list)",
+            "Provenance · GitHub (installed registry)",
+            "Installation recorded · 123 Unix ms (installed registry)",
+            "Registry revision matches lock",
+            "Last push · 2024-01-02",
+        ] {
+            assert!(frame.contains(fact), "{frame:?}");
+        }
+        for hidden in [
+            "Other manifest description",
+            "Other action",
+            "Other pane",
+            "other.event",
+            "Requires Herdr",
+            "Binding preview",
+            "Enter Run",
+            "L Logs",
+        ] {
+            assert!(!frame.contains(hidden), "unexpected {hidden}: {frame:?}");
+        }
+        app.run_detail_action();
+        assert!(app.flash.is_none());
+        app.bind_selected('t');
+        assert!(app.pending_bind.is_none());
+        app.open_logs_for(0);
+        assert!(app.log_view.is_none());
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("Logs unavailable · bundle ref evidence was rejected")
+        );
     }
 
     fn assert_no_registry_revision(row: &Row) {

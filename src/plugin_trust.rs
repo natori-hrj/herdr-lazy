@@ -1,6 +1,7 @@
 //! Read-only evidence for Plugin Details. Do not reuse operational matching or pin enforcement
 //! here: they deliberately tolerate evidence that does not establish provenance.
 
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::Path;
@@ -323,22 +324,55 @@ fn registry_identity(plugin: &Installed) -> RegistryIdentity {
     }
 }
 
-// Dispatch uses the registry ID, not the display name or repository. A conflicting ID anywhere
-// in the snapshot makes even an otherwise exact scope unsafe to address.
-fn unique_id(plugin: &Installed, installed: &[Installed]) -> bool {
-    let id = &plugin.plugin_id;
-    !id.is_empty()
-        && !id.starts_with('-')
-        && !matches!(id.as_str(), "." | "..")
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-        && !installed
-            .iter()
-            .any(|other| !std::ptr::eq(other, plugin) && other.plugin_id == *id)
+pub(crate) struct InstalledSnapshot<'a> {
+    records: &'a [Installed],
+    id_counts: HashMap<&'a str, usize>,
 }
 
-fn entry_record(line: &str) -> Option<(String, Option<&str>)> {
+impl<'a> InstalledSnapshot<'a> {
+    pub(crate) fn new(records: &'a [Installed]) -> Self {
+        let mut id_counts = HashMap::with_capacity(records.len());
+        // Dispatch uses exact registry IDs, not display names or repositories. Count even
+        // records that cannot supply evidence: they can still make an ID unsafe to address.
+        for record in records {
+            *id_counts.entry(record.plugin_id.as_str()).or_insert(0) += 1;
+        }
+        Self { records, id_counts }
+    }
+
+    fn unique_id(&self, plugin: &Installed) -> bool {
+        let id = plugin.plugin_id.as_str();
+        !id.is_empty()
+            && !id.starts_with('-')
+            && !matches!(id, "." | "..")
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            && self.id_counts.get(id) == Some(&1)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum RefEvidence {
+    #[default]
+    Absent,
+    Valid(String),
+    Invalid,
+    Ambiguous,
+}
+
+impl RefEvidence {
+    fn accepted(&self) -> bool {
+        matches!(self, Self::Absent | Self::Valid(_))
+    }
+}
+
+struct EntryRecord {
+    repository: String,
+    reference: RefEvidence,
+}
+
+fn entry_record(line: &str) -> Option<EntryRecord> {
     let line = line.trim();
     if line.starts_with('#') {
         return None;
@@ -349,17 +383,99 @@ fn entry_record(line: &str) -> Option<(String, Option<&str>)> {
     let (repo, reference) = match path.find('@') {
         Some(index) => {
             let (left, right) = line.split_at(prefix_len + index);
-            (left.trim_end(), safe_ref(right[1..].trim()))
+            (
+                left.trim_end(),
+                safe_ref(right[1..].trim()).map_or(RefEvidence::Invalid, |reference| {
+                    RefEvidence::Valid(reference.to_owned())
+                }),
+            )
         }
-        None => (line, None),
+        None => (line, RefEvidence::Absent),
     };
-    Some((repository(repo)?, reference))
+    Some(EntryRecord {
+        repository: repository(repo)?,
+        reference,
+    })
+}
+
+pub(crate) struct BundleEvidence {
+    entries: Vec<Option<EntryRecord>>,
+    blocked_scopes: HashSet<String>,
+}
+
+impl BundleEvidence {
+    pub(crate) fn new<'a>(displayed_specs: impl IntoIterator<Item = &'a str>) -> Self {
+        // Parse each display once, independently of Spec's operational split.
+        let mut entries: Vec<_> = displayed_specs.into_iter().map(entry_record).collect();
+        let mut blocked_scopes = {
+            let mut first_requests = HashMap::new();
+            let mut competing = HashSet::new();
+            for entry in entries.iter().flatten().filter(|e| e.reference.accepted()) {
+                let first = first_requests
+                    .entry(entry.repository.as_str())
+                    .or_insert(&entry.reference);
+                if *first != &entry.reference {
+                    competing.insert(entry.repository.clone());
+                }
+            }
+            competing
+        };
+        for entry in entries.iter_mut().flatten() {
+            if entry.reference.accepted() && blocked_scopes.contains(&entry.repository) {
+                entry.reference = RefEvidence::Ambiguous;
+            }
+        }
+        // A malformed row blocks its own payload and a direct fallback, but it
+        // is not a competing request for the other bundle rows.
+        blocked_scopes.extend(
+            entries
+                .iter()
+                .flatten()
+                .filter(|entry| entry.reference == RefEvidence::Invalid)
+                .map(|entry| entry.repository.clone()),
+        );
+        Self {
+            entries,
+            blocked_scopes,
+        }
+    }
+
+    pub(crate) fn for_row<'a>(
+        &self,
+        index: usize,
+        installed: &InstalledSnapshot<'a>,
+        operational_hit: Option<&Installed>,
+        market: &[registry::Entry],
+    ) -> (Report, Option<&'a Installed>) {
+        Report::from_bundle_entry(
+            self.entries[index].as_ref(),
+            installed,
+            operational_hit,
+            market,
+        )
+    }
+
+    pub(crate) fn for_direct<'a>(
+        &self,
+        index: usize,
+        installed: &InstalledSnapshot<'a>,
+        market: &[registry::Entry],
+    ) -> (Report, Option<&'a Installed>) {
+        let (mut report, authorized) = Report::for_install(index, installed, market);
+        report.direct_bundle_ref_blocked = report
+            .repository
+            .as_ref()
+            .is_some_and(|(scope, _)| self.blocked_scopes.contains(scope));
+        let authorized = authorized.filter(|_| !report.direct_bundle_ref_blocked);
+        (report, authorized)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Report {
     repository: Option<(String, &'static str)>,
-    requested: Option<String>,
+    requested: RefEvidence,
+    direct_bundle_ref_blocked: bool,
     resolved: Option<String>,
     source: Option<&'static str>,
     installed_ms: Option<u64>,
@@ -378,19 +494,21 @@ struct CachedPush {
 impl Report {
     /// Snapshot facts and, separately, the installed record authorized to supply a UI payload.
     /// A unique registry fact need not be the record the operational matcher chose.
-    pub(crate) fn for_bundle<'a>(
-        displayed_spec: &str,
-        installed: &'a [Installed],
+    fn from_bundle_entry<'a>(
+        entry: Option<&EntryRecord>,
+        installed: &InstalledSnapshot<'a>,
         operational_hit: Option<&Installed>,
         market: &[registry::Entry],
     ) -> (Self, Option<&'a Installed>) {
-        // Reparse the original display for evidence only: Spec::parse may have split at the
-        // transport '@' in an SSH alias instead of the requested ref.
-        let (repository, requested) = match entry_record(displayed_spec) {
-            Some((slug, requested)) => (Some((slug, BUNDLE)), requested),
-            None => (None, None),
+        let (repository, requested) = match entry {
+            Some(entry) => (
+                Some((entry.repository.clone(), BUNDLE)),
+                entry.reference.clone(),
+            ),
+            None => (None, RefEvidence::Absent),
         };
-        if installed.iter().any(|p| p.registry_duplicate_observed) {
+        let records = installed.records;
+        if records.iter().any(|p| p.registry_duplicate_observed) {
             return (
                 Self::from_evidence(repository, requested, None, market),
                 None,
@@ -400,7 +518,7 @@ impl Report {
         let root = wanted.map(crate::repo_root);
         let mut evidence = None;
         let mut ambiguous_or_conflicting = false;
-        for plugin in installed {
+        for plugin in records {
             match registry_identity(plugin) {
                 RegistryIdentity::Known(slug, _) => {
                     if wanted == Some(slug.as_str()) {
@@ -428,7 +546,8 @@ impl Report {
         };
         let authorized = evidence.filter(|plugin| {
             operational_hit.is_some_and(|hit| std::ptr::eq(hit, *plugin))
-                && unique_id(plugin, installed)
+                && installed.unique_id(plugin)
+                && requested.accepted()
         });
         (
             Self::from_evidence(repository, requested, evidence, market),
@@ -436,23 +555,40 @@ impl Report {
         )
     }
 
-    pub(crate) fn for_install<'a>(
-        plugin: &'a Installed,
-        installed: &[Installed],
+    #[cfg(test)]
+    fn for_bundle<'a>(
+        displayed_spec: &str,
+        installed: &'a [Installed],
+        operational_hit: Option<&Installed>,
         market: &[registry::Entry],
     ) -> (Self, Option<&'a Installed>) {
+        let installed = InstalledSnapshot::new(installed);
+        BundleEvidence::new([displayed_spec]).for_row(0, &installed, operational_hit, market)
+    }
+
+    fn for_install<'a>(
+        index: usize,
+        installed: &InstalledSnapshot<'a>,
+        market: &[registry::Entry],
+    ) -> (Self, Option<&'a Installed>) {
+        let plugin = &installed.records[index];
         if plugin.registry_duplicate_observed {
             return (Self::default(), None);
         }
         let identity = registry_identity(plugin);
         let authorized = (!matches!(identity, RegistryIdentity::Conflict { .. })
-            && unique_id(plugin, installed))
+            && installed.unique_id(plugin))
         .then_some(plugin);
         let report = match identity {
-            RegistryIdentity::Known(slug, source) => {
-                Self::from_evidence(Some((slug, source)), None, Some(plugin), market)
+            RegistryIdentity::Known(slug, source) => Self::from_evidence(
+                Some((slug, source)),
+                RefEvidence::Absent,
+                Some(plugin),
+                market,
+            ),
+            RegistryIdentity::Unidentified => {
+                Self::from_evidence(None, RefEvidence::Absent, Some(plugin), market)
             }
-            RegistryIdentity::Unidentified => Self::from_evidence(None, None, Some(plugin), market),
             RegistryIdentity::Conflict { .. } => Self::default(),
         };
         (report, authorized)
@@ -460,7 +596,7 @@ impl Report {
 
     fn from_evidence(
         repository: Option<(String, &'static str)>,
-        requested: Option<&str>,
+        requested: RefEvidence,
         installed: Option<&Installed>,
         market: &[registry::Entry],
     ) -> Self {
@@ -476,7 +612,7 @@ impl Report {
         });
         Self {
             repository,
-            requested: requested.and_then(safe_ref).map(str::to_owned),
+            requested,
             resolved: installed
                 .and_then(|plugin| plugin.resolved_commit.as_deref())
                 .and_then(full_digest)
@@ -504,17 +640,31 @@ impl Report {
             .is_some_and(|push| push.after_install)
     }
 
+    pub(crate) fn bundle_ref_problem(&self) -> Option<&'static str> {
+        match &self.requested {
+            RefEvidence::Invalid => Some("The bundle entry has an invalid requested ref."),
+            RefEvidence::Ambiguous => Some("The bundle has competing requests for this scope."),
+            _ if self.direct_bundle_ref_blocked => {
+                Some("The bundle has an invalid or competing request for this exact scope.")
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn set_lock(&mut self, snapshot: Option<&str>) {
         self.lock_ref = self.repository.as_ref().and_then(|(repo, _)| {
             let mut records = snapshot?
                 .lines()
                 .filter_map(entry_record)
-                .filter(|(candidate, _)| candidate == repo);
-            let (_, reference) = records.next()?;
+                .filter(|candidate| candidate.repository == *repo);
+            let record = records.next()?;
             if records.next().is_some() {
                 return None;
             }
-            reference.map(str::to_owned)
+            match record.reference {
+                RefEvidence::Valid(reference) => Some(reference),
+                _ => None,
+            }
         });
         self.consistency =
             self.resolved
@@ -552,9 +702,15 @@ impl Report {
             .as_ref()
             .map_or((None, ""), |(repo, source)| (Some(repo.as_str()), *source));
         let installed_time = self.installed_ms.map(|ms| format!("{ms} Unix ms"));
+        let requested = match &self.requested {
+            RefEvidence::Absent => None,
+            RefEvidence::Valid(reference) => Some(reference.as_str()),
+            RefEvidence::Invalid => Some("Invalid suffix"),
+            RefEvidence::Ambiguous => Some("Ambiguous request"),
+        };
         [
             fact("Repository", repo, repo_source),
-            fact("Requested ref", self.requested.as_deref(), BUNDLE),
+            fact("Requested ref", requested, BUNDLE),
             fact("Resolved revision", self.resolved.as_deref(), REGISTRY),
             // The registry supplies one revision, not a second reading of the checkout.
             format!("Installed revision · {UNKNOWN} (checkout not independently inspected)"),
@@ -640,6 +796,13 @@ mod tests {
         Report::for_bundle(&desired.display(), installed, installed.first(), market).0
     }
 
+    fn direct<'a>(
+        installed: &'a [Installed],
+        market: &[registry::Entry],
+    ) -> (Report, Option<&'a Installed>) {
+        Report::for_install(0, &InstalledSnapshot::new(installed), market)
+    }
+
     fn parsed_registry(source_field: &str) -> Vec<Installed> {
         crate::parse_plugin_list(&format!(
             r#"{{"result":{{"plugins":[{{"plugin_id":"fixture.plugin","enabled":false,
@@ -673,7 +836,7 @@ mod tests {
                 Report::for_bundle(&spec.display(), &records, Some(plugin), &[]);
             assert_eq!(report.resolved, None, "{kind}");
             assert!(payload.is_none(), "{kind}");
-            let (report, payload) = Report::for_install(plugin, &records, &[]);
+            let (report, payload) = direct(&records, &[]);
             assert_eq!(report.repository, None, "{kind}");
             assert_eq!(report.resolved, None, "{kind}");
             assert!(payload.is_none(), "{kind}");
@@ -696,7 +859,7 @@ mod tests {
                 let plugin = &records[0];
                 assert_eq!(plugin.installed_unix_ms, Some(123));
                 assert_eq!(plugin.resolved_commit.as_deref(), Some(SHA));
-                let (report, payload) = Report::for_install(plugin, &records, &[]);
+                let (report, payload) = direct(&records, &[]);
                 assert!(payload.is_none(), "{kind}{url}");
                 assert_eq!(report.resolved, None, "{kind}{url}");
                 assert_eq!(report.installed_ms, None, "{kind}{url}");
@@ -722,7 +885,7 @@ mod tests {
             r#"{"kind":"local","owner":"owner","repo":"plugin"}"#,
         ] {
             let records = parsed_registry(&format!(r#","source":{source}"#));
-            let (report, payload) = Report::for_install(&records[0], &records, &[]);
+            let (report, payload) = direct(&records, &[]);
             assert!(payload.is_none(), "{source}");
             assert_eq!(report.source, None, "{source}");
         }
@@ -738,7 +901,7 @@ mod tests {
         ] {
             let records = parsed_registry(source_field);
             let plugin = &records[0];
-            let (report, payload) = Report::for_install(plugin, &records, &[]);
+            let (report, payload) = direct(&records, &[]);
             assert_eq!(report.repository, None, "{source_field}");
             assert_eq!(report.source, expected_provenance, "{source_field}");
             let payload = payload.expect("a unique ID can authorize a direct payload");
@@ -796,7 +959,7 @@ mod tests {
         report.set_lock(Some(&format!("owner/plugin@{SHA}")));
         assert_eq!(report.lock_ref, None);
 
-        let mut root = Report::for_install(&installed("Owner/Plugin", SHA), &[], &[]).0;
+        let mut root = direct(&[installed("Owner/Plugin", SHA)], &[]).0;
         root.set_lock(Some(&format!(
             "https://github.com/OWNER/plugin.git@{SHA}\nowner/PLUGIN@{SHA}"
         )));
@@ -871,12 +1034,45 @@ mod tests {
                 let (mut report, payload) =
                     Report::for_bundle(&spec.display(), &records, None, &[]);
                 assert_eq!(report.repository.as_ref().unwrap().0, "owner/plugin");
-                assert_eq!(report.requested.as_deref(), expected_ref);
+                assert_eq!(
+                    report.requested,
+                    expected_ref.map_or(RefEvidence::Absent, |r| RefEvidence::Valid(r.into()))
+                );
                 assert_eq!(report.resolved.as_deref(), Some(SHA));
                 assert!(payload.is_none());
                 report.set_lock(Some(&format!("owner/plugin@{SHA}")));
                 assert_eq!(report.consistency, Some("Registry revision matches lock"));
             }
+        }
+    }
+
+    #[test]
+    fn bundle_ref_evidence_validates_the_entire_suffix() {
+        let records = [installed("owner/plugin", SHA)];
+        for displayed in [
+            "git@github.com:owner/plugin.git@",
+            "ssh://git@github.com/owner/plugin.git@stable@{1}",
+            "owner/plugin@stable@bad ref",
+        ] {
+            let (mut report, payload) =
+                Report::for_bundle(displayed, &records, records.first(), &[]);
+            assert_eq!(report.requested, RefEvidence::Invalid, "{displayed}");
+            assert!(payload.is_none(), "{displayed}");
+            assert_eq!(report.resolved.as_deref(), Some(SHA));
+            report.set_lock(Some(&format!("owner/plugin@{SHA}")));
+            assert_eq!(report.locked_revision(), Some(SHA));
+            assert_eq!(report.consistency, Some("Registry revision matches lock"));
+        }
+        for displayed in [
+            "owner/plugin@refs/tags/v1@rc_2",
+            "ssh://git@github.com/Owner/Plugin.git@refs/tags/v1@rc_2",
+        ] {
+            let (report, payload) = Report::for_bundle(displayed, &records, records.first(), &[]);
+            assert_eq!(
+                report.requested,
+                RefEvidence::Valid("refs/tags/v1@rc_2".into())
+            );
+            assert!(payload.is_some(), "{displayed}");
         }
     }
 
@@ -896,10 +1092,9 @@ mod tests {
             ))
             .unwrap();
             let conflict = installed.into_iter().next().unwrap();
-            let (direct, payload) =
-                Report::for_install(&conflict, std::slice::from_ref(&conflict), &[]);
-            assert_eq!(direct.repository, None, "{url:?}");
-            assert_eq!(direct.resolved, None, "{url:?}");
+            let (report, payload) = direct(std::slice::from_ref(&conflict), &[]);
+            assert_eq!(report.repository, None, "{url:?}");
+            assert_eq!(report.resolved, None, "{url:?}");
             assert!(payload.is_none(), "{url:?}");
             // A contradictory claim for this entry is not repaired by selecting another row.
             let records = [exact.clone(), conflict];
@@ -931,7 +1126,7 @@ mod tests {
         let upper = SHA.to_ascii_uppercase();
         let different = "f".repeat(40);
         let report_for = |resolved: &str, locked: &str| {
-            let mut report = Report::for_install(&installed("owner/plugin", resolved), &[], &[]).0;
+            let mut report = direct(&[installed("owner/plugin", resolved)], &[]).0;
             report.set_lock(Some(&format!("owner/plugin@{locked}")));
             report
         };
@@ -991,8 +1186,8 @@ mod tests {
         let mut report = bundle(&desired, std::slice::from_ref(&plugin), &market);
         report.set_lock(Some("different/plugin@release"));
         let text = report.lines().join("\n");
+        assert!(text.contains("Requested ref · Invalid suffix (bundle list)"));
         for label in [
-            "Requested ref",
             "Resolved revision",
             "Lockfile ref",
             "Lock consistency",
@@ -1003,7 +1198,7 @@ mod tests {
         }
         assert!(!text.contains("fixture-private") && !text.contains("credential"));
 
-        let local = Report::for_install(&plugin, std::slice::from_ref(&plugin), &market).0;
+        let local = direct(std::slice::from_ref(&plugin), &market).0;
         assert_eq!(local.source, Some("Local link"));
         assert_eq!(local.repository, None);
         assert!(safe_ref(&"a".repeat(129)).is_none());
