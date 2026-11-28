@@ -84,6 +84,13 @@ pub(crate) fn discover(
 /// Kept separate from the context adapter so path and malformed-file behaviour can be tested
 /// without manufacturing Herdr's environment payload.
 pub(crate) fn discover_at(root: &Path) -> Result<Option<WorkspaceProfile>, String> {
+    Ok(discover_with_lock_at(root)?.map(|(profile, _)| profile))
+}
+
+/// Return the exact validated specs for restore rather than reopening a path after discovery.
+pub(crate) fn discover_with_lock_at(
+    root: &Path,
+) -> Result<Option<(WorkspaceProfile, Vec<Spec>)>, String> {
     let directory = root.join(PROFILE_DIRECTORY);
     let list_path = directory.join(PROFILE_LIST_NAME);
     let lock_path = directory.join(PROFILE_LOCK_NAME);
@@ -93,26 +100,35 @@ pub(crate) fn discover_at(root: &Path) -> Result<Option<WorkspaceProfile>, Strin
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.to_string()),
     };
-    let lock_status = match read_specs(&lock_path, "workspace profile lock") {
+    let lock_label = "workspace profile lock";
+    let (lock_status, lock_specs) = match crate::lockfile::read_text(&lock_path, false)
+        .and_then(|body| parse_specs(&body, &lock_path, lock_label))
+    {
         Ok(lock_specs) if same_repositories(&specs, &lock_specs) => {
-            LockStatus::Ready(lock_specs.len())
+            (LockStatus::Ready(lock_specs.len()), lock_specs)
         }
-        Ok(lock_specs) => LockStatus::Invalid(format!(
-            "{} entries do not match the {} profile entries",
-            lock_specs.len(),
-            specs.len()
-        )),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => LockStatus::Missing,
-        Err(error) => LockStatus::Invalid(error.to_string()),
+        Ok(lock_specs) => (
+            LockStatus::Invalid(format!(
+                "{} entries do not match the {} profile entries",
+                lock_specs.len(),
+                specs.len()
+            )),
+            Vec::new(),
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (LockStatus::Missing, Vec::new()),
+        Err(error) => (LockStatus::Invalid(error.to_string()), Vec::new()),
     };
 
-    Ok(Some(WorkspaceProfile {
-        root: root.to_path_buf(),
-        list_path,
-        lock_path,
-        specs,
-        lock_status,
-    }))
+    Ok(Some((
+        WorkspaceProfile {
+            root: root.to_path_buf(),
+            list_path,
+            lock_path,
+            specs,
+            lock_status,
+        },
+        lock_specs,
+    )))
 }
 
 /// Compare entries by repository identity, while still surfacing a changed pin as a separate
@@ -148,7 +164,10 @@ fn read_specs(path: &Path, label: &str) -> io::Result<Vec<Spec>> {
     let body = crate::read_local_text(path, label).map_err(|error| {
         io::Error::new(error.kind(), format!("could not read {}: {}", label, error))
     })?;
+    parse_specs(&body, path, label)
+}
 
+fn parse_specs(body: &str, path: &Path, label: &str) -> io::Result<Vec<Spec>> {
     let mut specs = Vec::new();
     for (line_number, raw) in body.lines().enumerate() {
         let line = raw.trim();
