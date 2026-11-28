@@ -110,7 +110,11 @@ pub(crate) fn read_local_text(path: &Path, label: &str) -> io::Result<String> {
 }
 
 fn validate_local_text_size(body: &[u8], label: &str, path: &Path) -> io::Result<()> {
-    if body.len() as u64 > MAX_LOCAL_INPUT_BYTES {
+    validate_local_text_len(body.len(), label, path)
+}
+
+fn validate_local_text_len(len: usize, label: &str, path: &Path) -> io::Result<()> {
+    if len as u64 > MAX_LOCAL_INPUT_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -3407,46 +3411,40 @@ fn write_lock(desired: &[Spec], installed: &[Installed]) -> io::Result<()> {
 }
 
 fn write_lock_at(p: &Path, desired: &[Spec], installed: &[Installed]) -> io::Result<()> {
-    ensure_parent(p)?;
-
     // Prefer the commit herdr actually checked out (`source.resolved_commit`) over the ref the
     // bundle asked for: a bundle may say `main`, but the lock must say which `main`. This is
     // what makes the lock reproducible rather than merely descriptive.
-    let mut lines = Vec::new();
-    let mut unresolved = 0;
-    let mut drifted = Vec::new();
-    for d in desired {
-        let hit = installed.iter().find(|p| p.matches(d) == Match::Strong);
-        // A commit pin that disagrees with what is installed means bundle and reality have
-        // diverged. Record the truth (what is installed), but never let it pass silently:
-        // a lock that quietly contradicts its bundle is worse than no lock.
-        if let Some(p) = hit {
-            if let PinState::Drifted { have } = pin_state(d, p) {
-                drifted.push(format!(
-                    "{} pins {} but {} is installed",
-                    d.repo,
-                    short(d.reference.as_deref().unwrap_or("")),
-                    short(&have)
-                ));
-            }
-        }
-        match hit.and_then(|p| p.resolved_commit.clone()) {
-            Some(c) => lines.push(format!("{}@{}", d.repo, c)),
-            None => {
-                unresolved += 1;
-                lines.push(d.display());
-            }
-        }
-    }
-
-    let mut body = String::new();
+    let mut body = String::with_capacity(MAX_LOCAL_INPUT_BYTES as usize);
     body.push_str("# herdr-lazy lock — resolved plugin set at last sync.\n");
     body.push_str("# Each `owner/repo@commit` reproduces exactly via `plugin install --ref`.\n");
     body.push_str("# Commits come from herdr's own `source.resolved_commit`.\n\n");
-    for l in &lines {
-        body.push_str(l);
+    let mut unresolved = 0;
+    let mut pin_checks = Vec::new();
+    for d in desired {
+        let hit = installed.iter().find(|p| p.matches(d) == Match::Strong);
+        let resolved = hit.and_then(|p| p.resolved_commit.as_deref());
+        let reference = resolved.or(d.reference.as_deref());
+        let next_len = body
+            .len()
+            .saturating_add(d.repo.len())
+            .saturating_add(reference.map_or(0, |r| r.len().saturating_add(1)))
+            .saturating_add(1);
+        validate_local_text_len(next_len, "plugin lock", p)?;
+        body.push_str(&d.repo);
+        if let Some(reference) = reference {
+            body.push('@');
+            body.push_str(reference);
+        }
         body.push('\n');
+        if resolved.is_none() {
+            unresolved += 1;
+        } else if let (Some(pin), Some(hit)) = (d.reference.as_deref(), hit) {
+            // At most one borrowed check per accepted line, with no diagnostic text yet.
+            pin_checks.push((d, pin, hit));
+        }
     }
+
+    ensure_parent(p)?;
     if write_lock_contents(p, &body)? {
         println!("wrote lock -> {}", p.display());
     } else {
@@ -3460,11 +3458,23 @@ fn write_lock_at(p: &Path, desired: &[Spec], installed: &[Installed]) -> io::Res
             desired.len()
         );
     }
-    if !drifted.is_empty() {
-        println!("WARNING: the lock disagrees with the bundle's pins:");
-        for d in &drifted {
-            println!("  ! {}", d);
+    // Report drift only for an accepted lock, in bundle order, without collecting warnings.
+    let mut warned = false;
+    for (d, pin, hit) in pin_checks {
+        if let PinState::Drifted { have } = pin_state(d, hit) {
+            if !warned {
+                println!("WARNING: the lock disagrees with the bundle's pins:");
+                warned = true;
+            }
+            println!(
+                "  ! {} pins {} but {} is installed",
+                d.repo,
+                short(pin),
+                short(&have)
+            );
         }
+    }
+    if warned {
         println!("  run `herdr-lazy sync` to restore the pinned commits.");
     }
     Ok(())
