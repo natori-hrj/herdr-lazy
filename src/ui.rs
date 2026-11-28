@@ -1258,8 +1258,7 @@ impl App {
                 Ok(profile) => (profile, None),
                 Err(error) => (None, Some(error)),
             };
-        let desired = crate::desired_plugins_result()
-            .map_err(|error| format!("Cannot read plugin list · {error}"));
+        let desired = crate::desired_plugins_result().map_err(|error| error.to_string());
         // The compatibility check is local, but the version comes from herdr itself. Read it
         // once for the whole refresh rather than once per installed plugin.
         let herdr_version = current_herdr_version();
@@ -1517,7 +1516,11 @@ impl App {
         // Re-read after returning to the pane. Herdr action invocation is asynchronous, so this
         // may still show `running`; the log result remains visible and can be refreshed with r.
         self.open_machine_view();
-        self.flash = Some(machine_action_notification(action, &target, outcome));
+        let notification = machine_action_notification(action, &target, outcome);
+        self.flash = Some(match self.flash.take() {
+            Some(error) => format!("{notification}; {error}"),
+            None => notification,
+        });
         Ok(())
     }
 
@@ -2479,12 +2482,16 @@ impl App {
             return;
         };
         // Opening a presentation-only recommendation view must not trigger the legacy-list
-        // migration performed by `desired_plugins`.
-        let listed: Vec<String> = crate::read_bundle_specs()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|spec| spec.repo)
-            .collect();
+        // migration performed by `desired_plugins_result`.
+        let specs = match crate::read_bundle_specs() {
+            Ok(specs) => specs,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => {
+                self.flash = Some(format!("Cannot read plugin list · {error}"));
+                return;
+            }
+        };
+        let listed: Vec<String> = specs.into_iter().map(|spec| spec.repo).collect();
         match RecommendationsPicker::new(&agent, &listed) {
             Some(picker) => {
                 self.recommendations = Some(picker);
@@ -2685,7 +2692,10 @@ impl App {
             ManageCommand::Starter => self.flash = Some(crate::open_starter_pane()),
             ManageCommand::Refresh => {
                 self.refresh();
-                self.flash = Some("re-read your list and what is installed".to_string());
+                self.flash = self
+                    .error
+                    .is_none()
+                    .then(|| "re-read your list and what is installed".to_string());
             }
             ManageCommand::Help => self.help = Some(0),
         }
@@ -3280,7 +3290,10 @@ impl App {
         }
 
         let footer = match &self.flash {
-            Some(msg) => format!("{accent}{}\x1b[0m", msg),
+            Some(msg) => format!(
+                "{accent}{}\x1b[0m",
+                terminal_text::clip(msg, usize::from(width.saturating_sub(2))).0
+            ),
             None if a.asking() => {
                 "\x1b[1m[enter]\x1b[0m read it  \x1b[1m[esc]\x1b[0m back".to_string()
             }
