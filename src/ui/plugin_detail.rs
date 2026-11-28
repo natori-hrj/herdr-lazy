@@ -375,6 +375,8 @@ mod tests {
             name: "Plugin 界".into(),
             description: "Navigation and workspace setup. ".repeat(3),
             slug: Some("example/plugin".into()),
+            source_kind: "github".into(),
+            source_scope: crate::plugin_trust::SourceScope::GitHub("example/plugin".into()),
             resolved_commit: Some(SHA.into()),
             actions: (0..12)
                 .map(|i| (format!("example.plugin.action-{i}"), format!("Command {i}")))
