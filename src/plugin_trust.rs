@@ -2,45 +2,14 @@
 //! here: they deliberately tolerate evidence that does not establish provenance.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::OpenOptions;
-use std::io::Read;
-use std::path::Path;
 
 use crate::{json, registry, Installed};
 
 const UNKNOWN: &str = "Unknown";
 const MAX_IDENTITY_INPUT: usize = 320;
-const MAX_LOCK_BYTES: u64 = 256 * 1024;
 const BUNDLE: &str = "bundle list";
 const REGISTRY: &str = "installed registry";
 const LOCK: &str = "plugins.lock";
-
-/// Read only on opening Details, never during startup or a redraw. Don't interpret a truncated,
-/// invalid or unreadable snapshot: a later record could make an apparent match ambiguous.
-pub(crate) fn read_lock(path: &Path) -> Option<String> {
-    let metadata = path.metadata().ok()?;
-    if !metadata.is_file() || metadata.len() > MAX_LOCK_BYTES {
-        return None;
-    }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        // A path replacement must not block Details on a named pipe.
-        options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
-    }
-    let file = options.open(path).ok()?;
-    let metadata = file.metadata().ok()?;
-    if !metadata.is_file() || metadata.len() > MAX_LOCK_BYTES {
-        return None;
-    }
-    read_lock_contents(file)
-}
-
-fn read_lock_contents(reader: impl Read) -> Option<String> {
-    String::from_utf8(crate::read_limited(reader, MAX_LOCK_BYTES).ok()??).ok()
-}
 
 fn strip_alias(value: &str) -> Option<&str> {
     [
@@ -399,14 +368,22 @@ fn entry_record(line: &str) -> Option<EntryRecord> {
 }
 
 pub(crate) struct BundleEvidence {
-    entries: Vec<Option<EntryRecord>>,
+    // None is a rejected snapshot, not an observed list with no entries.
+    entries: Option<Vec<Option<EntryRecord>>>,
     blocked_scopes: HashSet<String>,
 }
 
 impl BundleEvidence {
-    pub(crate) fn new<'a>(displayed_specs: impl IntoIterator<Item = &'a str>) -> Self {
-        // Parse each display once, independently of Spec's operational split.
-        let mut entries: Vec<_> = displayed_specs.into_iter().map(entry_record).collect();
+    pub(crate) fn rejected() -> Self {
+        Self {
+            entries: None,
+            blocked_scopes: HashSet::new(),
+        }
+    }
+
+    pub(crate) fn new<'a>(observed_lines: impl IntoIterator<Item = &'a str>) -> Self {
+        // Parse the observed lines, not the operational Spec's normalized display.
+        let mut entries: Vec<_> = observed_lines.into_iter().map(entry_record).collect();
         let mut blocked_scopes = {
             let mut first_requests = HashMap::new();
             let mut competing = HashSet::new();
@@ -435,7 +412,7 @@ impl BundleEvidence {
                 .map(|entry| entry.repository.clone()),
         );
         Self {
-            entries,
+            entries: Some(entries),
             blocked_scopes,
         }
     }
@@ -448,7 +425,9 @@ impl BundleEvidence {
         market: &[registry::Entry],
     ) -> (Report, Option<&'a Installed>) {
         Report::from_bundle_entry(
-            self.entries[index].as_ref(),
+            self.entries
+                .as_ref()
+                .and_then(|entries| entries[index].as_ref()),
             installed,
             operational_hit,
             market,
@@ -462,11 +441,13 @@ impl BundleEvidence {
         market: &[registry::Entry],
     ) -> (Report, Option<&'a Installed>) {
         let (mut report, authorized) = Report::for_install(index, installed, market);
+        report.bundle_rejected = self.entries.is_none();
         report.direct_bundle_ref_blocked = report
             .repository
             .as_ref()
             .is_some_and(|(scope, _)| self.blocked_scopes.contains(scope));
-        let authorized = authorized.filter(|_| !report.direct_bundle_ref_blocked);
+        let authorized =
+            authorized.filter(|_| !report.bundle_rejected && !report.direct_bundle_ref_blocked);
         (report, authorized)
     }
 }
@@ -475,6 +456,7 @@ impl BundleEvidence {
 pub(crate) struct Report {
     repository: Option<(String, &'static str)>,
     requested: RefEvidence,
+    bundle_rejected: bool,
     direct_bundle_ref_blocked: bool,
     resolved: Option<String>,
     source: Option<&'static str>,
@@ -640,10 +622,13 @@ impl Report {
             .is_some_and(|push| push.after_install)
     }
 
-    pub(crate) fn bundle_ref_problem(&self) -> Option<&'static str> {
+    pub(crate) fn bundle_problem(&self) -> Option<&'static str> {
         match &self.requested {
             RefEvidence::Invalid => Some("The bundle entry has an invalid requested ref."),
             RefEvidence::Ambiguous => Some("The bundle has competing requests for this scope."),
+            _ if self.bundle_rejected => {
+                Some("Cannot read plugin list · bundle snapshot rejected.")
+            }
             _ if self.direct_bundle_ref_blocked => {
                 Some("The bundle has an invalid or competing request for this exact scope.")
             }
@@ -1223,15 +1208,6 @@ mod tests {
         ] {
             assert_eq!(safe_ref(reference), None, "{reference:?}");
         }
-    }
-
-    #[test]
-    fn lock_snapshot_is_never_used_partially() {
-        let exact = vec![b'a'; MAX_LOCK_BYTES as usize];
-        assert!(read_lock_contents(exact.as_slice()).is_some());
-        let oversized = vec![b'a'; MAX_LOCK_BYTES as usize + 1];
-        assert!(read_lock_contents(oversized.as_slice()).is_none());
-        assert!(read_lock_contents(&[0xff][..]).is_none());
     }
 
     #[test]
