@@ -140,7 +140,7 @@ struct Row {
     /// Ticked for a bulk operation. Kept on the row rather than as a set of indices so it
     /// survives the list being rebuilt in a different order.
     picked: bool,
-    /// Authorized UI payload, never populated by a merely operational match.
+    /// Legacy operation payload, populated only from a validated legacy nominee.
     detail: Option<PluginDetail>,
     /// Local evidence for Plugin Details, separate from operational matches and pins.
     trust: crate::plugin_trust::Report,
@@ -175,10 +175,6 @@ impl Row {
     fn detail_for(&self, key: &RowKey, plugin_id: &str) -> Option<&PluginDetail> {
         self.plugin_detail()
             .filter(|detail| &self.key == key && detail.plugin_id == plugin_id)
-    }
-
-    fn changes_target(&self) -> Option<&ChangesTarget> {
-        self.plugin_detail()?.changes.as_ref()
     }
 
     fn marker(&self) -> &'static str {
@@ -220,7 +216,7 @@ impl Row {
             };
         }
         if self.maybe_stale && self.status_note().is_empty() {
-            return "updates available — press l to see what changed".to_string();
+            return "updates available — press l for details".to_string();
         }
         let note = self.status_note();
         if !note.is_empty() {
@@ -246,16 +242,6 @@ impl Row {
     }
 }
 
-/// A row index can refer to a different plugin after refresh, and an installation can change
-/// revision even if it keeps its row and ID.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ChangesTarget {
-    plugin_id: String,
-    /// Validated GitHub repository root, even for a plugin installed from a subdirectory.
-    slug: String,
-    commit: String,
-}
-
 /// The manifest facts worth showing a user who just installed seven plugins at once.
 #[derive(Debug, Clone, Default)]
 struct PluginDetail {
@@ -264,24 +250,15 @@ struct PluginDetail {
     panes: Vec<(String, String, String)>,
     events: Vec<String>,
     plugin_id: String,
-    changes: Option<ChangesTarget>,
 }
 
-fn detail_of(p: &Installed, trust: &crate::plugin_trust::Report) -> PluginDetail {
+fn detail_of(p: &Installed) -> PluginDetail {
     PluginDetail {
         description: p.description.clone(),
         actions: p.actions.clone(),
         panes: p.panes.clone(),
         events: p.events.clone(),
         plugin_id: p.plugin_id.clone(),
-        changes: trust
-            .repository_root()
-            .zip(p.resolved_commit.as_deref())
-            .map(|(slug, commit)| ChangesTarget {
-                plugin_id: p.plugin_id.clone(),
-                slug,
-                commit: commit.to_owned(),
-            }),
     }
 }
 
@@ -734,7 +711,7 @@ fn rows_from_bundle(
         (required > running).then_some(HerdrVersionWarning { required, running })
     };
     let mut rows = Vec::new();
-    use crate::plugin_trust::BundleEvidence;
+    use crate::plugin_trust::{registry_identity, BundleEvidence, Report};
     let (bundle, specs) = match desired {
         Some(lines) => (
             BundleEvidence::new(lines.iter().map(String::as_str)),
@@ -767,39 +744,43 @@ fn rows_from_bundle(
                 (status, commit)
             }
         };
-        let (trust, authorized) = bundle.for_row(index, &snapshot, hit.map(|(p, _)| p), market);
+        let exact_record = bundle.listed_record(index, &snapshot);
+        let nominee = hit
+            .map(|(p, _)| p)
+            .filter(|p| bundle.allows_listed(index, &snapshot, p, exact_record));
+        let trust = Report::for_row(&bundle, index, exact_record, market);
         let display = spec.display();
         rows.push(Row {
             key: RowKey::Listed(line.clone()),
             label: display.clone(),
             commit,
             status,
-            herdr_warning: authorized.and_then(version_warning),
+            herdr_warning: nominee.and_then(version_warning),
             listed_as: Some(display),
             slug: Some(spec.repo.clone()),
             installed: hit.map(|(p, _)| (p.plugin_id.clone(), p.source_kind.clone())),
             enabled: hit.map(|(p, _)| p.enabled),
             maintenance: trust.maintenance(),
             // A pinned entry is meant to sit still; calling it out of date is noise.
-            maybe_stale: spec.reference.is_none()
-                && authorized.is_some()
-                && trust.pushed_since_install(),
+            maybe_stale: spec.reference.is_none() && trust.pushed_since_install(),
             picked: false,
-            detail: authorized.map(|p| detail_of(p, &trust)),
+            detail: nominee.map(detail_of),
             trust,
         });
     }
 
-    for (index, p) in installed.iter().enumerate() {
+    for p in installed {
         let claimed = specs.iter().any(|s| p.matches(s) != Match::None);
         if claimed {
             continue;
         }
-        let (trust, authorized) = bundle.for_direct(index, &snapshot, market);
+        let identity = registry_identity(p);
+        let nominee = bundle.allows_direct(&snapshot, p, &identity).then_some(p);
+        let trust = Report::for_direct(&bundle, p, &identity, market);
         rows.push(Row {
             key: RowKey::Direct {
                 plugin_id: p.plugin_id.clone(),
-                scope: trust.repository_scope().map(str::to_owned),
+                scope: identity.scope().map(str::to_owned),
             },
             label: p.slug.clone().unwrap_or_else(|| p.plugin_id.clone()),
             commit: p.resolved_commit.clone(),
@@ -816,15 +797,15 @@ fn rows_from_bundle(
             } else {
                 Status::Extra
             },
-            herdr_warning: authorized.and_then(version_warning),
+            herdr_warning: nominee.and_then(version_warning),
             listed_as: None,
             slug: p.slug.clone(),
             installed: Some((p.plugin_id.clone(), p.source_kind.clone())),
             enabled: Some(p.enabled),
             maintenance: trust.maintenance(),
-            maybe_stale: authorized.is_some() && trust.pushed_since_install(),
+            maybe_stale: trust.pushed_since_install(),
             picked: false,
-            detail: authorized.map(|p| detail_of(p, &trust)),
+            detail: nominee.map(detail_of),
             trust,
         });
     }
@@ -1304,10 +1285,6 @@ struct App {
     /// Which action is highlighted in the details view.
     detail_cursor: usize,
     detail_scroll: usize,
-    /// Changes fetched for the currently open details, and which row they belong to. Keyed by
-    /// row so reopening the same plugin does not re-hit the network, and a stale result for a
-    /// different plugin never shows.
-    detail_changes: Option<(ChangesTarget, crate::github::Changes)>,
     /// Recent command logs for the selected plugin. This is a modal overlay so the list/detail
     /// cursor remains where the user left it when they go back.
     log_view: Option<LogView>,
@@ -1429,7 +1406,6 @@ impl App {
         self.detail_of = None;
         self.detail_cursor = 0;
         self.detail_scroll = 0;
-        self.detail_changes = None;
         self.log_view = None;
         self.awaiting_bind = false;
         self.pending_bind = None;
@@ -1846,8 +1822,6 @@ impl App {
         else {
             let message = if self.bundle_error.is_some() {
                 "Logs unavailable · bundle snapshot rejected"
-            } else if row.is_some_and(|row| row.trust.bundle_problem().is_some()) {
-                "Logs unavailable · bundle ref evidence was rejected"
             } else if row.is_some_and(|row| row.installed.is_some()) {
                 "Logs unavailable · plugin identity is uncertain"
             } else {
@@ -1868,6 +1842,12 @@ impl App {
         let Some(view) = self.log_view.take() else {
             return;
         };
+        if matches!(view.row_key, Some(RowKey::Direct { scope: None, .. })) {
+            self.refresh();
+            self.flash =
+                Some("Logs unavailable · originating plugin row is no longer confirmed".into());
+            return;
+        }
         let origin = view.originating_row(&self.rows);
         let from_detail = origin.is_some() && self.detail_of == origin;
         self.refresh();
@@ -1953,30 +1933,6 @@ impl App {
             return;
         }
         self.show_detail(self.cursor, path);
-        let row = &self.rows[self.cursor];
-
-        // Fetch only for a plugin the offline marker already flagged. Opening the details of
-        // an up-to-date plugin must stay instant — going to the network for every `l` would
-        // make the common case (nothing changed) the slow one, which is backwards. The marker
-        // can lag a very recent push by up to a day; that a just-pushed plugin waits one more
-        // day for its diff is a fair price for `l` never blocking on a plugin that is current.
-        //
-        // Reuse only a result for the same authorized identity and revision.
-        let target = row.changes_target();
-        if self
-            .detail_changes
-            .as_ref()
-            .is_some_and(|(cached, _)| target == Some(cached))
-        {
-            return;
-        }
-        self.detail_changes = None;
-        if row.maybe_stale {
-            if let Some(target) = target.cloned() {
-                let changes = crate::github::changes_since(&target.slug, &target.commit);
-                self.detail_changes = Some((target, changes));
-            }
-        }
     }
 
     /// Bind the highlighted action to `prefix+shift+<letter>`.
@@ -6411,7 +6367,6 @@ mod tests {
         );
         // The cache supplies repository facts, not facts about the weakly matched install.
         assert!(!rows[0].maybe_stale);
-        assert!(rows[0].changes_target().is_none());
 
         let invalid = [Spec::parse("../plugin")];
         let rows = rows_with_updates(&invalid, &installed, &market);
@@ -6419,7 +6374,7 @@ mod tests {
     }
 
     #[test]
-    fn parsed_child_uses_root_for_cache_and_changes_but_keeps_scoped_report() {
+    fn parsed_child_uses_root_for_cache_but_keeps_scoped_report() {
         for repo in ["REPO", "REPO/Tools"] {
             let installed = crate::parse_plugin_list(&format!(
                 r#"{{"result":{{"plugins":[{{"plugin_id":"example.plugin","source":{{
@@ -6430,16 +6385,10 @@ mod tests {
             .unwrap();
             let desired = [Spec::parse("owner/repo/Tools")];
             let market = [market("OWNER/REPO", "2024-10-05T00:00:00Z")];
-            let target = ChangesTarget {
-                plugin_id: "example.plugin".into(),
-                slug: "owner/repo".into(),
-                commit: SHA.into(),
-            };
             for desired in [desired.as_slice(), &[]] {
                 let rows = rows_with_updates(desired, &installed, &market);
                 assert!(rows[0].maintenance.is_some());
                 assert!(rows[0].maybe_stale);
-                assert_eq!(rows[0].changes_target(), Some(&target));
                 assert!(rows[0]
                     .trust
                     .lines()

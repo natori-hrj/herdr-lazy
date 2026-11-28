@@ -101,13 +101,22 @@ fn full_digest(value: &str) -> Option<&str> {
     (matches!(value.len(), 40 | 64) && crate::is_commit_ref(value)).then_some(value)
 }
 
-enum RegistryIdentity {
+pub(crate) enum RegistryIdentity {
     Known(String, &'static str),
     Conflict {
         structured: Option<String>,
         alias: Option<String>,
     },
     Unidentified,
+}
+
+impl RegistryIdentity {
+    pub(crate) fn scope(&self) -> Option<&str> {
+        match self {
+            Self::Known(scope, _) => Some(scope),
+            Self::Conflict { .. } | Self::Unidentified => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -260,7 +269,7 @@ impl SourceUrl {
     }
 }
 
-fn registry_identity(plugin: &Installed) -> RegistryIdentity {
+pub(crate) fn registry_identity(plugin: &Installed) -> RegistryIdentity {
     let alias = plugin.source_url.alias();
     match &plugin.source_scope {
         SourceScope::Invalid(root) => RegistryIdentity::Conflict {
@@ -417,38 +426,81 @@ impl BundleEvidence {
         }
     }
 
-    pub(crate) fn for_row<'a>(
+    pub(crate) fn listed_record<'a>(
         &self,
         index: usize,
         installed: &InstalledSnapshot<'a>,
-        operational_hit: Option<&Installed>,
-        market: &[registry::Entry],
-    ) -> (Report, Option<&'a Installed>) {
-        Report::from_bundle_entry(
-            self.entries
-                .as_ref()
-                .and_then(|entries| entries[index].as_ref()),
-            installed,
-            operational_hit,
-            market,
-        )
+    ) -> Option<&'a Installed> {
+        let wanted = self.entry(index)?.repository.as_str();
+        let records = installed.records;
+        if records.iter().any(|p| p.registry_duplicate_observed) {
+            return None;
+        }
+        let root = crate::repo_root(wanted);
+        let mut evidence = None;
+        let mut ambiguous_or_conflicting = false;
+        for plugin in records {
+            match registry_identity(plugin) {
+                RegistryIdentity::Known(slug, _) => {
+                    if wanted == slug {
+                        ambiguous_or_conflicting |= evidence.replace(plugin).is_some();
+                    } else if root == slug {
+                        // For a child, a root-only record may be describing that same child
+                        // without its path. It cannot prove identity or break an apparent tie.
+                        ambiguous_or_conflicting = true;
+                    }
+                }
+                RegistryIdentity::Conflict { structured, alias } => {
+                    ambiguous_or_conflicting |= structured
+                        .as_deref()
+                        .is_some_and(|scope| wanted == scope || root == scope)
+                        || alias.as_ref() == Some(&root);
+                }
+                RegistryIdentity::Unidentified => {}
+            }
+        }
+        if ambiguous_or_conflicting {
+            None
+        } else {
+            evidence
+        }
     }
 
-    pub(crate) fn for_direct<'a>(
+    fn entry(&self, index: usize) -> Option<&EntryRecord> {
+        self.entries.as_ref()?.get(index)?.as_ref()
+    }
+
+    pub(crate) fn allows_listed(
         &self,
         index: usize,
-        installed: &InstalledSnapshot<'a>,
-        market: &[registry::Entry],
-    ) -> (Report, Option<&'a Installed>) {
-        let (mut report, authorized) = Report::for_install(index, installed, market);
-        report.bundle_rejected = self.entries.is_none();
-        report.direct_bundle_ref_blocked = report
-            .repository
-            .as_ref()
-            .is_some_and(|(scope, _)| self.blocked_scopes.contains(scope));
-        let authorized =
-            authorized.filter(|_| !report.bundle_rejected && !report.direct_bundle_ref_blocked);
-        (report, authorized)
+        installed: &InstalledSnapshot<'_>,
+        nominee: &Installed,
+        exact_record: Option<&Installed>,
+    ) -> bool {
+        exact_record.is_some_and(|record| std::ptr::eq(nominee, record))
+            && self
+                .entry(index)
+                .is_some_and(|entry| entry.reference.accepted())
+            && installed.unique_id(nominee)
+    }
+
+    pub(crate) fn allows_direct(
+        &self,
+        installed: &InstalledSnapshot<'_>,
+        nominee: &Installed,
+        identity: &RegistryIdentity,
+    ) -> bool {
+        self.entries.is_some()
+            && !nominee.registry_duplicate_observed
+            && !matches!(identity, RegistryIdentity::Conflict { .. })
+            && !self.blocks_scope(identity)
+            && installed.unique_id(nominee)
+    }
+
+    fn blocks_scope(&self, identity: &RegistryIdentity) -> bool {
+        identity
+            .scope()
+            .is_some_and(|scope| self.blocked_scopes.contains(scope))
     }
 }
 
@@ -474,96 +526,52 @@ struct CachedPush {
 }
 
 impl Report {
-    /// Snapshot facts and, separately, the installed record authorized to supply a UI payload.
-    /// A unique registry fact need not be the record the operational matcher chose.
-    fn from_bundle_entry<'a>(
-        entry: Option<&EntryRecord>,
-        installed: &InstalledSnapshot<'a>,
-        operational_hit: Option<&Installed>,
+    pub(crate) fn for_row(
+        bundle: &BundleEvidence,
+        index: usize,
+        exact_record: Option<&Installed>,
         market: &[registry::Entry],
-    ) -> (Self, Option<&'a Installed>) {
-        let (repository, requested) = match entry {
-            Some(entry) => (
-                Some((entry.repository.clone(), BUNDLE)),
-                entry.reference.clone(),
-            ),
-            None => (None, RefEvidence::Absent),
-        };
-        let records = installed.records;
-        if records.iter().any(|p| p.registry_duplicate_observed) {
-            return (
-                Self::from_evidence(repository, requested, None, market),
-                None,
-            );
-        }
-        let wanted = repository.as_ref().map(|(slug, _)| slug.as_str());
-        let root = wanted.map(crate::repo_root);
-        let mut evidence = None;
-        let mut ambiguous_or_conflicting = false;
-        for plugin in records {
-            match registry_identity(plugin) {
-                RegistryIdentity::Known(slug, _) => {
-                    if wanted == Some(slug.as_str()) {
-                        ambiguous_or_conflicting |= evidence.replace(plugin).is_some();
-                    } else if root.as_deref() == Some(slug.as_str()) {
-                        // For a child, a root-only record may be describing that same child
-                        // without its path. It cannot prove identity or break an apparent tie.
-                        ambiguous_or_conflicting = true;
-                    }
-                }
-                RegistryIdentity::Conflict { structured, alias } => {
-                    ambiguous_or_conflicting |= structured.as_deref().is_some_and(|scope| {
-                        wanted == Some(scope) || root.as_deref() == Some(scope)
-                    }) || root
-                        .as_ref()
-                        .is_some_and(|root| alias.as_ref() == Some(root));
-                }
-                RegistryIdentity::Unidentified => {}
-            }
-        }
-        let evidence = if ambiguous_or_conflicting {
-            None
-        } else {
-            evidence
-        };
-        let authorized = evidence.filter(|plugin| {
-            operational_hit.is_some_and(|hit| std::ptr::eq(hit, *plugin))
-                && installed.unique_id(plugin)
-                && requested.accepted()
-        });
-        (
-            Self::from_evidence(repository, requested, evidence, market),
-            authorized,
-        )
+    ) -> Self {
+        let (repository, requested) =
+            bundle
+                .entry(index)
+                .map_or((None, RefEvidence::Absent), |entry| {
+                    (
+                        Some((entry.repository.clone(), BUNDLE)),
+                        entry.reference.clone(),
+                    )
+                });
+        Self::from_evidence(repository, requested, exact_record, market)
     }
 
     #[cfg(test)]
     fn for_bundle<'a>(
         displayed_spec: &str,
         installed: &'a [Installed],
-        operational_hit: Option<&Installed>,
+        operational_hit: Option<&'a Installed>,
         market: &[registry::Entry],
     ) -> (Self, Option<&'a Installed>) {
         let installed = InstalledSnapshot::new(installed);
-        BundleEvidence::new([displayed_spec]).for_row(0, &installed, operational_hit, market)
+        let bundle = BundleEvidence::new([displayed_spec]);
+        let exact_record = bundle.listed_record(0, &installed);
+        let approved_nominee =
+            operational_hit.filter(|p| bundle.allows_listed(0, &installed, p, exact_record));
+        (
+            Self::for_row(&bundle, 0, exact_record, market),
+            approved_nominee,
+        )
     }
 
-    fn for_install<'a>(
-        index: usize,
-        installed: &InstalledSnapshot<'a>,
+    pub(crate) fn for_direct(
+        bundle: &BundleEvidence,
+        plugin: &Installed,
+        identity: &RegistryIdentity,
         market: &[registry::Entry],
-    ) -> (Self, Option<&'a Installed>) {
-        let plugin = &installed.records[index];
-        if plugin.registry_duplicate_observed {
-            return (Self::default(), None);
-        }
-        let identity = registry_identity(plugin);
-        let authorized = (!matches!(identity, RegistryIdentity::Conflict { .. })
-            && installed.unique_id(plugin))
-        .then_some(plugin);
-        let report = match identity {
+    ) -> Self {
+        let mut report = match identity {
+            _ if plugin.registry_duplicate_observed => Self::default(),
             RegistryIdentity::Known(slug, source) => Self::from_evidence(
-                Some((slug, source)),
+                Some((slug.clone(), source)),
                 RefEvidence::Absent,
                 Some(plugin),
                 market,
@@ -573,7 +581,9 @@ impl Report {
             }
             RegistryIdentity::Conflict { .. } => Self::default(),
         };
-        (report, authorized)
+        report.bundle_rejected = bundle.entries.is_none();
+        report.direct_bundle_ref_blocked = bundle.blocks_scope(identity);
+        report
     }
 
     fn from_evidence(
@@ -604,16 +614,6 @@ impl Report {
             last_push,
             ..Self::default()
         }
-    }
-
-    pub(crate) fn repository_root(&self) -> Option<String> {
-        self.repository
-            .as_ref()
-            .map(|(slug, _)| crate::repo_root(slug))
-    }
-
-    pub(crate) fn repository_scope(&self) -> Option<&str> {
-        self.repository.as_ref().map(|(scope, _)| scope.as_str())
     }
 
     pub(crate) fn maintenance(&self) -> Option<registry::MaintenanceStatus> {
@@ -715,8 +715,7 @@ impl Report {
             ),
             format!("License, security policy, archived state, external commands · {UNKNOWN}"),
             "Lock comparison does not authenticate the plugin.".to_string(),
-            "Provenance uses local snapshots. The separate Changes check may contact GitHub."
-                .to_string(),
+            "Provenance uses local snapshots.".to_string(),
         ]
     }
 }
@@ -789,7 +788,14 @@ mod tests {
         installed: &'a [Installed],
         market: &[registry::Entry],
     ) -> (Report, Option<&'a Installed>) {
-        Report::for_install(0, &InstalledSnapshot::new(installed), market)
+        let bundle = BundleEvidence::new([]);
+        let plugin = &installed[0];
+        let identity = registry_identity(plugin);
+        let allowed = bundle.allows_direct(&InstalledSnapshot::new(installed), plugin, &identity);
+        (
+            Report::for_direct(&bundle, plugin, &identity, market),
+            allowed.then_some(plugin),
+        )
     }
 
     fn parsed_registry(source_field: &str) -> Vec<Installed> {
@@ -926,7 +932,7 @@ mod tests {
             "Marketplace cache, repository-wide",
             "License, security policy, archived state, external commands · Unknown",
             "Lock comparison does not authenticate the plugin.",
-            "Provenance uses local snapshots. The separate Changes check may contact GitHub.",
+            "Provenance uses local snapshots.",
         ] {
             assert!(text.contains(fact), "missing {fact}: {text}");
         }

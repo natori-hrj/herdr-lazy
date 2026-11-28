@@ -681,35 +681,13 @@ fn read_ui_bundle(path: &Path) -> Result<Option<Vec<String>>, BundleError> {
 }
 
 fn observe_bundle(refresh: bool) -> Result<ObservedBundle, BundleError> {
-    let (path, migrate) = match bundle_override() {
-        Some(path) => (path, false),
-        None => (
-            resolved_config_dir(refresh)
-                .map_err(BundleError::Location)?
-                .join("plugins.list"),
-            true,
-        ),
+    let path = match bundle_override() {
+        Some(path) => path,
+        None => resolved_config_dir(refresh)
+            .map_err(BundleError::Location)?
+            .join("plugins.list"),
     };
-    let mut contents = read_ui_bundle(&path)?;
-    if contents.is_none() && migrate {
-        let legacy = legacy_config_dir().join("plugins.list");
-        let copied = copy_legacy_bundle(&path, &legacy, |body| {
-            fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)?
-                .write_all(body.as_bytes())
-        });
-        match copied {
-            Ok(false) => {}
-            Ok(true) => contents = read_ui_bundle(&path)?,
-            // Another creator won the slot. Observe it, but never follow it for a write.
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                contents = read_ui_bundle(&path)?;
-            }
-            Err(error) => return Err(bundle_content_error(&path, error)),
-        }
-    }
+    let contents = read_ui_bundle(&path)?;
     Ok(ObservedBundle { path, contents })
 }
 
@@ -734,36 +712,23 @@ fn migrate_legacy_bundle_at(current: &Path, legacy: &Path) -> io::Result<()> {
     if current.exists() {
         return Ok(());
     }
-    copy_legacy_bundle(current, legacy, |body| {
-        ensure_parent(current)?;
-        write_local_text(current, body, "plugin list")
-    })?;
-    Ok(())
-}
-
-fn copy_legacy_bundle(
-    current: &Path,
-    legacy: &Path,
-    write: impl FnOnce(&str) -> io::Result<()>,
-) -> io::Result<bool> {
     if legacy == current {
-        return Ok(false);
+        return Ok(());
     }
-    // A known legacy entry that cannot be read is a failed migration, not absence.
-    match fs::symlink_metadata(legacy) {
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+    let body = match read_local_text(legacy, "legacy plugin list") {
+        Ok(body) => body,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
-    }
-    let body = read_local_text(legacy, "legacy plugin list")?;
-    write(&body)?;
+    };
+    ensure_parent(current)?;
+    write_local_text(current, &body, "plugin list")?;
     println!(
         "moved your plugin list to the location herdr uses:\n  {} -> {}\n  (the old copy is \
          left in place; delete it when you are happy)",
         legacy.display(),
         current.display()
     );
-    Ok(true)
+    Ok(())
 }
 
 /// "owner/repo" or "owner/repo/subdir" -> "repo"
