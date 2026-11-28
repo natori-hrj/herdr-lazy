@@ -5,8 +5,8 @@
 //! writers, or parent-directory changes. Identity checks catch some external path replacements,
 //! not in-place edits or changes between the last check and a filesystem operation.
 //! This is not a crash transaction: interruption can leave partial history or temporary files.
-//! Unix locks the directory inode, preserves ordinary permission bits and rejects special mode
-//! bits and extended ACLs on publication.
+//! Unix locks the directory inode, preserves ordinary permission bits, and rejects special mode
+//! bits, extended ACLs, and stages with different ownership from their source.
 //! Windows keeps a guard file in the directory. New files (including the guard) get the
 //! directory's normal file creation policy. Existing sources must match the stage's owner
 //! and DACL before any payload is written, or publication is refused. This does not copy
@@ -151,8 +151,8 @@ impl Stage {
         #[cfg(windows)]
         drop(file);
         #[cfg(unix)]
-        let written =
-            platform::check_private_stage(&file, &path).and_then(|()| file.write_all(bytes));
+        let written = platform::check_private_stage(&file, source, &path)
+            .and_then(|()| file.write_all(bytes));
         let stage = Self {
             path,
             id,
@@ -402,10 +402,24 @@ mod platform {
         Ok(mode)
     }
 
-    pub(super) fn check_private_stage(file: &File, path: &Path) -> io::Result<()> {
+    pub(super) fn check_private_stage(
+        file: &File,
+        source: Option<&Leaf>,
+        path: &Path,
+    ) -> io::Result<()> {
         check_stage_policy(file, path)?;
-        if mode(file)? & !PRIVATE_MODE != 0 {
+        let metadata = file.metadata()?;
+        if metadata.mode() & MODE_BITS & !PRIVATE_MODE != 0 {
             return Err(invalid(path, "stage mode is not private"));
+        }
+        if let Some(source) = source {
+            let original = source.file.metadata()?;
+            if (metadata.uid(), metadata.gid()) != (original.uid(), original.gid()) {
+                return Err(invalid(
+                    path,
+                    "stage cannot preserve the source owner and group",
+                ));
+            }
         }
         Ok(())
     }
