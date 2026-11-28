@@ -324,19 +324,32 @@ fn registry_identity(plugin: &Installed) -> RegistryIdentity {
     }
 }
 
-// Dispatch uses the registry ID, not the display name or repository. A conflicting ID anywhere
-// in the snapshot makes even an otherwise exact scope unsafe to address.
-fn unique_id(plugin: &Installed, installed: &[Installed]) -> bool {
-    let id = &plugin.plugin_id;
-    !id.is_empty()
-        && !id.starts_with('-')
-        && !matches!(id.as_str(), "." | "..")
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-        && !installed
-            .iter()
-            .any(|other| !std::ptr::eq(other, plugin) && other.plugin_id == *id)
+pub(crate) struct InstalledSnapshot<'a> {
+    records: &'a [Installed],
+    id_counts: HashMap<&'a str, usize>,
+}
+
+impl<'a> InstalledSnapshot<'a> {
+    pub(crate) fn new(records: &'a [Installed]) -> Self {
+        let mut id_counts = HashMap::with_capacity(records.len());
+        // Dispatch uses exact registry IDs, not display names or repositories. Count even
+        // records that cannot supply evidence: they can still make an ID unsafe to address.
+        for record in records {
+            *id_counts.entry(record.plugin_id.as_str()).or_insert(0) += 1;
+        }
+        Self { records, id_counts }
+    }
+
+    fn unique_id(&self, plugin: &Installed) -> bool {
+        let id = plugin.plugin_id.as_str();
+        !id.is_empty()
+            && !id.starts_with('-')
+            && !matches!(id, "." | "..")
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            && self.id_counts.get(id) == Some(&1)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -430,7 +443,7 @@ impl BundleEvidence {
     pub(crate) fn for_row<'a>(
         &self,
         index: usize,
-        installed: &'a [Installed],
+        installed: &InstalledSnapshot<'a>,
         operational_hit: Option<&Installed>,
         market: &[registry::Entry],
     ) -> (Report, Option<&'a Installed>) {
@@ -444,11 +457,11 @@ impl BundleEvidence {
 
     pub(crate) fn for_direct<'a>(
         &self,
-        plugin: &'a Installed,
-        installed: &[Installed],
+        index: usize,
+        installed: &InstalledSnapshot<'a>,
         market: &[registry::Entry],
     ) -> (Report, Option<&'a Installed>) {
-        let (mut report, authorized) = Report::for_install(plugin, installed, market);
+        let (mut report, authorized) = Report::for_install(index, installed, market);
         report.direct_bundle_ref_blocked = report
             .repository
             .as_ref()
@@ -483,7 +496,7 @@ impl Report {
     /// A unique registry fact need not be the record the operational matcher chose.
     fn from_bundle_entry<'a>(
         entry: Option<&EntryRecord>,
-        installed: &'a [Installed],
+        installed: &InstalledSnapshot<'a>,
         operational_hit: Option<&Installed>,
         market: &[registry::Entry],
     ) -> (Self, Option<&'a Installed>) {
@@ -494,7 +507,8 @@ impl Report {
             ),
             None => (None, RefEvidence::Absent),
         };
-        if installed.iter().any(|p| p.registry_duplicate_observed) {
+        let records = installed.records;
+        if records.iter().any(|p| p.registry_duplicate_observed) {
             return (
                 Self::from_evidence(repository, requested, None, market),
                 None,
@@ -504,7 +518,7 @@ impl Report {
         let root = wanted.map(crate::repo_root);
         let mut evidence = None;
         let mut ambiguous_or_conflicting = false;
-        for plugin in installed {
+        for plugin in records {
             match registry_identity(plugin) {
                 RegistryIdentity::Known(slug, _) => {
                     if wanted == Some(slug.as_str()) {
@@ -532,7 +546,7 @@ impl Report {
         };
         let authorized = evidence.filter(|plugin| {
             operational_hit.is_some_and(|hit| std::ptr::eq(hit, *plugin))
-                && unique_id(plugin, installed)
+                && installed.unique_id(plugin)
                 && requested.accepted()
         });
         (
@@ -548,20 +562,22 @@ impl Report {
         operational_hit: Option<&Installed>,
         market: &[registry::Entry],
     ) -> (Self, Option<&'a Installed>) {
-        BundleEvidence::new([displayed_spec]).for_row(0, installed, operational_hit, market)
+        let installed = InstalledSnapshot::new(installed);
+        BundleEvidence::new([displayed_spec]).for_row(0, &installed, operational_hit, market)
     }
 
     fn for_install<'a>(
-        plugin: &'a Installed,
-        installed: &[Installed],
+        index: usize,
+        installed: &InstalledSnapshot<'a>,
         market: &[registry::Entry],
     ) -> (Self, Option<&'a Installed>) {
+        let plugin = &installed.records[index];
         if plugin.registry_duplicate_observed {
             return (Self::default(), None);
         }
         let identity = registry_identity(plugin);
         let authorized = (!matches!(identity, RegistryIdentity::Conflict { .. })
-            && unique_id(plugin, installed))
+            && installed.unique_id(plugin))
         .then_some(plugin);
         let report = match identity {
             RegistryIdentity::Known(slug, source) => Self::from_evidence(
@@ -780,6 +796,13 @@ mod tests {
         Report::for_bundle(&desired.display(), installed, installed.first(), market).0
     }
 
+    fn direct<'a>(
+        installed: &'a [Installed],
+        market: &[registry::Entry],
+    ) -> (Report, Option<&'a Installed>) {
+        Report::for_install(0, &InstalledSnapshot::new(installed), market)
+    }
+
     fn parsed_registry(source_field: &str) -> Vec<Installed> {
         crate::parse_plugin_list(&format!(
             r#"{{"result":{{"plugins":[{{"plugin_id":"fixture.plugin","enabled":false,
@@ -813,7 +836,7 @@ mod tests {
                 Report::for_bundle(&spec.display(), &records, Some(plugin), &[]);
             assert_eq!(report.resolved, None, "{kind}");
             assert!(payload.is_none(), "{kind}");
-            let (report, payload) = Report::for_install(plugin, &records, &[]);
+            let (report, payload) = direct(&records, &[]);
             assert_eq!(report.repository, None, "{kind}");
             assert_eq!(report.resolved, None, "{kind}");
             assert!(payload.is_none(), "{kind}");
@@ -836,7 +859,7 @@ mod tests {
                 let plugin = &records[0];
                 assert_eq!(plugin.installed_unix_ms, Some(123));
                 assert_eq!(plugin.resolved_commit.as_deref(), Some(SHA));
-                let (report, payload) = Report::for_install(plugin, &records, &[]);
+                let (report, payload) = direct(&records, &[]);
                 assert!(payload.is_none(), "{kind}{url}");
                 assert_eq!(report.resolved, None, "{kind}{url}");
                 assert_eq!(report.installed_ms, None, "{kind}{url}");
@@ -862,7 +885,7 @@ mod tests {
             r#"{"kind":"local","owner":"owner","repo":"plugin"}"#,
         ] {
             let records = parsed_registry(&format!(r#","source":{source}"#));
-            let (report, payload) = Report::for_install(&records[0], &records, &[]);
+            let (report, payload) = direct(&records, &[]);
             assert!(payload.is_none(), "{source}");
             assert_eq!(report.source, None, "{source}");
         }
@@ -878,7 +901,7 @@ mod tests {
         ] {
             let records = parsed_registry(source_field);
             let plugin = &records[0];
-            let (report, payload) = Report::for_install(plugin, &records, &[]);
+            let (report, payload) = direct(&records, &[]);
             assert_eq!(report.repository, None, "{source_field}");
             assert_eq!(report.source, expected_provenance, "{source_field}");
             let payload = payload.expect("a unique ID can authorize a direct payload");
@@ -936,7 +959,7 @@ mod tests {
         report.set_lock(Some(&format!("owner/plugin@{SHA}")));
         assert_eq!(report.lock_ref, None);
 
-        let mut root = Report::for_install(&installed("Owner/Plugin", SHA), &[], &[]).0;
+        let mut root = direct(&[installed("Owner/Plugin", SHA)], &[]).0;
         root.set_lock(Some(&format!(
             "https://github.com/OWNER/plugin.git@{SHA}\nowner/PLUGIN@{SHA}"
         )));
@@ -1069,10 +1092,9 @@ mod tests {
             ))
             .unwrap();
             let conflict = installed.into_iter().next().unwrap();
-            let (direct, payload) =
-                Report::for_install(&conflict, std::slice::from_ref(&conflict), &[]);
-            assert_eq!(direct.repository, None, "{url:?}");
-            assert_eq!(direct.resolved, None, "{url:?}");
+            let (report, payload) = direct(std::slice::from_ref(&conflict), &[]);
+            assert_eq!(report.repository, None, "{url:?}");
+            assert_eq!(report.resolved, None, "{url:?}");
             assert!(payload.is_none(), "{url:?}");
             // A contradictory claim for this entry is not repaired by selecting another row.
             let records = [exact.clone(), conflict];
@@ -1104,7 +1126,7 @@ mod tests {
         let upper = SHA.to_ascii_uppercase();
         let different = "f".repeat(40);
         let report_for = |resolved: &str, locked: &str| {
-            let mut report = Report::for_install(&installed("owner/plugin", resolved), &[], &[]).0;
+            let mut report = direct(&[installed("owner/plugin", resolved)], &[]).0;
             report.set_lock(Some(&format!("owner/plugin@{locked}")));
             report
         };
@@ -1176,7 +1198,7 @@ mod tests {
         }
         assert!(!text.contains("fixture-private") && !text.contains("credential"));
 
-        let local = Report::for_install(&plugin, std::slice::from_ref(&plugin), &market).0;
+        let local = direct(std::slice::from_ref(&plugin), &market).0;
         assert_eq!(local.source, Some("Local link"));
         assert_eq!(local.repository, None);
         assert!(safe_ref(&"a".repeat(129)).is_none());

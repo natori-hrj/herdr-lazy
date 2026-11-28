@@ -663,6 +663,7 @@ fn rows_with_herdr_version(
     let mut rows = Vec::new();
     let displays: Vec<_> = desired.iter().map(Spec::display).collect();
     let bundle = crate::plugin_trust::BundleEvidence::new(displays.iter().map(String::as_str));
+    let snapshot = crate::plugin_trust::InstalledSnapshot::new(installed);
 
     for (index, (spec, display)) in desired.iter().zip(displays).enumerate() {
         let hit = installed
@@ -684,7 +685,7 @@ fn rows_with_herdr_version(
                 (status, commit)
             }
         };
-        let (trust, authorized) = bundle.for_row(index, installed, hit.map(|(p, _)| p), market);
+        let (trust, authorized) = bundle.for_row(index, &snapshot, hit.map(|(p, _)| p), market);
         rows.push(Row {
             label: display.clone(),
             commit,
@@ -705,12 +706,12 @@ fn rows_with_herdr_version(
         });
     }
 
-    for p in installed {
+    for (index, p) in installed.iter().enumerate() {
         let claimed = desired.iter().any(|s| p.matches(s) != Match::None);
         if claimed {
             continue;
         }
-        let (trust, authorized) = bundle.for_direct(p, installed, market);
+        let (trust, authorized) = bundle.for_direct(index, &snapshot, market);
         rows.push(Row {
             label: p.slug.clone().unwrap_or_else(|| p.plugin_id.clone()),
             commit: p.resolved_commit.clone(),
@@ -5262,6 +5263,30 @@ mod tests {
                 .lines()
                 .contains(&"Resolved revision · Unknown".to_string()));
             assert!(r[0].plugin_detail().is_none());
+        }
+    }
+
+    #[test]
+    fn row_payload_ids_are_unique_across_the_snapshot_and_case_sensitive() {
+        let desired = [Spec::parse("owner/plugin")];
+        let exact = github("owner", "plugin", SHA, true);
+        for (id, unique) in [("plugin", false), ("Plugin", true)] {
+            let mut malformed = local(id);
+            malformed.name = "unrelated".into();
+            malformed.source_scope = crate::plugin_trust::SourceScope::Invalid(None);
+            for candidates in [
+                [exact.clone(), malformed.clone()],
+                [malformed, exact.clone()],
+            ] {
+                for specs in [&[][..], &desired[..]] {
+                    let r = rows(specs, &candidates);
+                    let row = r
+                        .iter()
+                        .find(|row| row.slug.as_deref() == Some("owner/plugin"))
+                        .unwrap();
+                    assert_eq!(row.plugin_detail().is_some(), unique, "{id}, {specs:?}");
+                }
+            }
         }
     }
 
