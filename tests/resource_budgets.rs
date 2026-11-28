@@ -287,3 +287,124 @@ fn update_inventory_failure_does_not_rotate_a_valid_lock() {
     );
     fs::remove_dir_all(root).unwrap();
 }
+
+fn lock_command(root: &Path, list: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_herdr-lazy"));
+    command
+        .env("HERDR_LAZY_LIST", list)
+        .env("HERDR_BIN_PATH", root.join("herdr"));
+    command
+}
+
+#[test]
+fn cooperating_lock_invocations_keep_each_published_generation() {
+    use std::process::Stdio;
+
+    let root = fixture_root("concurrent-lock");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    write_executable(
+        &root.join("herdr"),
+        "#!/bin/sh\nprintf '%s' '{\"result\":{\"plugins\":[]}}'\n",
+    );
+    fs::write(root.join("plugins.lock"), "owner/original\n").unwrap();
+
+    let expected = ["owner/one", "owner/two", "owner/three", "owner/four"];
+    let mut children = Vec::new();
+    for (index, body) in expected.iter().enumerate() {
+        let list = root.join(format!("bundle-{index}.list"));
+        fs::write(&list, format!("{body}\n")).unwrap();
+        children.push(
+            lock_command(&root, &list)
+                .arg("lock")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+    }
+    for child in children {
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let mut actual: Vec<_> = [
+        "plugins.lock",
+        "plugins.lock.1",
+        "plugins.lock.2",
+        "plugins.lock.3",
+    ]
+    .iter()
+    .map(|name| {
+        fs::read_to_string(root.join(name))
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap()
+            .to_owned()
+    })
+    .collect();
+    actual.sort();
+    let mut expected = expected;
+    expected.sort();
+    assert_eq!(
+        actual.iter().map(String::as_str).collect::<Vec<_>>(),
+        expected
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn lock_and_both_restore_commands_reject_linked_lock_leaves() {
+    use std::os::unix::fs::{symlink, MetadataExt};
+
+    let root = fixture_root("linked-locks");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    write_executable(
+        &root.join("herdr"),
+        "#!/bin/sh\nprintf '%s' '{\"result\":{\"plugins\":[]}}'\n",
+    );
+    let list = root.join("plugins.list");
+    let active = root.join("plugins.lock");
+    let prev = root.join("plugins.lock.1");
+    let other = root.join("external");
+    fs::write(&list, "owner/plugin\n").unwrap();
+    fs::write(&other, "owner/external\n").unwrap();
+
+    for (leaf, target, hardlink) in [
+        (&active, "plugins.lock.1", false),
+        (&prev, "plugins.lock", false),
+        (&prev, "external", false),
+        (&active, "external", true),
+    ] {
+        if hardlink {
+            fs::hard_link(root.join(target), leaf).unwrap();
+        } else {
+            symlink(target, leaf).unwrap();
+        }
+        let before = fs::symlink_metadata(leaf).unwrap();
+        for args in [&["lock"][..], &["restore"], &["restore", "--previous"]] {
+            let output = lock_command(&root, &list).args(args).output().unwrap();
+            assert!(!output.status.success(), "unexpected success for {args:?}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("independent regular file"), "{stderr}");
+            let after = fs::symlink_metadata(leaf).unwrap();
+            assert_eq!((after.ino(), after.nlink()), (before.ino(), before.nlink()));
+            if !hardlink {
+                assert_eq!(fs::read_link(leaf).unwrap(), Path::new(target));
+            }
+            let absent = if leaf == &active { &prev } else { &active };
+            assert_eq!(
+                fs::symlink_metadata(absent).unwrap_err().kind(),
+                std::io::ErrorKind::NotFound
+            );
+            assert_eq!(fs::read(&other).unwrap(), b"owner/external\n");
+        }
+        fs::remove_file(leaf).unwrap();
+    }
+    fs::remove_dir_all(root).unwrap();
+}

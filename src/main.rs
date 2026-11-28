@@ -30,6 +30,7 @@ mod extras;
 mod github;
 mod herdr_output;
 mod json;
+mod lockfile;
 mod machine;
 mod plugin_trust;
 mod profile;
@@ -125,7 +126,7 @@ fn validate_local_text_size(body: &[u8], label: &str, path: &Path) -> io::Result
 
 fn write_local_text(path: &Path, body: &str, label: &str) -> io::Result<()> {
     validate_local_text_size(body.as_bytes(), label, path)?;
-    write_bytes_atomically(path, body.as_bytes())
+    fs::write(path, body)
 }
 
 /// Curated "batteries-included" default set — the distro layer.
@@ -245,12 +246,10 @@ fn lock_beside(list: &Path) -> PathBuf {
     list.with_file_name("plugins.lock")
 }
 
-/// Keep a short, file-based history of lockfile contents next to the active lock.
-///
-/// Three generations are enough to undo a recent bad sync without turning the config
-/// directory into an unbounded archive. The suffix is deliberately part of the filename so
-/// the snapshots remain easy to inspect and copy by hand.
-const MAX_PREVIOUS_LOCKFILES: usize = 3;
+#[cfg(test)]
+use lockfile::MAX_PREVIOUS_LOCKFILES;
+use lockfile::{lock_history_beside, write_lock_contents};
+
 static LOCK_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn lock_file_name(lock: &Path) -> String {
@@ -259,119 +258,11 @@ fn lock_file_name(lock: &Path) -> String {
         .unwrap_or_else(|| "plugins.lock".to_string())
 }
 
-fn lock_history_beside(lock: &Path, generation: usize) -> PathBuf {
-    assert!((1..=MAX_PREVIOUS_LOCKFILES).contains(&generation));
-    lock.with_file_name(format!("{}.{}", lock_file_name(lock), generation))
-}
-
-fn previous_lock_path() -> PathBuf {
-    lock_history_beside(&lock_path(), 1)
-}
-
 fn remove_file_if_present(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
-    }
-}
-
-fn history_slot_metadata(path: &Path) -> io::Result<Option<fs::Metadata>> {
-    // Generated slots must be independent directory entries, not symlinks (even dangling ones).
-    // Regular hard links are fine: replacement never writes into their shared inode.
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() => Ok(Some(metadata)),
-        Ok(_) => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "plugin lock history {} is not a regular file",
-                path.display()
-            ),
-        )),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
-    }
-}
-
-fn optional_history_contents(path: &Path, active_path: &Path) -> io::Result<Option<Vec<u8>>> {
-    if history_slot_metadata(path)?.is_none() {
-        return Ok(None);
-    }
-    if fs::canonicalize(path)? == active_path {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("plugin lock history {} is the active lock", path.display()),
-        ));
-    }
-    match open_local_regular_file(path, "plugin lock history") {
-        Ok(file) => read_limited(file, MAX_LOCAL_INPUT_BYTES)?
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "plugin lock history {} exceeds {} bytes",
-                        path.display(),
-                        MAX_LOCAL_INPUT_BYTES
-                    ),
-                )
-            })
-            .map(Some),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
-    }
-}
-
-fn replace_history_slot(path: &Path, contents: Option<&[u8]>) -> io::Result<()> {
-    let permissions = history_slot_metadata(path)?.map(|metadata| metadata.permissions());
-    match contents {
-        Some(bytes) => write_atomic_replacement(path, bytes, permissions),
-        None => remove_file_if_present(path),
-    }
-}
-
-fn restore_lock_history(lock: &Path, previous: &[Option<Vec<u8>>]) -> io::Result<()> {
-    for (index, contents) in previous.iter().enumerate() {
-        replace_history_slot(&lock_history_beside(lock, index + 1), contents.as_deref())?;
-    }
-    Ok(())
-}
-
-/// Shift validated snapshots back one slot, then save the active lock into `.1`.
-///
-/// Every source is captured before the first write. If validation or a history operation fails,
-/// the caller can leave the current lock untouched instead of losing the only known-good state.
-fn rotate_lock_history(lock: &Path, active: &[u8]) -> io::Result<Vec<Option<Vec<u8>>>> {
-    let active_path = fs::canonicalize(lock)?;
-    let previous: Vec<Option<Vec<u8>>> = (1..=MAX_PREVIOUS_LOCKFILES)
-        .map(|generation| {
-            optional_history_contents(&lock_history_beside(lock, generation), &active_path)
-        })
-        .collect::<io::Result<_>>()?;
-
-    let result = (|| {
-        for generation in (2..=MAX_PREVIOUS_LOCKFILES).rev() {
-            let destination = lock_history_beside(lock, generation);
-            replace_history_slot(&destination, previous[generation - 2].as_deref())?;
-        }
-        replace_history_slot(&lock_history_beside(lock, 1), Some(active))
-    })();
-
-    match result {
-        Ok(()) => Ok(previous),
-        Err(error) => {
-            // The active lock was never touched. Restore all snapshot slots as well, so a
-            // failed rotation is a no-op from the user's point of view.
-            if let Err(rollback) = restore_lock_history(lock, &previous) {
-                return Err(io::Error::new(
-                    rollback.kind(),
-                    format!(
-                        "lock history rotation failed: {}; rollback failed: {}",
-                        error, rollback
-                    ),
-                ));
-            }
-            Err(error)
-        }
     }
 }
 
@@ -475,157 +366,36 @@ fn replace_lock(path: &Path, temporary: &Path) -> io::Result<()> {
 }
 
 pub(crate) fn write_bytes_atomically(path: &Path, body: &[u8]) -> io::Result<()> {
-    let path = atomic_write_destination(path)?;
-    let permissions = fs::metadata(&path)
-        .ok()
-        .map(|metadata| metadata.permissions());
-    write_atomic_replacement(&path, body, permissions)
-}
-
-fn create_atomic_temp(
-    path: &Path,
-    options: &mut fs::OpenOptions,
-) -> io::Result<(PathBuf, fs::File)> {
-    options.write(true).create_new(true);
-    loop {
+    let temporary = loop {
         let candidate = lock_temp_path(path);
-        match options.open(&candidate) {
-            Ok(file) => return Ok((candidate, file)),
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(body) {
+                    drop(file);
+                    let _ = remove_file_if_present(&candidate);
+                    return Err(error);
+                }
+                break candidate;
+            }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         }
-    }
-}
-
-fn create_atomic_stage(path: &Path) -> io::Result<(PathBuf, fs::File)> {
-    let mut options = fs::OpenOptions::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    create_atomic_temp(path, &mut options)
-}
-
-/// Publish at this exact leaf. Only the caller decides whether to resolve symlinks.
-fn write_atomic_replacement(
-    path: &Path,
-    body: &[u8],
-    permissions: Option<fs::Permissions>,
-) -> io::Result<()> {
-    #[cfg(unix)]
-    let permissions = match permissions {
-        Some(permissions) => Some(permissions),
-        None => {
-            // Measure the normal creation mode in this directory without changing the process
-            // umask. The probe stays empty; no reader can acquire an early fd to the actual stage.
-            let (probe_path, probe) = create_atomic_temp(path, &mut fs::OpenOptions::new())?;
-            let permissions = probe.metadata().map(|metadata| metadata.permissions());
-            drop(probe);
-            remove_file_if_present(&probe_path)?;
-            Some(permissions?)
-        }
     };
-
-    let (temporary, mut file) = create_atomic_stage(path)?;
-    let written = file.write_all(body);
-    drop(file);
-    let result = written.and_then(|()| {
-        if let Some(permissions) = permissions {
-            fs::set_permissions(&temporary, permissions)?;
+    if let Ok(metadata) = fs::metadata(path) {
+        if let Err(error) = fs::set_permissions(&temporary, metadata.permissions()) {
+            let _ = remove_file_if_present(&temporary);
+            return Err(error);
         }
-        replace_lock(path, &temporary)
-    });
+    }
+    let result = replace_lock(path, &temporary);
     if result.is_err() {
         let _ = remove_file_if_present(&temporary);
     }
     result
-}
-
-/// Resolve only the destination leaf before an atomic replacement.
-///
-/// Dotfile managers commonly make `config.toml` or `plugins.list` a relative symlink. Renaming
-/// over that path replaces the link itself, so follow a bounded link chain and atomically replace
-/// the final target instead. Resolving before creating the temporary file also leaves every link
-/// untouched if preparation or replacement fails.
-fn atomic_write_destination(path: &Path) -> io::Result<PathBuf> {
-    const MAX_SYMLINKS: usize = 40;
-    let mut destination = path.to_path_buf();
-    for _ in 0..MAX_SYMLINKS {
-        match fs::symlink_metadata(&destination) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                let target = fs::read_link(&destination)?;
-                destination = if target.is_absolute() {
-                    target
-                } else {
-                    destination
-                        .parent()
-                        .unwrap_or_else(|| Path::new(""))
-                        .join(target)
-                };
-            }
-            Ok(_) => return Ok(destination),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(destination),
-            Err(error) => return Err(error),
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!("too many symbolic links while resolving {}", path.display()),
-    ))
-}
-
-fn write_lock_atomically(path: &Path, body: &str) -> io::Result<()> {
-    write_bytes_atomically(path, body.as_bytes())
-}
-
-/// Write a lock and rotate its history only when the contents actually change.
-///
-/// The boolean says whether a new active file was written. A no-op sync therefore preserves
-/// both the current file and every historical snapshot.
-fn write_lock_contents(path: &Path, body: &str) -> io::Result<bool> {
-    validate_local_text_size(body.as_bytes(), "plugin lock", path)?;
-    let current = match open_local_regular_file(path, "plugin lock") {
-        Ok(file) => Some(read_limited(file, MAX_LOCAL_INPUT_BYTES)?.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "plugin lock {} exceeds {} bytes",
-                    path.display(),
-                    MAX_LOCAL_INPUT_BYTES
-                ),
-            )
-        })?),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e),
-    };
-    if current.as_deref() == Some(body.as_bytes()) {
-        return Ok(false);
-    }
-
-    let previous = if current.is_some() {
-        Some(rotate_lock_history(
-            path,
-            current.as_deref().expect("current lock was read"),
-        )?)
-    } else {
-        None
-    };
-    if let Err(error) = write_lock_atomically(path, body) {
-        if let Some(previous) = previous {
-            if let Err(rollback) = restore_lock_history(path, &previous) {
-                return Err(io::Error::new(
-                    rollback.kind(),
-                    format!(
-                        "lock write failed: {}; history rollback failed: {}",
-                        error, rollback
-                    ),
-                ));
-            }
-        }
-        return Err(error);
-    }
-    Ok(true)
 }
 
 fn ensure_parent(p: &Path) -> io::Result<()> {
@@ -1545,11 +1315,7 @@ fn cmd_init(
     } else {
         base
     };
-    // Reading a list before it becomes your file is the point; this is the scriptable half.
-    //
-    // An adopted body is written verbatim and gets its extras from a second pass further down,
-    // so they have to be printed here too. `default_bundle_body` already contains them, which
-    // is why this only runs on the adopted path — printing both ways listed pluck twice.
+    // Preview the same complete proposal that a real invocation would write.
     if dry_run {
         print!("{}", proposal);
         return Ok(());
@@ -1720,8 +1486,8 @@ fn cmd_list() -> io::Result<()> {
 /// writing the lock from it would drop every entry it did not look at.
 /// Read a lockfile as a set of specs, preserving I/O errors for callers that need to explain
 /// whether the file is missing or inaccessible.
-fn lock_specs_from(path: &Path) -> io::Result<Vec<Spec>> {
-    let body = read_local_text(path, "plugin lock")?;
+fn lock_specs_from(path: &Path, previous: bool) -> io::Result<Vec<Spec>> {
+    let body = lockfile::read_text(path, previous)?;
     Ok(body
         .lines()
         .map(str::trim)
@@ -1759,20 +1525,39 @@ fn restore_from_lock(
     previous: bool,
     installed: Option<Vec<Installed>>,
 ) -> io::Result<()> {
-    let all = match lock_specs_from(path) {
+    let display_path = if previous {
+        lock_history_beside(path, 1)
+    } else {
+        path.to_owned()
+    };
+    let all = match lock_specs_from(path, previous) {
         Ok(all) if !all.is_empty() => all,
         Ok(_) => {
-            print_missing_lock(path, previous);
+            print_missing_lock(&display_path, previous);
             return Ok(());
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            print_missing_lock(path, previous);
+            print_missing_lock(&display_path, previous);
             return Ok(());
         }
         Err(e) => return Err(e),
     };
     if previous {
-        println!("restoring from previous lockfile -> {}", path.display());
+        println!(
+            "restoring from previous lockfile -> {}",
+            display_path.display()
+        );
+    }
+    restore_lock_specs(&all, targets, installed)
+}
+
+fn restore_lock_specs(
+    all: &[Spec],
+    targets: &[&str],
+    installed: Option<Vec<Installed>>,
+) -> io::Result<()> {
+    if all.is_empty() {
+        return Ok(());
     }
     let unpinned = all.iter().filter(|s| s.reference.is_none()).count();
     if unpinned > 0 {
@@ -1784,8 +1569,8 @@ fn restore_from_lock(
         );
     }
     match installed {
-        Some(installed) => converge_with_installed(&all, targets, false, false, installed),
-        None => converge(&all, targets, false, false),
+        Some(installed) => converge_with_installed(all, targets, false, false, installed),
+        None => converge(all, targets, false, false),
     }
 }
 
@@ -1800,8 +1585,7 @@ pub(crate) fn cmd_restore(targets: &[&str]) -> io::Result<()> {
 /// escape hatch for undoing a recent sync. Keeping the active file untouched also means the
 /// user can inspect the result and choose whether to make the rollback permanent.
 fn cmd_restore_previous(targets: &[&str]) -> io::Result<()> {
-    let path = previous_lock_path();
-    restore_from_lock(&path, targets, true, None)
+    restore_from_lock(&lock_path(), targets, true, None)
 }
 
 pub(crate) fn cmd_sync(prune: bool, targets: &[&str]) -> io::Result<()> {
@@ -1858,20 +1642,20 @@ pub(crate) fn cmd_sync_profile(profile: &profile::WorkspaceProfile) -> io::Resul
 
 /// Restore the exact versions recorded by a workspace profile lockfile.
 pub(crate) fn cmd_restore_profile(profile: &profile::WorkspaceProfile) -> io::Result<()> {
-    let current = profile::discover_at(&profile.root).map_err(|error| {
+    let current = profile::discover_with_lock_at(&profile.root).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("workspace profile is no longer valid: {}", error),
         )
     })?;
-    let Some(current) = current else {
+    let Some((current, lock_specs)) = current else {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "workspace profile was removed before restore",
         ));
     };
     match current.lock_status {
-        profile::LockStatus::Ready(_) => restore_from_lock(&current.lock_path, &[], false, None),
+        profile::LockStatus::Ready(_) => restore_lock_specs(&lock_specs, &[], None),
         profile::LockStatus::Missing => Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
@@ -2572,7 +2356,9 @@ enum BootstrapResult {
 
 fn write_first_run_list(path: &Path) -> io::Result<()> {
     ensure_parent(path)?;
-    write_local_text(path, &default_bundle_body(&[]), "plugin list")
+    let body = default_bundle_body(&[]);
+    validate_local_text_size(body.as_bytes(), "plugin list", path)?;
+    write_bytes_atomically(path, body.as_bytes())
 }
 
 fn pending_default_plugin_count() -> usize {
@@ -3287,14 +3073,10 @@ fn bind_action_at(
     // Back up only after the complete proposal passes validation. Same name every time: one
     // restore point is enough, and a rejected bind must preserve both config and prior backup.
     if !existing.is_empty() {
-        let _ = write_bytes_atomically(
-            &path.with_extension("toml.herdr-lazy-backup"),
-            existing.as_bytes(),
-        );
+        let _ = fs::write(path.with_extension("toml.herdr-lazy-backup"), &existing);
     }
 
-    write_local_text(path, &body, "Herdr config")
-        .map_err(|e| format!("could not write config.toml: {}", e))?;
+    fs::write(path, body).map_err(|e| format!("could not write config.toml: {}", e))?;
 
     // Ask herdr to pick it up; without this the binding does nothing until the next restart.
     let reloaded = matches!(run_herdr(&["server", "reload-config"]), Ok((true, _, _)));
@@ -3781,7 +3563,8 @@ fn merge_specs_into_list(path: &Path, specs: &[Spec]) -> io::Result<ListMergeRes
     ensure_parent(path)?;
     let mut body = lines.join("\n");
     body.push('\n');
-    write_local_text(path, &body, "plugin list")?;
+    validate_local_text_size(body.as_bytes(), "plugin list", path)?;
+    write_bytes_atomically(path, body.as_bytes())?;
     Ok(result)
 }
 
@@ -4793,6 +4576,25 @@ command = "something.else"
     }
 
     #[test]
+    fn hardlinked_history_rejects_noop_and_restore_without_touching_the_family() {
+        let lock = scratch_lock("hardlinked-history");
+        let history = lock_history_beside(&lock, 1);
+        let external = lock.with_file_name("external");
+        fs::write(&lock, "owner/current\n").unwrap();
+        fs::write(&external, "owner/old\n").unwrap();
+        fs::hard_link(&external, &history).unwrap();
+
+        let error = write_lock_contents(&lock, "owner/current\n").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let error = lock_specs_from(&lock, true).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&lock).unwrap(), b"owner/current\n");
+        assert_eq!(fs::read(&history).unwrap(), b"owner/old\n");
+        assert_eq!(fs::read(&external).unwrap(), b"owner/old\n");
+        clean_scratch_lock(&lock);
+    }
+
+    #[test]
     fn oversized_lock_write_preserves_active_and_history() {
         let lock = scratch_lock("oversized-write");
         let history = lock_history_beside(&lock, 1);
@@ -4952,12 +4754,13 @@ command = "something.else"
 
     #[cfg(unix)]
     #[test]
-    fn atomic_text_write_updates_relative_symlink_target_without_replacing_link() {
-        use std::os::unix::fs::symlink;
+    fn bounded_direct_list_write_keeps_existing_symlink_and_inode() {
+        use std::os::unix::fs::{symlink, MetadataExt};
 
         let list = scratch_lock("symlink-write").with_file_name("plugins.list");
         let target = list.with_file_name("dotfiles.list");
         fs::write(&target, "old\n").unwrap();
+        let original = fs::metadata(&target).unwrap().ino();
         symlink("dotfiles.list", &list).unwrap();
 
         write_local_text(&list, "new\n", "plugin list").unwrap();
@@ -4968,38 +4771,33 @@ command = "something.else"
             .is_symlink());
         assert_eq!(fs::read_link(&list).unwrap(), Path::new("dotfiles.list"));
         assert_eq!(fs::read_to_string(&target).unwrap(), "new\n");
+        assert_eq!(fs::metadata(&target).unwrap().ino(), original);
         clean_scratch_lock(&list);
     }
 
     #[cfg(unix)]
     #[test]
-    fn atomic_write_stages_privately_and_preserves_final_modes() {
-        use std::os::unix::fs::PermissionsExt;
+    fn legacy_atomic_writer_replaces_the_leaf_not_the_symlink_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
 
         let path = scratch_lock("atomic-modes");
-        let ordinary = path.with_file_name("ordinary");
-        fs::write(&ordinary, "ordinary\n").unwrap();
+        let target = path.with_file_name("target");
+        fs::write(&target, "old\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o400)).unwrap();
+        symlink("target", &path).unwrap();
         let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
 
-        let (temporary, stage) = create_atomic_stage(&path).unwrap();
-        assert_eq!(stage.metadata().unwrap().len(), 0);
-        assert_eq!(mode(&temporary) & 0o077, 0);
-        drop(stage);
-        fs::remove_file(temporary).unwrap();
-
-        write_bytes_atomically(&path, b"first\n").unwrap();
-        assert_eq!(mode(&path), mode(&ordinary));
-
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
         write_bytes_atomically(&path, b"private\n").unwrap();
+        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_file());
         assert_eq!(mode(&path), 0o400);
         assert_eq!(fs::read(&path).unwrap(), b"private\n");
+        assert_eq!(fs::read(&target).unwrap(), b"old\n");
         clean_scratch_lock(&path);
     }
 
     #[cfg(unix)]
     #[test]
-    fn failed_atomic_replacement_preserves_symlink_and_target() {
+    fn failed_direct_write_preserves_symlink_and_target() {
         use std::os::unix::fs::symlink;
 
         let list = scratch_lock("symlink-write-error").with_file_name("plugins.list");
@@ -5022,7 +4820,7 @@ command = "something.else"
         assert_eq!(
             entries.len(),
             2,
-            "failed write must clean its temporary file"
+            "failed direct write must not create another entry"
         );
         clean_scratch_lock(&list);
     }
@@ -5111,11 +4909,11 @@ command = "something.else"
         .unwrap();
 
         assert_eq!(
-            lock_specs_from(&lock_history_beside(&lock, 1)).unwrap(),
+            lock_specs_from(&lock, true).unwrap(),
             vec![Spec::parse("owner/old@2222222")]
         );
         assert_eq!(
-            lock_specs_from(&lock).unwrap(),
+            lock_specs_from(&lock, false).unwrap(),
             vec![Spec::parse("owner/current@1111111")]
         );
         clean_scratch_lock(&lock);
@@ -5133,13 +4931,7 @@ command = "something.else"
         )
         .unwrap();
 
-        restore_from_lock(
-            &previous,
-            &[],
-            true,
-            Some(vec![from_github("owner", "repo")]),
-        )
-        .unwrap();
+        restore_from_lock(&lock, &[], true, Some(vec![from_github("owner", "repo")])).unwrap();
 
         assert_eq!(fs::read_to_string(&lock).unwrap(), active_body);
         clean_scratch_lock(&lock);
@@ -5148,7 +4940,7 @@ command = "something.else"
     #[test]
     fn a_missing_lockfile_returns_not_found() {
         let lock = scratch_lock("missing");
-        let error = lock_specs_from(&lock).unwrap_err();
+        let error = lock_specs_from(&lock, false).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         clean_scratch_lock(&lock);
     }
