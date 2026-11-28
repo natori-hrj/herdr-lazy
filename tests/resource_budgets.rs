@@ -297,6 +297,59 @@ fn lock_command(root: &Path, list: &Path) -> Command {
 }
 
 #[test]
+fn lock_rejects_expanded_proposal_without_changing_any_generation() {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = fixture_root("lock-expanded-proposal");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let list = root.join("plugins.list");
+    fs::write(&list, "owner/repo/one@abcdef0\nowner/repo/two@abcdef1\n").unwrap();
+
+    // Both inputs are in budget, but the one resolved ref matches both subdir specs.
+    // Encoding it twice plus the repo names and header exceeds the 64 KiB lock limit.
+    let resolved = "x".repeat(32 * 1024);
+    fs::write(
+        root.join("inventory.json"),
+        format!(
+            r#"{{"result":{{"plugins":[{{"source":{{"kind":"github","owner":"owner","repo":"repo","resolved_commit":"{resolved}"}}}}]}}}}"#
+        ),
+    )
+    .unwrap();
+    write_executable(
+        &root.join("herdr"),
+        "#!/bin/sh\ncat \"${0%/*}/inventory.json\"\n",
+    );
+    let leaves = [
+        ("plugins.lock", "owner/active\n"),
+        ("plugins.lock.1", "owner/first\n"),
+        ("plugins.lock.2", "owner/second\n"),
+        ("plugins.lock.3", "owner/third\n"),
+    ];
+    let before = leaves.map(|(name, contents)| {
+        let path = root.join(name);
+        fs::write(&path, contents).unwrap();
+        fs::metadata(path).unwrap().ino()
+    });
+
+    let output = lock_command(&root, &list).arg("lock").output().unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty(), "unexpected proposal diagnostics");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("plugin lock") && stderr.contains("exceeds 65536 bytes"),
+        "unexpected stderr: {stderr}"
+    );
+    for ((name, contents), ino) in leaves.into_iter().zip(before) {
+        let path = root.join(name);
+        assert_eq!(fs::read_to_string(&path).unwrap(), contents);
+        assert_eq!(fs::metadata(path).unwrap().ino(), ino);
+    }
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 7);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn cooperating_lock_invocations_keep_each_published_generation() {
     use std::process::Stdio;
 

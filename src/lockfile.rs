@@ -5,7 +5,8 @@
 //! writers, or parent-directory changes. Identity checks catch some external path replacements,
 //! not in-place edits or changes between the last check and a filesystem operation.
 //! This is not a crash transaction: interruption can leave partial history or temporary files.
-//! Unix locks the directory inode, preserves mode bits and rejects extended ACLs on publication.
+//! Unix locks the directory inode, preserves ordinary permission bits and rejects special mode
+//! bits and extended ACLs on publication.
 //! Windows keeps a guard file in the directory. New files (including the guard) get the
 //! directory's normal file creation policy. Existing sources must match the stage's owner
 //! and DACL before any payload is written, or publication is refused. This does not copy
@@ -118,7 +119,7 @@ struct Stage {
     #[cfg(unix)]
     file: File,
     #[cfg(unix)]
-    mode: fs::Permissions,
+    mode: u32,
 }
 
 impl Stage {
@@ -127,7 +128,7 @@ impl Stage {
         options.write(true).create_new(true);
         platform::stage_options(&mut options);
         #[cfg(unix)]
-        let mode = platform::stage_mode(source)?;
+        let mode = platform::stage_mode(source, destination)?;
         let (path, mut file) = loop {
             let path = lock_temp_path(destination);
             match options.open(&path) {
@@ -151,7 +152,7 @@ impl Stage {
         drop(file);
         #[cfg(unix)]
         let written =
-            platform::check_stage_policy(&file, &path).and_then(|()| file.write_all(bytes));
+            platform::check_private_stage(&file, &path).and_then(|()| file.write_all(bytes));
         let stage = Self {
             path,
             id,
@@ -164,10 +165,13 @@ impl Stage {
         Ok(stage)
     }
 
+    #[cfg(unix)]
+    fn prepare(&self) -> io::Result<()> {
+        platform::apply_stage_mode(&self.file, &self.path, self.mode)
+    }
+
     fn publish(&self, path: &Path, expected: Option<platform::Identity>) -> io::Result<()> {
         revalidate(&self.path, Some(self.id))?;
-        #[cfg(unix)]
-        self.file.set_permissions(self.mode.clone())?;
         revalidate(path, expected)?;
         platform::publish(&self.path, path, expected.is_some())
     }
@@ -206,6 +210,17 @@ fn commit(
     active: &Stage,
     current: Option<platform::Identity>,
 ) -> io::Result<()> {
+    // Payloads were written privately. Apply and verify the final Unix permissions on every
+    // stage now, including rollback copies, so a policy failure can't leave partial history.
+    #[cfg(unix)]
+    {
+        active.prepare()?;
+        for change in changes {
+            for stage in [&change.forward, &change.rollback].into_iter().flatten() {
+                stage.prepare()?;
+            }
+        }
+    }
     let mut applied = 0;
     let result = (|| {
         for change in changes {
@@ -289,12 +304,16 @@ mod platform {
     pub(super) type Identity = (u64, u64);
 
     pub(super) fn guard(parent: &Path) -> io::Result<File> {
+        open_guard(parent, libc::LOCK_EX)
+    }
+
+    fn open_guard(parent: &Path, flags: libc::c_int) -> io::Result<File> {
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY)
             .open(parent)?;
         loop {
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            if unsafe { libc::flock(file.as_raw_fd(), flags) } == 0 {
                 return Ok(file);
             }
             let error = io::Error::last_os_error();
@@ -308,7 +327,8 @@ mod platform {
         parent: &Path,
         read: impl Fn() -> io::Result<T>,
     ) -> io::Result<T> {
-        let _guard = guard(parent)?;
+        // Details and restore must not consume tentative history or wait on a writer.
+        let _guard = open_guard(parent, libc::LOCK_SH | libc::LOCK_NB)?;
         read()
     }
 
@@ -356,17 +376,46 @@ mod platform {
     }
 
     pub(super) fn stage_options(options: &mut OpenOptions) {
-        options.mode(0o600);
+        options.mode(PRIVATE_MODE);
     }
 
-    pub(super) fn stage_mode(source: Option<&Leaf>) -> io::Result<fs::Permissions> {
-        match source {
-            Some(source) => {
-                check_stage_policy(&source.file, Path::new("source snapshot"))?;
-                Ok(source.file.metadata()?.permissions())
-            }
-            None => Ok(fs::Permissions::from_mode(0o600)),
+    const MODE_BITS: u32 = 0o7777;
+    const SPECIAL_BITS: u32 = 0o7000;
+    const PRIVATE_MODE: u32 = 0o600;
+
+    fn mode(file: &File) -> io::Result<u32> {
+        Ok(file.metadata()?.permissions().mode() & MODE_BITS)
+    }
+
+    pub(super) fn stage_mode(source: Option<&Leaf>, path: &Path) -> io::Result<u32> {
+        let Some(source) = source else {
+            return Ok(PRIVATE_MODE);
+        };
+        check_stage_policy(&source.file, path)?;
+        let mode = mode(&source.file)?;
+        if mode & SPECIAL_BITS != 0 {
+            return Err(invalid(
+                path,
+                "special mode bits are unsupported for lock publication",
+            ));
         }
+        Ok(mode)
+    }
+
+    pub(super) fn check_private_stage(file: &File, path: &Path) -> io::Result<()> {
+        check_stage_policy(file, path)?;
+        if mode(file)? & !PRIVATE_MODE != 0 {
+            return Err(invalid(path, "stage mode is not private"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn apply_stage_mode(file: &File, path: &Path, expected: u32) -> io::Result<()> {
+        file.set_permissions(fs::Permissions::from_mode(expected))?;
+        if mode(file)? != expected {
+            return Err(invalid(path, "stage cannot represent the source mode"));
+        }
+        Ok(())
     }
 
     #[cfg(target_os = "macos")]
@@ -458,6 +507,20 @@ mod tests {
         fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
+    #[test]
+    fn snapshot_read_returns_busy_while_a_publisher_holds_the_guard() {
+        let active = scratch("reader-busy");
+        assert!(write_lock_contents(&active, "one\n").unwrap());
+        let guard = platform::guard(parent(&active)).unwrap();
+        assert_eq!(
+            read_text(&active, false).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(guard);
+        assert_eq!(read_text(&active, false).unwrap(), "one\n");
+        fs::remove_dir_all(parent(&active)).unwrap();
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn stage_with_inherited_acl_is_rejected_before_lock_publication() {
@@ -498,6 +561,37 @@ mod tests {
             assert_eq!(fs::read(path).unwrap(), bytes);
             assert_eq!(mode(path), expected_mode);
         }
+        fs::remove_dir_all(parent(&active)).unwrap();
+    }
+
+    #[test]
+    fn special_mode_on_rollback_only_source_blocks_all_publication() {
+        let active = scratch("special-mode");
+        let leaves = [
+            (active.clone(), &b"active"[..], 0o600),
+            (lock_history_beside(&active, 1), &b"first"[..], 0o640),
+            (lock_history_beside(&active, 2), &b"second"[..], 0o644),
+            // The oldest generation is staged only for rollback.
+            (lock_history_beside(&active, 3), &b"third"[..], 0o4600),
+        ];
+        for (path, bytes, expected_mode) in &leaves {
+            seed(path, bytes, *expected_mode);
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o7777,
+                *expected_mode
+            );
+        }
+        let error = write_lock_contents(&active, "next\n").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("special mode bits"));
+        for (path, bytes, expected_mode) in &leaves {
+            assert_eq!(fs::read(path).unwrap().as_slice(), *bytes);
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o7777,
+                *expected_mode
+            );
+        }
+        assert_eq!(fs::read_dir(parent(&active)).unwrap().count(), leaves.len());
         fs::remove_dir_all(parent(&active)).unwrap();
     }
 
@@ -643,7 +737,11 @@ mod platform {
         };
         identity(&file, &path)?;
         let mut offset = unsafe { zeroed::<OVERLAPPED>() };
-        let flags = if create { LOCKFILE_EXCLUSIVE_LOCK } else { 0 };
+        let flags = if create {
+            LOCKFILE_EXCLUSIVE_LOCK
+        } else {
+            windows_sys::Win32::Storage::FileSystem::LOCKFILE_FAIL_IMMEDIATELY
+        };
         if unsafe { LockFileEx(file.as_raw_handle(), flags, 0, 1, 0, &mut offset) } == 0 {
             return Err(io::Error::last_os_error());
         }
