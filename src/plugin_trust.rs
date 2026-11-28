@@ -156,15 +156,14 @@ impl SourceScope {
             Some(json::Value::Obj(fields)) => fields,
             Some(_) => return Self::Invalid(None),
         };
-        // Herdr declares local and GitHub kinds. Missing kinds remain eligible for
-        // legacy URL-only records; a present unsupported kind is not equivalent.
-        let kind = match fields.get("kind") {
-            None => "unknown",
-            Some(value) => match value.as_str() {
-                Some(kind @ ("github" | "local")) => kind,
-                _ => "",
-            },
-        };
+        // Keep the legacy `git` URL-only and absent-kind forms. A present
+        // malformed or unsupported kind is not equivalent to either.
+        let kind = fields.get("kind").map_or("unknown", |value| {
+            value
+                .as_str()
+                .filter(|kind| matches!(*kind, "github" | "local" | "git"))
+                .unwrap_or_default()
+        });
         if kind == "local"
             && fields
                 .get("url")
