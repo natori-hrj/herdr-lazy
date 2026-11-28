@@ -5,7 +5,6 @@ use super::{
     terminal_text::{clip, one_line, wrap_line},
     App, Color, Role,
 };
-use crate::github::Changes;
 
 struct Line {
     text: String,
@@ -80,12 +79,12 @@ fn body(app: &App, width: u16) -> Body {
         if let Some(problem) = bundle_problem {
             body.push_wrapped(problem, text_width);
             body.push_wrapped(
-                "Manifest, actions, compatibility, logs, and Changes are unavailable here.",
+                "Manifest, actions, compatibility, and logs are unavailable here.",
                 text_width,
             );
         } else {
             body.push_wrapped(
-                "The installed record cannot be attributed to this entry. Manifest, actions, compatibility, logs, and Changes are unavailable here.",
+                "The installed record cannot be attributed to this entry. Manifest, actions, compatibility, and logs are unavailable here.",
                 text_width,
             );
         }
@@ -173,37 +172,6 @@ fn body(app: &App, width: u16) -> Body {
             body.push(format!("  {event}"));
         }
         body.push("");
-    }
-
-    if let Some((cached, changes)) = &app.detail_changes {
-        if row.changes_target() == Some(cached) {
-            let warning = app.theme.color(Role::Warning);
-            match changes {
-                Changes::Commits(subjects) if !subjects.is_empty() => {
-                    body.push_styled(
-                        format!("Changes · {} new commits", subjects.len()),
-                        warning,
-                        true,
-                    );
-                    for subject in subjects.iter().take(8) {
-                        body.push(format!("  · {subject}"));
-                    }
-                    if subjects.len() > 8 {
-                        body.push(format!("  … and {} more", subjects.len() - 8));
-                    }
-                    body.push("Esc returns to the list. Press u there to update.");
-                }
-                Changes::Commits(_) => {}
-                Changes::ManyPlus(count) => {
-                    body.push_styled(format!("Changes · {count}+ commits behind"), warning, true);
-                    body.push("Esc returns to the list. Press u there to update.");
-                }
-                Changes::Unknown(reason) => {
-                    body.push(format!("Could not check for changes · {reason}"))
-                }
-            }
-            body.push("");
-        }
     }
 
     if let Some((target, _)) = items.get(app.detail_cursor) {
@@ -375,9 +343,7 @@ pub(super) fn draw(app: &App, out: &mut impl Write, width: u16, height: u16) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::super::{
-        bundle_read_error, rows, rows_from_bundle, rows_with_herdr_version, ChangesTarget, Row,
-    };
+    use super::super::{bundle_read_error, rows, rows_from_bundle, rows_with_herdr_version, Row};
     use super::*;
     use crate::{Installed, Spec};
 
@@ -415,11 +381,9 @@ mod tests {
             ..Default::default()
         };
         let rows = rows(&[], &[plugin]);
-        let target = rows[0].changes_target().unwrap().clone();
         App {
             rows,
             detail_of: Some(0),
-            detail_changes: Some((target, Changes::Commits(vec!["Fix workspaces".into()]))),
             ..Default::default()
         }
     }
@@ -492,7 +456,7 @@ mod tests {
             scrolled.push_str(&render(&app, 40, 10));
         }
         assert!(scrolled.contains("Selected: Command 10"));
-        assert!(scrolled.contains("Fix workspaces"));
+        assert!(scrolled.contains("Plugin provenance"));
         assert!(scrolled.contains("Binding preview"));
         assert_eq!(app.detail_cursor, 10);
     }
@@ -528,7 +492,6 @@ mod tests {
             required: crate::HerdrVersion::parse("0.10.0").unwrap(),
             running: crate::HerdrVersion::parse("0.9.5").unwrap(),
         });
-        app.detail_changes = None;
         let wide = render(&app, 120, 24);
         for fact in [
             "Installed · disabled",
@@ -563,20 +526,11 @@ mod tests {
                 &[],
                 crate::HerdrVersion::parse("0.9.5"),
             ),
-            detail_changes: Some((
-                ChangesTarget {
-                    plugin_id: "other-plugin".into(),
-                    slug: spec.into(),
-                    commit: SHA.into(),
-                },
-                Changes::Commits(vec!["Other plugin changes".into()]),
-            )),
             ..App::default()
         };
         assert_eq!(app.rows[0].enabled, Some(true));
         assert!(app.rows[0].herdr_warning.is_none());
         assert!(app.rows[0].plugin_detail().is_none());
-        assert!(app.rows[0].changes_target().is_none());
         let list = render(&app, 160, 24);
         assert!(!list.contains("Other manifest description"), "{list:?}");
         assert!(!list.contains("needs herdr"), "{list:?}");
@@ -667,7 +621,6 @@ mod tests {
         let row = &mut app.rows[0];
         row.trust.set_lock(Some(&format!("example/plugin@{SHA}")));
         assert!(row.maintenance.is_some());
-        assert!(row.changes_target().is_none());
         let frame = render(&app, 120, 24);
         for fact in [
             "Requested ref · Invalid suffix (bundle list)",
@@ -698,7 +651,7 @@ mod tests {
         assert!(app.log_view.is_none());
         assert_eq!(
             app.flash.as_deref(),
-            Some("Logs unavailable · bundle ref evidence was rejected")
+            Some("Logs unavailable · plugin identity is uncertain")
         );
     }
 
@@ -888,7 +841,6 @@ mod tests {
                 assert_eq!(row.commit.as_deref(), Some(SHA));
                 assert_eq!(row.enabled, Some(true));
                 assert!(row.plugin_detail().is_none());
-                assert!(row.changes_target().is_none());
                 assert_no_registry_revision(&row);
             }
         }
@@ -994,7 +946,6 @@ mod tests {
             assert!(frame.contains(&format!("Resolved revision · {SHA} (installed registry)")));
             for index in 0..app.rows.len() {
                 assert!(app.rows[index].plugin_detail().is_none());
-                assert!(app.rows[index].changes_target().is_none());
                 app.detail_of = Some(index);
                 assert!(!confirm_selection_visible(&mut app, 120, 24));
                 app.flash = None;
@@ -1078,20 +1029,6 @@ mod tests {
         assert!(frame.contains("Local action"));
         assert!(frame.contains("L Logs"));
         assert!(confirm_selection_visible(&mut app, 120, 24));
-    }
-
-    #[test]
-    fn cached_changes_do_not_follow_the_row_index_or_survive_a_revision_change() {
-        let mut app = fixture();
-        assert!(render(&app, 120, 35).contains("Fix workspaces"));
-        let mut record = registry_fixture("plugin", "example.plugin", "");
-        record.resolved_commit = Some("f".repeat(40));
-        app.rows = rows(&[], std::slice::from_ref(&record));
-        assert!(!render(&app, 120, 35).contains("Fix workspaces"));
-        record.resolved_commit = Some(SHA.into());
-        record.plugin_id = "other-plugin".into();
-        app.rows = rows(&[], &[record]);
-        assert!(!render(&app, 120, 35).contains("Fix workspaces"));
     }
 
     #[test]
