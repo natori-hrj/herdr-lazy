@@ -196,8 +196,6 @@ mod tests {
     use std::io::Write;
     use std::thread;
 
-    const EOF_FIXTURE_EXIT_CODE: i32 = 37;
-
     fn fixture_command(mode: &str) -> Command {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
@@ -255,7 +253,7 @@ mod tests {
         }
         thread::sleep(delay);
         // SAFETY: bypass stdio cleanup; the response descriptors are already closed.
-        unsafe { libc::_exit(EOF_FIXTURE_EXIT_CODE) }
+        unsafe { libc::_exit(0) }
     }
 
     #[cfg(windows)]
@@ -279,7 +277,7 @@ mod tests {
         }
         thread::sleep(delay);
         // SAFETY: this terminates only the fixture process.
-        unsafe { ExitProcess(EOF_FIXTURE_EXIT_CODE as u32) }
+        unsafe { ExitProcess(0) }
     }
 
     #[test]
@@ -381,7 +379,7 @@ mod tests {
         if result.is_err() {
             // Only inspect the exit code after the OS probe has verified capture did not
             // leave a live or waitable child behind.
-            assert_ne!(child.wait().unwrap().code(), Some(EOF_FIXTURE_EXIT_CODE));
+            assert!(!child.wait().unwrap().success(), "fixture exited normally");
         }
         result
     }
@@ -415,7 +413,7 @@ mod tests {
     fn eof_before_direct_child_exit_returns_reaped_status() {
         let mode = "close-streams-before-exit";
         let (status, _, _) = capture_after_observed_eof(mode, Duration::from_secs(5)).unwrap();
-        assert_eq!(status.code(), Some(EOF_FIXTURE_EXIT_CODE));
+        assert!(status.success());
     }
 
     #[test]
