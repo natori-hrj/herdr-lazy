@@ -14,8 +14,9 @@ to identify your installed build.
   to terminate and reap the directly started child. It does not traverse the
   process tree, and cleanup can extend past the response deadline.
 - The bounded local text readers limit plugin lists, generated locks, workspace
-  profiles, and binding configuration to 64 KiB. Oversized or unreadable data
-  is reported instead of silently consumed as partial content.
+  profiles, and binding configuration to 64 KiB. Manage reports plugin-list
+  read failures. The `probe` entry count can still show zero when it cannot
+  read a list or lock.
 
 ## Generated locks and history
 
@@ -24,7 +25,7 @@ lock and its history before publishing. Unsupported aliases are rejected.
 Publication replaces individual files and attempts to roll back changes on
 failure; the lock family is not a crash-atomic transaction.
 
-On Unix, publication preserves ordinary mode bits, rejects stages whose
+On Linux and macOS, publication preserves ordinary mode bits, rejects stages whose
 owner or group differs from the source, and refuses unsupported special modes
 and extended ACLs. On Windows, publication checks the owner's identity and
 DACL against the stage's creation policy; it does not copy arbitrary security
