@@ -3636,7 +3636,7 @@ impl App {
             return Ok(());
         };
         let rule = rule_line(width);
-        let preview = machine_summary(entry);
+        let preview = machine_summary(entry, view.bundle_error.is_none());
 
         write!(out, "\x1b[H\x1b[2J")?;
         writeln!(
