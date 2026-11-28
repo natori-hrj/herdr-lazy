@@ -351,6 +351,17 @@ impl MachineAction {
     }
 }
 
+fn machine_action_notification(
+    action: MachineAction,
+    target: &str,
+    outcome: Result<(), String>,
+) -> String {
+    match outcome {
+        Ok(()) => format!("{} started on {}", action.label(), target),
+        Err(error) => format!("{} on {}: {}", action.label(), target, error),
+    }
+}
+
 struct MachineEntry {
     health: crate::machine::MachineHealth,
     rows: Vec<Row>,
@@ -1510,10 +1521,7 @@ impl App {
         // Re-read after returning to the pane. Herdr action invocation is asynchronous, so this
         // may still show `running`; the log result remains visible and can be refreshed with r.
         self.open_machine_view();
-        self.flash = Some(match outcome {
-            Ok(()) => format!("{} started on {}", action.label(), target),
-            Err(error) => format!("{} failed on {}: {}", action.label(), target, error),
-        });
+        self.flash = Some(machine_action_notification(action, &target, outcome));
         Ok(())
     }
 
@@ -1681,7 +1689,7 @@ impl App {
 
         match action {
             ProfileAction::Merge => {
-                let result = crate::merge_specs_into_list(&crate::bundle_path(), &profile.specs);
+                let result = crate::merge_specs_into_global_list(&profile.specs);
                 self.profile_open = false;
                 self.refresh();
                 self.flash = Some(match result {
@@ -6753,5 +6761,47 @@ mod tests {
             .flash
             .as_deref()
             .is_some_and(|message| message.contains("update action is unavailable")));
+    }
+
+    #[test]
+    fn machine_action_notifications_keep_unknown_and_explicit_failure_distinct() {
+        let cases = [
+            (
+                "machine action acknowledgement timed out; action state is unknown: fixture",
+                "sync on Build machine (dev@example.com): machine action acknowledgement timed out; action state is unknown: fixture",
+                "sync failed on",
+            ),
+            (
+                "machine action failed: fixture exited 42",
+                "sync on Build machine (dev@example.com): machine action failed: fixture exited 42",
+                "acknowledgement timed out",
+            ),
+        ];
+
+        for (error, expected, absent) in cases {
+            let view = machine_view_for_test(crate::machine::MachineConnection::Connected, true);
+            let app = App {
+                machine_view: Some(view),
+                flash: Some(machine_action_notification(
+                    MachineAction::Sync,
+                    "Build machine (dev@example.com)",
+                    Err(error.to_string()),
+                )),
+                ..Default::default()
+            };
+            let mut buffer = Vec::new();
+
+            app.draw_machines(&mut buffer, 180, 24).unwrap();
+
+            let visible = String::from_utf8(buffer).unwrap();
+            assert!(
+                visible.contains(expected),
+                "unexpected notification: {visible}"
+            );
+            assert!(
+                !visible.contains(absent),
+                "unexpected notification: {visible}"
+            );
+        }
     }
 }

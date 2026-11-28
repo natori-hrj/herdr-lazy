@@ -18,6 +18,35 @@ fn remaining(deadline: Instant) -> io::Result<Duration> {
     Ok(remaining)
 }
 
+pub(crate) struct ResponsePipes {
+    stdout: platform::Pipe,
+    stderr: platform::Pipe,
+}
+
+pub(crate) fn spawn_response(mut command: Command) -> io::Result<(Child, ResponsePipes)> {
+    command.stdin(Stdio::null());
+    let (child, stdout, stderr) = platform::Pipe::spawn_both(command)?;
+    Ok((child, ResponsePipes { stdout, stderr }))
+}
+
+impl ResponsePipes {
+    pub(crate) fn read_stdout(
+        &mut self,
+        buffer: &mut [u8],
+        deadline: Instant,
+    ) -> io::Result<usize> {
+        self.stdout.read(buffer, deadline)
+    }
+
+    pub(crate) fn read_stderr(
+        &mut self,
+        buffer: &mut [u8],
+        deadline: Instant,
+    ) -> io::Result<usize> {
+        self.stderr.read(buffer, deadline)
+    }
+}
+
 /// Capture a bounded response and reap the direct child before returning.
 /// The caller can share the same deadline with a fallback downloader.
 pub(crate) fn capture(
