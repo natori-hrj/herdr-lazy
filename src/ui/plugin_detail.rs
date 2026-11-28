@@ -363,7 +363,7 @@ pub(super) fn draw(app: &App, out: &mut impl Write, width: u16, height: u16) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::super::{rows, rows_with_herdr_version, ChangesTarget};
+    use super::super::{rows, rows_with_herdr_version, ChangesTarget, Row};
     use super::*;
     use crate::{Installed, Spec};
 
@@ -483,6 +483,7 @@ mod tests {
             plugin_id: "fixture.plugin".into(),
             slug: Some("Example/Plugin".into()),
             source_kind: "github".into(),
+            source_scope: crate::plugin_trust::SourceScope::GitHub("example/plugin".into()),
             resolved_commit: Some(sha.into()),
             ..Installed::default()
         };
@@ -589,12 +590,12 @@ mod tests {
         );
     }
 
-    fn registry_fixture(repo: &str, id: &str, url_field: &str) -> Installed {
+    fn registry_source_fixture(id: &str, source_fields: &str) -> Installed {
         crate::parse_plugin_list(&format!(
             r#"{{"result":{{"plugins":[{{
                 "plugin_id":"{id}","name":"plugin","description":"Other manifest description",
                 "min_herdr_version":"0.10.0",
-                "source":{{"kind":"github","owner":"example","repo":"{repo}","resolved_commit":"{SHA}"{url_field}}},
+                "source":{{"resolved_commit":"{SHA}"{source_fields}}},
                 "actions":[{{"id":"other.action","title":"Other action"}}],
                 "panes":[{{"id":"other.pane","title":"Other pane"}}],
                 "events":[{{"on":"other.event"}}]
@@ -605,6 +606,21 @@ mod tests {
         .unwrap()
     }
 
+    fn registry_fixture(repo: &str, id: &str, fields: &str) -> Installed {
+        registry_source_fixture(
+            id,
+            &format!(r#","kind":"github","owner":"example","repo":"{repo}"{fields}"#),
+        )
+    }
+
+    fn assert_no_registry_revision(row: &Row) {
+        assert!(row
+            .trust
+            .lines()
+            .iter()
+            .any(|line| line == "Resolved revision · Unknown"));
+    }
+
     #[test]
     fn child_does_not_get_payload_from_weak_or_competing_registry_claims() {
         let spec = "example/plugin/Tools";
@@ -612,12 +628,10 @@ mod tests {
         let second_root = registry_fixture("plugin", "second-plugin", "");
         let exact = registry_fixture("plugin/Tools", "exact-plugin", "");
         let sibling = registry_fixture("plugin/tools", "other-plugin", "");
-        let mut url_only = registry_fixture(
-            "plugin",
+        let url_only = registry_source_fixture(
             "other-plugin",
             r#","url":"https://github.com/example/plugin.git""#,
         );
-        url_only.slug = None;
         for candidates in [
             vec![root.clone()],
             vec![second_root, root.clone()],
@@ -655,6 +669,138 @@ mod tests {
             for repo in ["plugin", "plugin/Tools"] {
                 let plugin = registry_fixture(repo, "other-plugin", &field);
                 assert_unattributed(&format!("example/{repo}"), &[plugin]);
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_structured_fields_cannot_be_replaced_by_a_clone_url() {
+        let url = r#","url":"https://github.com/example/plugin.git""#;
+        for fields in [
+            r#","kind":"github","owner":null,"repo":"plugin""#,
+            r#","kind":"github","owner":"example","repo":null"#,
+            r#","kind":"github","owner":42,"repo":"plugin""#,
+            r#","kind":"github","owner":"example","repo":["plugin"]"#,
+            r#","kind":"github","owner":"example""#,
+            r#","kind":"github","repo":"plugin""#,
+            r#","kind":"github","owner":"","repo":"plugin""#,
+            r#","kind":"github","owner":"https://github.com/example","repo":"plugin""#,
+            r#","kind":"github","owner":"example","repo":"plugin/..""#,
+            r#","kind":"github","owner":"example","repo":"plugin.git""#,
+            r#","kind":"git","owner":"example","repo":"plugin""#,
+            r#","owner":"example","repo":"plugin""#,
+            r#","subdir":"Tools""#,
+        ] {
+            let plugin = registry_source_fixture("other-plugin", &format!("{fields}{url}"));
+            let records = [plugin];
+            assert_unattributed("example/plugin", &records);
+            assert_no_registry_revision(&rows(&[Spec::parse("example/plugin")], &records)[0]);
+            let direct = rows(&[], &records);
+            assert!(direct[0].plugin_detail().is_none(), "{fields}");
+            assert_no_registry_revision(&direct[0]);
+        }
+        for fields in ["", r#","kind":"github""#, r#","kind":"git""#] {
+            let plugin = registry_source_fixture("other-plugin", &format!("{fields}{url}"));
+            let records = [plugin];
+            let bundle = rows(&[Spec::parse("example/plugin")], &records);
+            assert!(bundle[0].plugin_detail().is_some(), "{fields}");
+            assert!(rows(&[], &records)[0].plugin_detail().is_some(), "{fields}");
+        }
+    }
+
+    #[test]
+    fn canonical_subdir_proves_only_its_exact_scope_without_changing_lifecycle_match() {
+        for repo in ["PLUGIN", "PLUGIN/Tools/Way"] {
+            let child = registry_source_fixture(
+                "other-plugin",
+                &format!(
+                    r#","kind":"github","owner":"EXAMPLE","repo":"{repo}","subdir":"Tools/Way","url":"git@github.com:example/plugin.git""#
+                ),
+            );
+            assert_eq!(
+                child.slug.as_deref(),
+                Some(format!("EXAMPLE/{repo}").as_str())
+            );
+            let records = [child];
+            let (root, exact) = ("example/plugin", "example/plugin/Tools/Way");
+            assert_eq!(
+                records[0].matches(&Spec::parse(exact)),
+                crate::Match::Strong
+            );
+            assert!(rows(&[Spec::parse(exact)], &records)[0]
+                .plugin_detail()
+                .is_some());
+            for nonmatching in [root, "example/plugin/tools/Way"] {
+                assert_unattributed(nonmatching, &records);
+                assert_no_registry_revision(&rows(&[Spec::parse(nonmatching)], &records)[0]);
+            }
+            let direct = rows(&[], &records);
+            assert!(direct[0].plugin_detail().is_some());
+            assert!(direct[0]
+                .trust
+                .lines()
+                .iter()
+                .any(|line| line == "Repository · example/plugin/Tools/Way (installed registry)"));
+        }
+        let root = registry_fixture("plugin", "other-plugin", "");
+        assert!(rows(&[Spec::parse("example/plugin")], &[root])[0]
+            .plugin_detail()
+            .is_some());
+    }
+
+    #[test]
+    fn malformed_or_contradictory_subdir_is_not_an_absent_subdir() {
+        for (repo, subdir) in [
+            ("plugin", "null"),
+            ("plugin", "42"),
+            ("plugin", r#""""#),
+            ("plugin", r#""Tools/../Other""#),
+            ("plugin", r#""/Tools""#),
+            ("plugin/Tools", r#""Other""#),
+            ("plugin/Tools", r#""tools""#),
+        ] {
+            let plugin = registry_fixture(repo, "other-plugin", &format!(r#","subdir":{subdir}"#));
+            let records = [plugin];
+            assert_unattributed("example/plugin", &records);
+            assert_unattributed("example/plugin/Tools", &records);
+            assert_no_registry_revision(&rows(&[Spec::parse("example/plugin")], &records)[0]);
+            assert!(rows(&[], &records)[0].plugin_detail().is_none());
+        }
+    }
+
+    #[test]
+    fn duplicate_registry_keys_withhold_bundle_and_direct_payloads_in_both_orders() {
+        let url = r#""https://github.com/example/plugin.git""#;
+        for (first, last) in [("null", url), (url, "null")] {
+            let records = crate::parse_plugin_list(&format!(
+                r#"{{"result":{{"plugins":[{{
+                    "plugin_id":"other-plugin","source":{{
+                        "kind":"github","owner":"example","repo":"plugin","resolved_commit":"{SHA}",
+                        "url":{first},"url":{last}
+                    }}
+                }},{{"plugin_id":"unrelated","source":{{"kind":"local","resolved_commit":"{SHA}"}},
+                     "actions":[{{"id":"test","title":"Normally available"}}]
+                }}]}}}}"#
+            ))
+            .unwrap();
+            assert_eq!(records.len(), 2);
+            assert_eq!(
+                records[0]
+                    .source_values
+                    .iter()
+                    .any(|s| s == "https://github.com/example/plugin.git"),
+                last == url
+            );
+            let spec = "example/plugin";
+            assert_eq!(records[0].matches(&Spec::parse(spec)), crate::Match::Strong);
+            assert_unattributed(spec, &records);
+            assert_no_registry_revision(&rows(&[Spec::parse(spec)], &records)[0]);
+            for row in rows(&[], &records) {
+                assert_eq!(row.commit.as_deref(), Some(SHA));
+                assert_eq!(row.enabled, Some(true));
+                assert!(row.plugin_detail().is_none());
+                assert!(row.changes_target().is_none());
+                assert_no_registry_revision(&row);
             }
         }
     }

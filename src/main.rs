@@ -861,9 +861,10 @@ pub(crate) struct Installed {
     /// `owner/repo` rebuilt from `source.owner` + `source.repo`. herdr stores them as two
     /// separate fields, never as a joined slug, so this has to be assembled.
     pub(crate) slug: Option<String>,
-    /// A path in the owner field cannot establish a registry scope, even when its flattened
-    /// slug happens to match. Keep the flattened value unchanged for lifecycle matching.
-    source_owner_has_path: bool,
+    /// Structured attribution evidence, independent of the flattened lifecycle slug.
+    source_scope: plugin_trust::SourceScope,
+    /// Broadcast to every record: duplicate keys anywhere can hide a competing claim or ID.
+    registry_duplicate_observed: bool,
     /// `source.installed_unix_ms` — when herdr fetched this. Compared against the
     /// marketplace's `pushedAt` to spot plugins that have moved since.
     pub(crate) installed_unix_ms: Option<u64>,
@@ -987,7 +988,8 @@ fn collect_strings(v: &json::Value, out: &mut Vec<String>) {
 }
 
 pub(crate) fn parse_plugin_list(stdout: &str) -> Result<Vec<Installed>, String> {
-    let v = json::parse(stdout.trim()).map_err(|e| format!("could not parse JSON: {}", e))?;
+    let (v, registry_duplicate_observed) = json::parse_with_duplicates(stdout.trim())
+        .map_err(|e| format!("could not parse JSON: {}", e))?;
     let plugins = v
         .path(&["result", "plugins"])
         .and_then(|p| p.as_array())
@@ -996,13 +998,20 @@ pub(crate) fn parse_plugin_list(stdout: &str) -> Result<Vec<Installed>, String> 
     Ok(plugins
         .iter()
         .map(|p| {
+            let source = p.get("source");
             let mut source_values = Vec::new();
-            if let Some(src) = p.get("source") {
+            if let Some(src) = source {
                 collect_strings(src, &mut source_values);
             }
-            let owner = p.path(&["source", "owner"]).and_then(|v| v.as_str());
-            let repo = p.path(&["source", "repo"]).and_then(|v| v.as_str());
-            let slug = match (owner, repo) {
+            let source_kind = source
+                .and_then(|s| s.str_field("kind"))
+                .unwrap_or("unknown");
+            let owner = source.and_then(|s| s.get("owner"));
+            let repo = source.and_then(|s| s.get("repo"));
+            let slug = match (
+                owner.and_then(json::Value::as_str),
+                repo.and_then(json::Value::as_str),
+            ) {
                 (Some(o), Some(r)) => Some(format!("{}/{}", o, r)),
                 _ => None,
             };
@@ -1010,11 +1019,7 @@ pub(crate) fn parse_plugin_list(stdout: &str) -> Result<Vec<Installed>, String> 
                 plugin_id: p.str_field("plugin_id").unwrap_or_default().to_string(),
                 name: p.str_field("name").unwrap_or_default().to_string(),
                 enabled: p.get("enabled").and_then(|e| e.as_bool()).unwrap_or(true),
-                source_kind: p
-                    .path(&["source", "kind"])
-                    .and_then(|k| k.as_str())
-                    .unwrap_or("unknown")
-                    .to_string(),
+                source_kind: source_kind.to_string(),
                 min_herdr_version: p
                     .str_field("min_herdr_version")
                     .and_then(HerdrVersion::parse),
@@ -1066,7 +1071,13 @@ pub(crate) fn parse_plugin_list(stdout: &str) -> Result<Vec<Installed>, String> 
                         _ => None,
                     }),
                 slug,
-                source_owner_has_path: owner.is_some_and(|owner| owner.contains('/')),
+                source_scope: plugin_trust::SourceScope::from_fields(
+                    source_kind,
+                    owner,
+                    repo,
+                    source.and_then(|s| s.get("subdir")),
+                ),
+                registry_duplicate_observed,
                 resolved_commit: p
                     .path(&["source", "resolved_commit"])
                     .and_then(|c| c.as_str())
