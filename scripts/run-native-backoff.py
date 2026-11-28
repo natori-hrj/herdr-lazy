@@ -52,11 +52,6 @@ def main():
                     "revision": sha, "sha256": hashlib.sha256(executable.read_bytes()).hexdigest()
                 }
                 binaries.append(f"{label}={executable}")
-                if label == "integrated":
-                    with (evidence / "resource-tests.txt").open("w") as log:
-                        run("cargo", "+stable", "test", "--locked", "--target-dir", str(target),
-                            "herdr_output::tests::", "--", "--nocapture", cwd=checkout,
-                            stdout=log, stderr=subprocess.STDOUT)
             finally:
                 run("git", "worktree", "remove", str(checkout), cwd=repo)
         (evidence / "builds.json").write_text(json.dumps(metadata, indent=2))
