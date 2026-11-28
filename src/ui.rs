@@ -153,6 +153,14 @@ struct HerdrVersionWarning {
 }
 
 impl Row {
+    fn plugin_detail(&self) -> Option<&PluginDetail> {
+        if self.trust.hide_install_details {
+            None
+        } else {
+            self.detail.as_ref()
+        }
+    }
+
     fn marker(&self) -> &'static str {
         if self.herdr_warning.is_some() {
             "⚠"
@@ -680,12 +688,19 @@ fn rows_with_herdr_version(
                 (status, commit)
             }
         };
+        let display = spec.display();
+        let trust = crate::plugin_trust::Report::for_bundle(
+            &display,
+            installed,
+            hit.map(|(p, _)| p),
+            market,
+        );
         rows.push(Row {
-            label: spec.display(),
+            label: display.clone(),
             commit,
             status,
             herdr_warning: hit.and_then(|(p, _)| version_warning(p)),
-            listed_as: Some(spec.display()),
+            listed_as: Some(display),
             slug: Some(spec.repo.clone()),
             installed: hit.map(|(p, _)| (p.plugin_id.clone(), p.source_kind.clone())),
             enabled: hit.map(|(p, _)| p.enabled),
@@ -693,7 +708,7 @@ fn rows_with_herdr_version(
             maybe_stale: hit.map(|(p, _)| stale(p, Some(spec))).unwrap_or(false),
             picked: false,
             detail: hit.map(|(p, _)| detail_of(p)),
-            trust: crate::plugin_trust::Report::for_bundle(spec, installed, market),
+            trust,
         });
     }
 
@@ -1716,6 +1731,18 @@ impl App {
         self.open_logs_for(self.cursor);
     }
 
+    fn open_detail_logs(&mut self, idx: usize) {
+        if self
+            .rows
+            .get(idx)
+            .is_some_and(|row| row.trust.hide_install_details)
+        {
+            self.flash = Some("Logs unavailable · plugin identity is uncertain".to_string());
+            return;
+        }
+        self.open_logs_for(idx);
+    }
+
     fn open_logs_for(&mut self, idx: usize) {
         let Some(plugin_id) = self
             .rows
@@ -1788,6 +1815,10 @@ impl App {
         self.detail_scroll = 0;
         self.flash = None;
 
+        if row.trust.hide_install_details {
+            self.detail_changes = None;
+            return;
+        }
         // Fetch only for a plugin the offline marker already flagged. Opening the details of
         // an up-to-date plugin must stay instant — going to the network for every `l` would
         // make the common case (nothing changed) the slow one, which is backwards. The marker
@@ -1847,7 +1878,7 @@ impl App {
 
     fn bind_selected(&mut self, letter: char) {
         let Some(idx) = self.detail_of else { return };
-        let Some(d) = self.rows.get(idx).and_then(|r| r.detail.clone()) else {
+        let Some(d) = self.rows.get(idx).and_then(Row::plugin_detail).cloned() else {
             return;
         };
         let Some((target, _)) = Self::bindable(&d).into_iter().nth(self.detail_cursor) else {
@@ -1871,7 +1902,8 @@ impl App {
         let Some(d) = self
             .detail_of
             .and_then(|i| self.rows.get(i))
-            .and_then(|r| r.detail.clone())
+            .and_then(Row::plugin_detail)
+            .cloned()
         else {
             return;
         };
@@ -1882,7 +1914,7 @@ impl App {
 
     fn run_detail_action(&mut self) {
         let Some(idx) = self.detail_of else { return };
-        let Some(d) = self.rows.get(idx).and_then(|r| r.detail.clone()) else {
+        let Some(d) = self.rows.get(idx).and_then(Row::plugin_detail).cloned() else {
             return;
         };
         let Some((target, _)) = Self::bindable(&d).into_iter().nth(self.detail_cursor) else {
@@ -2720,7 +2752,7 @@ impl App {
         let plugin_id = self
             .detail_of
             .and_then(|i| self.rows.get(i))
-            .and_then(|r| r.detail.as_ref())
+            .and_then(Row::plugin_detail)
             .map(|d| d.plugin_id.clone())
             .unwrap_or_default();
         let path = crate::herdr_config_path()
@@ -4194,7 +4226,7 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             let n = app
                 .rows
                 .get(idx)
-                .and_then(|r| r.detail.as_ref())
+                .and_then(Row::plugin_detail)
                 .map(|d| App::bindable(d).len())
                 .unwrap_or(0);
             // Ctrl-chords first: a plain `j` moves, but Ctrl+J is a pty's Enter, and a
@@ -4254,7 +4286,7 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                         app.run_detail_action();
                     }
                 }
-                KeyCode::Char('L') => app.open_logs_for(idx),
+                KeyCode::Char('L') => app.open_detail_logs(idx),
                 _ => {}
             }
             continue;
@@ -5207,6 +5239,7 @@ mod tests {
             );
             assert_eq!(r[0].enabled, Some(winner.enabled));
             assert_eq!(r[0].commit, winner.resolved_commit);
+            assert!(r[0].plugin_detail().is_none());
             assert_eq!(
                 r[0].status,
                 if winner.enabled {

@@ -5,7 +5,7 @@ use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::Path;
 
-use crate::{registry, Installed, Spec};
+use crate::{registry, Installed};
 
 const UNKNOWN: &str = "Unknown";
 pub(crate) const MAX_IDENTITY_INPUT: usize = 320;
@@ -127,31 +127,43 @@ fn full_digest(value: &str) -> Option<&str> {
     (matches!(value.len(), 40 | 64) && crate::is_commit_ref(value)).then_some(value)
 }
 
-fn registry_identity(plugin: &Installed) -> Option<(String, &'static str)> {
+enum RegistryIdentity {
+    Known(String, &'static str),
+    Conflict {
+        structured: String,
+        alias: Option<String>,
+    },
+    Unidentified,
+}
+
+fn registry_identity(plugin: &Installed) -> RegistryIdentity {
     if plugin.source_kind == "local" {
-        return None;
+        return RegistryIdentity::Unidentified;
     }
     let structured = if plugin.source_kind == "github" {
         plugin.slug.as_deref().and_then(repository)
     } else {
         None
     };
-    let url = plugin
+    let alias = plugin
         .source_url
         .as_deref()
         .filter(|url| strip_alias(url).is_some())
         .and_then(repository);
-    if let Some(slug) = structured {
-        if url.is_some_and(|url| url != crate::repo_root(&slug)) {
-            return None;
+    match (structured, alias) {
+        (Some(structured), alias)
+            if plugin.source_url.is_some()
+                && alias.as_deref() != Some(crate::repo_root(&structured).as_str()) =>
+        {
+            RegistryIdentity::Conflict { structured, alias }
         }
-        Some((slug, REGISTRY))
-    } else {
-        url.map(|slug| (slug, "installed registry URL"))
+        (Some(slug), _) => RegistryIdentity::Known(slug, REGISTRY),
+        (None, Some(slug)) => RegistryIdentity::Known(slug, "installed registry URL"),
+        (None, None) => RegistryIdentity::Unidentified,
     }
 }
 
-fn lock_record(line: &str) -> Option<(String, Option<&str>)> {
+fn entry_record(line: &str) -> Option<(String, Option<&str>)> {
     let line = line.trim();
     if line.starts_with('#') {
         return None;
@@ -179,29 +191,81 @@ pub(crate) struct Report {
     last_push: Option<String>,
     lock_ref: Option<String>,
     consistency: Option<&'static str>,
+    pub(crate) hide_install_details: bool,
 }
 
 impl Report {
     pub(crate) fn for_bundle(
-        desired: &Spec,
+        displayed_spec: &str,
         installed: &[Installed],
+        operational_hit: Option<&Installed>,
         market: &[registry::Entry],
     ) -> Self {
-        let repository = repository(&desired.repo).map(|slug| (slug, BUNDLE));
+        // Reparse the original display for evidence only: Spec::parse may have split at the
+        // transport '@' in an SSH alias instead of the requested ref.
+        let (repository, requested) = match entry_record(displayed_spec) {
+            Some((slug, requested)) => (Some((slug, BUNDLE)), requested),
+            None => (None, None),
+        };
         // Action routing deliberately tolerates root/name matches and ties. A bundle report
         // instead needs exactly one registry record for the normalized entry.
-        let evidence = repository.as_ref().and_then(|(wanted, _)| {
-            let mut exact = installed.iter().filter(|plugin| {
-                registry_identity(plugin).is_some_and(|(recorded, _)| &recorded == wanted)
+        let wanted = repository.as_ref().map(|(slug, _)| slug.as_str());
+        let mut evidence = None;
+        let mut ambiguous_or_conflicting = false;
+        let mut hide_install_details = false;
+        for plugin in installed {
+            let is_hit = operational_hit.is_some_and(|hit| std::ptr::eq(hit, plugin));
+            match registry_identity(plugin) {
+                RegistryIdentity::Known(slug, _) => {
+                    if wanted == Some(slug.as_str()) {
+                        ambiguous_or_conflicting |= evidence.replace(plugin).is_some();
+                    } else if is_hit
+                        && wanted.is_some_and(|wanted| {
+                            // A root-only registry entry may simply omit the subdirectory.
+                            // A different explicit subdirectory is a conflict, not a weak hit.
+                            slug != crate::repo_root(wanted)
+                        })
+                    {
+                        hide_install_details = true;
+                    }
+                }
+                RegistryIdentity::Conflict { structured, alias } => {
+                    ambiguous_or_conflicting |= wanted == Some(structured.as_str())
+                        || wanted.is_some_and(|wanted| alias.as_deref() == Some(wanted));
+                    hide_install_details |= is_hit;
+                }
+                RegistryIdentity::Unidentified => {}
+            }
+        }
+        hide_install_details |= ambiguous_or_conflicting
+            || evidence.is_some_and(|plugin| {
+                !operational_hit.is_some_and(|hit| std::ptr::eq(hit, plugin))
             });
-            let plugin = exact.next()?;
-            exact.next().is_none().then_some(plugin)
-        });
-        Self::from_evidence(repository, desired.reference.as_deref(), evidence, market)
+        let mut report = Self::from_evidence(
+            repository,
+            requested,
+            if ambiguous_or_conflicting {
+                None
+            } else {
+                evidence
+            },
+            market,
+        );
+        report.hide_install_details = hide_install_details;
+        report
     }
 
     pub(crate) fn for_install(plugin: &Installed, market: &[registry::Entry]) -> Self {
-        Self::from_evidence(registry_identity(plugin), None, Some(plugin), market)
+        match registry_identity(plugin) {
+            RegistryIdentity::Known(slug, source) => {
+                Self::from_evidence(Some((slug, source)), None, Some(plugin), market)
+            }
+            RegistryIdentity::Unidentified => Self::from_evidence(None, None, Some(plugin), market),
+            RegistryIdentity::Conflict { .. } => Self {
+                hide_install_details: true,
+                ..Self::default()
+            },
+        }
     }
 
     fn from_evidence(
@@ -237,7 +301,7 @@ impl Report {
         self.lock_ref = self.repository.as_ref().and_then(|(repo, _)| {
             let mut records = snapshot?
                 .lines()
-                .filter_map(lock_record)
+                .filter_map(entry_record)
                 .filter(|(candidate, _)| candidate == repo);
             let (_, reference) = records.next()?;
             if records.next().is_some() {
@@ -268,7 +332,7 @@ impl Report {
         }
     }
 
-    pub(crate) fn lines(&self) -> [String; 12] {
+    pub(crate) fn lines(&self) -> [String; 13] {
         fn fact(label: &str, value: Option<&str>, source: &str) -> String {
             match value {
                 Some(value) => format!("{label} · {value} ({source})"),
@@ -299,6 +363,8 @@ impl Report {
             ),
             format!("License, security policy, archived state, external commands · {UNKNOWN}"),
             "Lock comparison does not authenticate the plugin.".to_string(),
+            "Provenance uses local snapshots. The separate Changes check may contact GitHub."
+                .to_string(),
         ]
     }
 }
@@ -334,6 +400,7 @@ fn cached_last_push(root: &str, market: &[registry::Entry]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Spec;
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
@@ -347,6 +414,10 @@ mod tests {
         }
     }
 
+    fn bundle(desired: &Spec, installed: &[Installed], market: &[registry::Entry]) -> Report {
+        Report::for_bundle(&desired.display(), installed, installed.first(), market)
+    }
+
     #[test]
     fn reports_local_evidence_without_inventing_a_second_revision() {
         let desired = Spec::parse("Owner/Plugin@v1.2.3+build.4");
@@ -355,7 +426,7 @@ mod tests {
             pushed_at: "2024-01-02T00:00:00Z".into(),
             ..registry::Entry::default()
         };
-        let mut report = Report::for_bundle(&desired, &[installed("owner/PLUGIN", SHA)], &[market]);
+        let mut report = bundle(&desired, &[installed("owner/PLUGIN", SHA)], &[market]);
         report.set_lock(Some(&format!("git@GITHUB.COM:OWNER/PLUGIN.GIT@{SHA}")));
         let text = report.lines().join("\n");
         for fact in [
@@ -371,6 +442,7 @@ mod tests {
             "Marketplace cache, repository-wide",
             "License, security policy, archived state, external commands · Unknown",
             "Lock comparison does not authenticate the plugin.",
+            "Provenance uses local snapshots. The separate Changes check may contact GitHub.",
         ] {
             assert!(text.contains(fact), "missing {fact}: {text}");
         }
@@ -379,7 +451,7 @@ mod tests {
     #[test]
     fn lock_uses_exact_subdirectory_case_and_rejects_duplicate_identities() {
         let desired = Spec::parse("Owner/Plugin/Tools");
-        let mut report = Report::for_bundle(&desired, &[installed("OWNER/PLUGIN/Tools", SHA)], &[]);
+        let mut report = bundle(&desired, &[installed("OWNER/PLUGIN/Tools", SHA)], &[]);
         let first = format!("OWNER/plugin/Tools@{SHA}");
         report.set_lock(Some(&format!("{first}\nowner/plugin/tools@other")));
         assert_eq!(report.lock_ref.as_deref(), Some(SHA));
@@ -412,7 +484,7 @@ mod tests {
         ))
         .unwrap();
         let root = Spec::parse("owner/plugin");
-        let report = Report::for_bundle(&root, &plugins, &[]);
+        let report = bundle(&root, &plugins, &[]);
         assert_eq!(report.resolved.as_deref(), Some(SHA));
         assert_eq!(report.source, Some("GitHub URL"));
 
@@ -421,29 +493,88 @@ mod tests {
             [plugins[0].clone(), structured.clone()],
             [structured, plugins[0].clone()],
         ] {
-            let report = Report::for_bundle(&root, &candidates, &[]);
+            let report = bundle(&root, &candidates, &[]);
             assert_eq!(report.resolved, None);
             assert_eq!(report.source, None);
+            assert!(report.hide_install_details);
         }
 
         let child = Spec::parse("owner/plugin/Tools");
-        for plugin in [
-            plugins[0].clone(),
-            installed("OWNER/PLUGIN", SHA),
-            installed("OWNER/PLUGIN/tools", SHA),
+        for (plugin, hide_details) in [
+            (plugins[0].clone(), false),
+            (installed("OWNER/PLUGIN", SHA), false),
+            (installed("OWNER/PLUGIN/tools", SHA), true),
         ] {
-            let report = Report::for_bundle(&child, &[plugin], &[]);
+            let report = bundle(&child, &[plugin], &[]);
             assert_eq!(report.resolved, None);
             assert_eq!(report.source, None);
+            assert_eq!(report.hide_install_details, hide_details);
         }
-        let conflict = Installed {
-            source_url: Some("https://github.com/other/plugin".into()),
-            ..installed("owner/plugin", SHA)
-        };
-        assert!(registry_identity(&conflict).is_none());
         assert!(repository("https://github.com.evil/owner/plugin").is_none());
         assert!(repository("https://github.com/owner/plugin/tree/main").is_none());
         assert_ne!(repository("owner/plugin.git"), repository("owner/plugin"));
+    }
+
+    #[test]
+    fn sourced_alias_refs_are_split_after_the_transport() {
+        for transport in [
+            "git@GitHub.com:Owner/Plugin.git",
+            "ssh://git@github.com/Owner/Plugin.git",
+            "https://github.com/Owner/Plugin.git",
+        ] {
+            let plain = Spec::parse(transport);
+            let pinned = Spec::parse(&format!("{transport}@v1.2.3+build.4"));
+            for (spec, expected_ref) in [(plain, None), (pinned, Some("v1.2.3+build.4"))] {
+                let mut report = Report::for_bundle(
+                    &spec.display(),
+                    &[installed("owner/plugin", SHA)],
+                    None,
+                    &[],
+                );
+                assert_eq!(report.repository.as_ref().unwrap().0, "owner/plugin");
+                assert_eq!(report.requested.as_deref(), expected_ref);
+                assert_eq!(report.resolved.as_deref(), Some(SHA));
+                assert!(report.hide_install_details);
+                report.set_lock(Some(&format!("owner/plugin@{SHA}")));
+                assert_eq!(report.consistency, Some("Registry revision matches lock"));
+            }
+        }
+    }
+
+    #[test]
+    fn a_named_url_must_corroborate_the_structured_github_root() {
+        let desired = Spec::parse("owner/plugin");
+        let exact = installed("owner/plugin", SHA);
+        for url in [
+            "https://github.com/other/plugin",
+            "https://example.invalid/owner/plugin.git",
+            "https://github.com/owner/plugin/tree/main",
+            "not a URL",
+            "",
+        ] {
+            let installed = crate::parse_plugin_list(&format!(
+                r#"{{"result":{{"plugins":[{{"source":{{"kind":"github","owner":"owner","repo":"plugin","resolved_commit":"{SHA}","url":"{url}"}}}}]}}}}"#
+            ))
+            .unwrap();
+            let conflict = installed.into_iter().next().unwrap();
+            let direct = Report::for_install(&conflict, &[]);
+            assert_eq!(direct.repository, None, "{url:?}");
+            assert_eq!(direct.resolved, None, "{url:?}");
+            assert!(direct.hide_install_details, "{url:?}");
+            // A contradictory claim for this entry is not repaired by selecting another row.
+            let report = bundle(&desired, &[exact.clone(), conflict], &[]);
+            assert_eq!(report.resolved, None, "{url:?}");
+            assert!(report.hide_install_details, "{url:?}");
+        }
+        let corroborated = Installed {
+            source_url: Some("git@GITHUB.COM:OWNER/PLUGIN.git".into()),
+            ..exact.clone()
+        };
+        for plugin in [exact, corroborated] {
+            let report = bundle(&desired, &[plugin], &[]);
+            assert_eq!(report.resolved.as_deref(), Some(SHA));
+            assert!(!report.hide_install_details);
+        }
     }
 
     #[test]
@@ -510,7 +641,7 @@ mod tests {
                 ..registry::Entry::default()
             },
         ];
-        let mut report = Report::for_bundle(&desired, std::slice::from_ref(&plugin), &market);
+        let mut report = bundle(&desired, std::slice::from_ref(&plugin), &market);
         report.set_lock(Some("different/plugin@release"));
         let text = report.lines().join("\n");
         for label in [
@@ -569,11 +700,11 @@ mod tests {
             pushed_at: "2024-01-02T01:02:03Z".into(),
             ..registry::Entry::default()
         };
-        let report = Report::for_bundle(&desired, &[], std::slice::from_ref(&entry));
+        let report = bundle(&desired, &[], std::slice::from_ref(&entry));
         assert!(report.lines().iter().any(|line| {
             line.starts_with("Last push · 2024-01-02") && line.contains("repository-wide")
         }));
-        let report = Report::for_bundle(&desired, &[], &[entry.clone(), entry]);
+        let report = bundle(&desired, &[], &[entry.clone(), entry]);
         assert!(report.lines().contains(&"Last push · Unknown".into()));
     }
 }

@@ -73,6 +73,15 @@ fn body(app: &App, width: u16) -> Body {
     };
 
     let text_width = usize::from(width).saturating_sub(2).max(1);
+    if row.trust.hide_install_details {
+        body.push_color("Installation · Unknown", app.theme.color(Role::Warning));
+        body.push_wrapped(
+            "The installed record cannot be attributed to this entry. Manifest, actions, compatibility, and logs are unavailable here.",
+            text_width,
+        );
+        push_trust(&mut body, &row.trust, text_width);
+        return body;
+    }
     let (status, role) = match (row.installed.is_some(), row.enabled) {
         (false, _) => ("Not installed", Role::Warning),
         (true, Some(true)) => ("Installed · enabled", Role::Success),
@@ -92,7 +101,7 @@ fn body(app: &App, width: u16) -> Body {
     }
     body.push("");
 
-    let Some(detail) = row.detail.as_ref() else {
+    let Some(detail) = row.plugin_detail() else {
         body.push_wrapped(
             "Esc returns to the list. Press i there to install.",
             text_width,
@@ -335,7 +344,7 @@ pub(super) fn draw(app: &App, out: &mut impl Write, width: u16, height: u16) -> 
                     " · ↑/↓ Select · Enter Run · b Bind"
                 });
             }
-            if row.installed.is_some() {
+            if row.installed.is_some() && !row.trust.hide_install_details {
                 hints.push_str(if compact { " · L" } else { " · L Logs" });
             }
             let (footer, _) = clip(&hints, columns);
@@ -502,6 +511,83 @@ mod tests {
         assert!(missing.contains("Requested ref · v1 (bundle list)"));
         assert!(missing.contains("Resolved revision · Unknown"));
         assert!(!missing.contains("Requires Herdr"));
+    }
+
+    #[test]
+    fn detail_does_not_attribute_a_case_distinct_subdirectory_to_the_bundle_entry() {
+        let plugin = Installed {
+            plugin_id: "fixture-other-subdir".into(),
+            enabled: true,
+            source_kind: "github".into(),
+            slug: Some("example/plugin/tools".into()),
+            min_herdr_version: crate::HerdrVersion::parse("0.10.0"),
+            description: "Other manifest description".into(),
+            actions: vec![("other.action".into(), "Other action".into())],
+            events: vec!["other.event".into()],
+            ..Installed::default()
+        };
+        let mut app = App {
+            rows: super::super::rows_with_herdr_version(
+                &[crate::Spec::parse("example/plugin/Tools")],
+                &[plugin],
+                &[],
+                crate::HerdrVersion::parse("0.9.5"),
+            ),
+            detail_of: Some(0),
+            detail_changes: Some((0, Changes::Commits(vec!["Other plugin changes".into()]))),
+            ..App::default()
+        };
+        assert_eq!(app.rows[0].enabled, Some(true));
+        assert!(app.rows[0].herdr_warning.is_some());
+        assert!(app.rows[0].detail.is_some());
+        assert!(app.rows[0].plugin_detail().is_none());
+
+        let frame = render(&app, 120, 24);
+        assert!(frame.contains("Installation · Unknown"));
+        assert!(frame.contains("Repository · example/plugin/Tools (bundle list)"));
+        for hidden in [
+            "Installed ·",
+            "Other manifest description",
+            "Other action",
+            "other.event",
+            "Requires Herdr",
+            "Other plugin changes",
+            "Binding preview",
+            "L Logs",
+        ] {
+            assert!(!frame.contains(hidden), "unexpected {hidden}: {frame:?}");
+        }
+        assert!(!confirm_selection_visible(&mut app, 120, 24));
+        app.run_detail_action();
+        app.bind_selected('t');
+        assert!(app.pending_bind.is_none());
+        app.open_detail_logs(0);
+        assert!(app.log_view.is_none());
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("Logs unavailable · plugin identity is uncertain")
+        );
+    }
+
+    #[test]
+    fn ordinary_weak_local_detail_still_shows_actions() {
+        let plugin = Installed {
+            name: "plugin".into(),
+            enabled: true,
+            source_kind: "local".into(),
+            actions: vec![("local.action".into(), "Local action".into())],
+            ..Installed::default()
+        };
+        let mut app = App {
+            rows: super::super::rows(&[crate::Spec::parse("example/plugin")], &[plugin]),
+            detail_of: Some(0),
+            ..App::default()
+        };
+        let frame = render(&app, 120, 24);
+        assert!(frame.contains("Installed · enabled"));
+        assert!(frame.contains("Local action"));
+        assert!(frame.contains("L Logs"));
+        assert!(confirm_selection_visible(&mut app, 120, 24));
     }
 
     #[test]
