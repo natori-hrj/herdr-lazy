@@ -197,21 +197,53 @@ pub(crate) const PLUGIN_ID: &str = "herdr-lazy";
 ///
 /// Cached: this shells out, and it is consulted several times per run.
 pub(crate) fn config_dir() -> PathBuf {
-    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    DIR.get_or_init(|| {
-        if let Ok(d) = env::var("HERDR_PLUGIN_CONFIG_DIR") {
-            return PathBuf::from(d);
-        }
-        if let Ok((true, out, _)) = run_herdr_response(&["plugin", "config-dir", PLUGIN_ID]) {
-            let p = out.trim();
-            if !p.is_empty() {
-                return PathBuf::from(p);
-            }
-        }
-        // herdr is unreachable or we are not registered with it yet (fresh checkout).
-        legacy_config_dir()
-    })
-    .clone()
+    resolved_config_dir(false).unwrap_or_else(|_| legacy_config_dir())
+}
+
+fn resolved_config_dir(refresh: bool) -> Result<PathBuf, &'static str> {
+    if let Some(path) = env::var_os("HERDR_PLUGIN_CONFIG_DIR") {
+        return if path.is_empty() {
+            Err("HERDR_PLUGIN_CONFIG_DIR is empty")
+        } else {
+            Ok(PathBuf::from(path))
+        };
+    }
+
+    // Share success *and* failure with compatibility callers such as saved themes, without
+    // ever caching the fallback as evidence. Hold the lock through the single discovery.
+    static DIR: std::sync::Mutex<Option<Result<PathBuf, &'static str>>> =
+        std::sync::Mutex::new(None);
+    let mut dir = DIR.lock().expect("config discovery cache");
+    if refresh {
+        *dir = None;
+    }
+    dir.get_or_insert_with(discover_config_dir).clone()
+}
+
+fn discover_config_dir() -> Result<PathBuf, &'static str> {
+    let (status, stdout, _) =
+        herdr_output::capture(&herdr_bin(), &["plugin", "config-dir", PLUGIN_ID]).map_err(
+            |error| match error.kind() {
+                io::ErrorKind::TimedOut => "Herdr config-dir query timed out",
+                _ => "could not capture Herdr config-dir response",
+            },
+        )?;
+    parse_config_dir_response(status.success(), &stdout)
+}
+
+fn parse_config_dir_response(success: bool, stdout: &[u8]) -> Result<PathBuf, &'static str> {
+    if !success {
+        return Err("Herdr config-dir query failed");
+    }
+    let path = std::str::from_utf8(stdout).map_err(|_| "Herdr config-dir response is not UTF-8")?;
+    let path = path
+        .strip_suffix("\r\n")
+        .or_else(|| path.strip_suffix('\n'))
+        .unwrap_or(path);
+    if path.chars().any(char::is_control) || !Path::new(path).is_absolute() {
+        return Err("Herdr config-dir response is not one absolute path");
+    }
+    Ok(PathBuf::from(path))
 }
 
 /// Where an earlier version kept things, before the location was taken from herdr.
@@ -227,12 +259,13 @@ fn legacy_config_dir() -> PathBuf {
 /// dir mixed in with a cache they do not want to commit. Unset, it stays exactly where it
 /// always was, so nothing changes for anyone not asking for this.
 pub(crate) fn bundle_path() -> PathBuf {
-    if let Ok(p) = env::var("HERDR_LAZY_LIST") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
-        }
-    }
-    config_dir().join("plugins.list")
+    bundle_override().unwrap_or_else(|| config_dir().join("plugins.list"))
+}
+
+fn bundle_override() -> Option<PathBuf> {
+    env::var_os("HERDR_LAZY_LIST")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
 }
 
 /// The lock sits beside the list, wherever the list is.
@@ -533,10 +566,6 @@ fn read_lines(p: &Path) -> Vec<String> {
     }
 }
 
-pub(crate) fn desired_plugins() -> Vec<String> {
-    desired_plugins_result().unwrap_or_default()
-}
-
 fn desired_plugins_result() -> io::Result<Vec<String>> {
     migrate_legacy_bundle()?;
     let body = match read_local_text(&bundle_path(), "plugin list") {
@@ -544,11 +573,144 @@ fn desired_plugins_result() -> io::Result<Vec<String>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(error),
     };
-    Ok(body
-        .lines()
-        .map(|line| line.trim().to_string())
+    Ok(bundle_lines(&body))
+}
+
+fn bundle_lines(body: &str) -> Vec<String> {
+    body.lines()
+        .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .collect())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Evidence for the manage UI only. Do not infer authorization from the compatibility path.
+struct ObservedBundle {
+    path: PathBuf,
+    /// None is a confirmed missing leaf, distinct from observed empty contents.
+    contents: Option<Vec<String>>,
+}
+
+impl ObservedBundle {
+    fn lines(&self) -> &[String] {
+        self.contents.as_deref().unwrap_or_default()
+    }
+}
+
+#[derive(Debug)]
+enum BundleError {
+    Location(&'static str),
+    UnresolvedParent(PathBuf, io::Error),
+    Inaccessible(PathBuf, io::Error),
+    Invalid(PathBuf, io::Error),
+}
+
+impl fmt::Display for BundleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Location(reason) => write!(f, "unconfirmed list location: {reason}"),
+            Self::UnresolvedParent(path, error) => {
+                write!(
+                    f,
+                    "unconfirmed list location at {}: {error}",
+                    path.display()
+                )
+            }
+            Self::Inaccessible(path, error) | Self::Invalid(path, error) => {
+                write!(f, "{}: {error}", path.display())
+            }
+        }
+    }
+}
+
+fn bundle_content_error(path: &Path, error: io::Error) -> BundleError {
+    if error.kind() == io::ErrorKind::InvalidData {
+        BundleError::Invalid(path.to_path_buf(), error)
+    } else {
+        BundleError::Inaccessible(path.to_path_buf(), error)
+    }
+}
+
+fn read_ui_bundle(path: &Path) -> Result<Option<Vec<String>>, BundleError> {
+    // A trailing separator or `/.` is not an exact file leaf.
+    if !path.file_name().is_some_and(|name| {
+        path.as_os_str()
+            .as_encoded_bytes()
+            .ends_with(name.as_encoded_bytes())
+    }) {
+        return Err(BundleError::UnresolvedParent(
+            path.to_path_buf(),
+            io::Error::new(io::ErrorKind::InvalidInput, "expected a file leaf"),
+        ));
+    }
+    // A following NotFound does not prove absence: the exact leaf may be a dangling link.
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let kind = metadata.file_type();
+            if !kind.is_file() && !kind.is_symlink() {
+                return Err(BundleError::Invalid(
+                    path.to_path_buf(),
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "plugin list is not a regular file",
+                    ),
+                ));
+            }
+            read_local_text(path, "plugin list")
+                .map(|body| Some(bundle_lines(&body)))
+                .map_err(|error| bundle_content_error(path, error))
+        }
+        Err(error) => {
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            match fs::metadata(parent) {
+                Ok(metadata) if metadata.is_dir() => {
+                    if error.kind() == io::ErrorKind::NotFound {
+                        Ok(None)
+                    } else {
+                        Err(bundle_content_error(path, error))
+                    }
+                }
+                Ok(_) => Err(BundleError::UnresolvedParent(path.to_path_buf(), error)),
+                Err(error) => Err(BundleError::UnresolvedParent(path.to_path_buf(), error)),
+            }
+        }
+    }
+}
+
+fn observe_bundle(refresh: bool) -> Result<ObservedBundle, BundleError> {
+    let (path, migrate) = match bundle_override() {
+        Some(path) => (path, false),
+        None => (
+            resolved_config_dir(refresh)
+                .map_err(BundleError::Location)?
+                .join("plugins.list"),
+            true,
+        ),
+    };
+    let mut contents = read_ui_bundle(&path)?;
+    if contents.is_none() && migrate {
+        let legacy = legacy_config_dir().join("plugins.list");
+        let copied = copy_legacy_bundle(&path, &legacy, |body| {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)?
+                .write_all(body.as_bytes())
+        });
+        match copied {
+            Ok(false) => {}
+            Ok(true) => contents = read_ui_bundle(&path)?,
+            // Another creator won the slot. Observe it, but never follow it for a write.
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                contents = read_ui_bundle(&path)?;
+            }
+            Err(error) => return Err(bundle_content_error(&path, error)),
+        }
+    }
+    Ok(ObservedBundle { path, contents })
 }
 
 /// Move a bundle written by an earlier version into the location herdr gives us.
@@ -560,7 +722,7 @@ fn migrate_legacy_bundle() -> io::Result<()> {
     // When the location was chosen explicitly, do not auto-populate it. That path is likely a
     // dotfiles repo, and silently writing a legacy list into it is not ours to do — `init` or
     // `add` will, when the user asks.
-    if env::var("HERDR_LAZY_LIST").is_ok_and(|v| !v.is_empty()) {
+    if bundle_override().is_some() {
         return Ok(());
     }
     let current = bundle_path();
@@ -572,23 +734,36 @@ fn migrate_legacy_bundle_at(current: &Path, legacy: &Path) -> io::Result<()> {
     if current.exists() {
         return Ok(());
     }
+    copy_legacy_bundle(current, legacy, |body| {
+        ensure_parent(current)?;
+        write_local_text(current, body, "plugin list")
+    })?;
+    Ok(())
+}
+
+fn copy_legacy_bundle(
+    current: &Path,
+    legacy: &Path,
+    write: impl FnOnce(&str) -> io::Result<()>,
+) -> io::Result<bool> {
     if legacy == current {
-        return Ok(());
+        return Ok(false);
     }
-    let body = match read_local_text(legacy, "legacy plugin list") {
-        Ok(body) => body,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+    // A known legacy entry that cannot be read is a failed migration, not absence.
+    match fs::symlink_metadata(legacy) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
-    };
-    ensure_parent(current)?;
-    write_local_text(current, &body, "plugin list")?;
+    }
+    let body = read_local_text(legacy, "legacy plugin list")?;
+    write(&body)?;
     println!(
         "moved your plugin list to the location herdr uses:\n  {} -> {}\n  (the old copy is \
          left in place; delete it when you are happy)",
         legacy.display(),
         current.display()
     );
-    Ok(())
+    Ok(true)
 }
 
 /// "owner/repo" or "owner/repo/subdir" -> "repo"
@@ -2121,10 +2296,11 @@ fn print_check_report(
 /// Marketplace data is refreshed only because the user explicitly asked to run this command.
 /// A failed refresh never becomes a false current result: all update statuses remain uncertain.
 fn cmd_check(fail_on_problem: bool, json: bool) -> io::Result<()> {
-    // Do not call desired_plugins here: its legacy migration is intentionally useful for
+    // Do not call desired_plugins_result here: its legacy migration is intentionally useful for
     // mutating commands, but a read-only check must not create or copy a list file.
     let configured_list_path = bundle_path();
-    let legacy_list_path = (!env::var("HERDR_LAZY_LIST").is_ok_and(|value| !value.is_empty()))
+    let legacy_list_path = bundle_override()
+        .is_none()
         .then(|| legacy_config_dir().join("plugins.list"));
     let (desired, list_path) =
         match read_check_specs(&configured_list_path, legacy_list_path.as_deref()) {
@@ -3936,6 +4112,42 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_dir_wire_requires_success_and_one_absolute_utf8_path() {
+        #[cfg(windows)]
+        let path = r"C:\ fixture directory ";
+        #[cfg(not(windows))]
+        let path = "/ fixture directory ";
+        for ending in ["", "\n", "\r\n"] {
+            let wire = format!("{path}{ending}");
+            assert_eq!(
+                parse_config_dir_response(true, wire.as_bytes()),
+                Ok(PathBuf::from(path))
+            );
+            assert!(parse_config_dir_response(false, wire.as_bytes()).is_err());
+        }
+        for invalid in [
+            "",
+            "relative",
+            "\n",
+            " ",
+            " /absolute",
+            &format!("{path}\n\n"),
+            &format!("{path}\r"),
+            &format!("{path}\nother"),
+            &format!("{path}\u{1b}"),
+            &format!("{path}\0"),
+        ] {
+            assert!(
+                parse_config_dir_response(true, invalid.as_bytes()).is_err(),
+                "{invalid:?}"
+            );
+        }
+        let mut invalid = path.as_bytes().to_vec();
+        invalid.push(0xff);
+        assert!(parse_config_dir_response(true, &invalid).is_err());
+    }
 
     /// Verbatim from `herdr plugin list --json` (herdr 0.7.4), trimmed of long arrays.
     const LINKED_LOCAL: &str = r#"{"id":"cli:plugin","result":{"plugins":[{"actions":[{"command":["target/release/herdr-lazy","init"],"contexts":["workspace"],"id":"init","title":"Lazy: install curated defaults"}],"build":[{"command":["cargo","build","--release"]}],"description":"Be lazy","enabled":true,"manifest_path":"/Users/n/work/herdr-lazy/herdr-plugin.toml","min_herdr_version":"0.7.0","name":"herdr-lazy","platforms":["macos"],"plugin_id":"herdr-lazy","plugin_root":"/Users/n/work/herdr-lazy","source":{"kind":"local"},"version":"0.1.0"}],"type":"plugin_list"}}"#;
