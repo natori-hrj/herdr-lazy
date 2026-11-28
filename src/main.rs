@@ -30,6 +30,7 @@ mod extras;
 mod github;
 mod json;
 mod machine;
+mod plugin_trust;
 mod profile;
 mod recommendations;
 mod registry;
@@ -715,6 +716,8 @@ pub(crate) struct Installed {
     /// `source.resolved_commit` — the exact commit herdr checked out. This is what makes a
     /// lockfile real: we can record what is actually installed, not merely what was asked for.
     pub(crate) resolved_commit: Option<String>,
+    /// A named source URL, when present. Provenance must not infer this from arbitrary leaves.
+    source_url: Option<String>,
     /// Every string value inside `source`, as a fallback for source kinds we have not seen
     /// (e.g. a plain clone URL) so an unknown shape degrades to a match attempt, not a miss.
     source_values: Vec<String>,
@@ -914,6 +917,11 @@ pub(crate) fn parse_plugin_list(stdout: &str) -> Result<Vec<Installed>, String> 
                     .path(&["source", "resolved_commit"])
                     .and_then(|c| c.as_str())
                     .map(|s| s.to_string()),
+                source_url: p
+                    .path(&["source", "url"])
+                    .and_then(|url| url.as_str())
+                    .filter(|url| url.len() <= plugin_trust::MAX_IDENTITY_INPUT)
+                    .map(str::to_owned),
                 source_values,
             }
         })

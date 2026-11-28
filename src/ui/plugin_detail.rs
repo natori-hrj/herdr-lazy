@@ -55,6 +55,14 @@ impl Body {
     }
 }
 
+fn push_trust(body: &mut Body, report: &crate::plugin_trust::Report, width: usize) {
+    body.push("");
+    body.push_styled("Plugin provenance", Color::Plain, true);
+    for fact in report.lines() {
+        body.push_wrapped(&fact, width);
+    }
+}
+
 fn body(app: &App, width: u16) -> Body {
     let mut body = Body::default();
     let Some(idx) = app.detail_of else {
@@ -72,19 +80,6 @@ fn body(app: &App, width: u16) -> Body {
         (true, None) => ("Installed", Role::Success),
     };
     body.push_color(status, app.theme.color(role));
-    if let Some(slug) = row.slug.as_deref() {
-        body.push_wrapped(&format!("Repository · {slug}"), text_width);
-    }
-    if let Some(commit) = row.commit.as_deref() {
-        body.push_wrapped(&format!("Resolved commit · {commit}"), text_width);
-    }
-    if let Some(reference) = row
-        .listed_as
-        .as_deref()
-        .and_then(|line| crate::Spec::parse(line).reference)
-    {
-        body.push_wrapped(&format!("Listed ref · {reference}"), text_width);
-    }
     if let Some(warning) = row.herdr_warning {
         body.push_wrapped_color(
             &format!(
@@ -102,23 +97,13 @@ fn body(app: &App, width: u16) -> Body {
             "Esc returns to the list. Press i there to install.",
             text_width,
         );
+        push_trust(&mut body, &row.trust, text_width);
         return body;
     };
 
     if !detail.description.is_empty() {
         body.push_wrapped(&detail.description, text_width);
         body.push("");
-    }
-
-    if let Some(maintenance) = row.maintenance.as_ref() {
-        if let Some(age) = maintenance.age() {
-            let quiet = if maintenance.is_quiet() {
-                " · quiet"
-            } else {
-                ""
-            };
-            body.push(format!("Maintenance · last pushed {age} ago{quiet}"));
-        }
     }
 
     let items = App::bindable(detail);
@@ -205,6 +190,7 @@ fn body(app: &App, width: u16) -> Body {
         body.push(format!("  type = \"{kind}\""));
         body.push_wrapped(&format!("  command = \"{command}\""), text_width);
     }
+    push_trust(&mut body, &row.trust, text_width);
     body
 }
 
@@ -431,7 +417,7 @@ mod tests {
         app.rows[0].label = "owner/long-plugin-name".into();
         let end = render(&app, 40, 11);
         assert!(end.contains("Selected: Command 1"));
-        assert!(end.contains("\x1b[1m Binding preview\x1b[0m"));
+        assert!(end.contains("Lock comparison does not authenticate"));
         assert!(end.contains("Pg↑"));
         assert!(!end.contains("Pg↓"));
         assert!(!end.contains("\x1b[1mEnter\x1b[0m"));
@@ -473,39 +459,69 @@ mod tests {
     }
 
     #[test]
-    fn detail_lists_only_available_local_metadata() {
+    fn detail_shows_source_labelled_evidence_and_unknowns_for_missing_rows() {
         let mut app = fixture();
-        let row = &mut app.rows[0];
-        row.slug = Some("example/plugin".into());
-        row.enabled = Some(false);
-        row.commit = Some("0123456789abcdef0123456789abcdef01234567".into());
-        row.listed_as = Some("example/plugin@stable".into());
-        row.herdr_warning = Some(super::super::HerdrVersionWarning {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let plugin = Installed {
+            slug: Some("Example/Plugin".into()),
+            source_kind: "github".into(),
+            resolved_commit: Some(sha.into()),
+            ..Installed::default()
+        };
+        let spec = crate::Spec::parse("example/plugin@stable");
+        app.rows = super::super::rows(&[spec], &[plugin]);
+        app.rows[0]
+            .trust
+            .set_lock(Some(&format!("example/plugin@{sha}")));
+        app.rows[0].herdr_warning = Some(super::super::HerdrVersionWarning {
             required: crate::HerdrVersion::parse("0.10.0").unwrap(),
             running: crate::HerdrVersion::parse("0.9.5").unwrap(),
         });
+        app.detail_changes = None;
         let wide = render(&app, 120, 24);
         for fact in [
             "Installed · disabled",
-            "Repository · example/plugin",
-            "Resolved commit · 0123456789abcdef0123456789abcdef01234567",
-            "Listed ref · stable",
             "Requires Herdr 0.10.0 · running 0.9.5",
+            "Plugin provenance",
+            "Repository · example/plugin (bundle list)",
+            "Resolved revision · 0123456789abcdef0123456789abcdef01234567 (installed registry)",
+            "Requested ref · stable (bundle list)",
+            "Registry revision matches lock",
         ] {
-            assert!(wide.contains(fact), "missing {fact}");
+            assert!(wide.contains(fact), "missing {fact}: {wide:?}");
         }
         let narrow = body(&app, 25);
         let text: String = narrow.lines.into_iter().map(|line| line.text).collect();
-        assert!(text.contains("0123456789abcdef0123456789abcdef01234567"));
+        assert!(text.contains(sha));
 
         let spec = crate::Spec::parse("example/missing@v1");
         app.rows = super::super::rows(&[spec], &[]);
-        let missing = render(&app, 80, 10);
+        let missing = render(&app, 80, 24);
         assert!(missing.contains("Not installed"));
-        assert!(missing.contains("Repository · example/missing"));
-        assert!(missing.contains("Listed ref · v1"));
-        assert!(!missing.contains("Resolved commit"));
+        assert!(missing.contains("Repository · example/missing (bundle list)"));
+        assert!(missing.contains("Requested ref · v1 (bundle list)"));
+        assert!(missing.contains("Resolved revision · Unknown"));
         assert!(!missing.contains("Requires Herdr"));
+    }
+
+    #[test]
+    fn detail_scroll_stays_local_and_log_modal_keeps_precedence() {
+        let mut app = fixture();
+        let cursor = app.detail_cursor;
+        scroll_rows(&mut app, 80, 9, isize::MAX);
+        assert!(render(&app, 80, 9).contains("Lock comparison does not authenticate"));
+        let offset = app.detail_scroll;
+        app.log_view = Some(super::super::LogView::from_result(
+            "example.plugin".into(),
+            Ok("example log".into()),
+        ));
+        let modal = render(&app, 80, 24);
+        assert!(modal.contains("example log"));
+        assert!(!modal.contains("Lock comparison"));
+        app.log_view = None;
+        assert_eq!(app.detail_scroll, offset);
+        assert_eq!(app.detail_cursor, cursor);
+        assert!(render(&app, 80, 9).contains("Lock comparison does not authenticate"));
     }
 
     #[test]

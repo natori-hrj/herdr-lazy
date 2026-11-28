@@ -142,6 +142,8 @@ struct Row {
     /// What this plugin can do, for the details view. Empty for anything not installed —
     /// herdr only knows a manifest once it has fetched it.
     detail: Option<PluginDetail>,
+    /// Local evidence for Plugin Details, separate from operational matches and pins.
+    trust: crate::plugin_trust::Report,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -691,6 +693,11 @@ fn rows_with_herdr_version(
             maybe_stale: hit.map(|(p, _)| stale(p, Some(spec))).unwrap_or(false),
             picked: false,
             detail: hit.map(|(p, _)| detail_of(p)),
+            trust: crate::plugin_trust::Report::from_snapshots(
+                Some(spec),
+                hit.map(|(p, _)| p),
+                market,
+            ),
         });
     }
 
@@ -718,6 +725,7 @@ fn rows_with_herdr_version(
             maybe_stale: stale(p, None),
             picked: false,
             detail: Some(detail_of(p)),
+            trust: crate::plugin_trust::Report::from_snapshots(None, Some(p), market),
         });
     }
 
@@ -1774,9 +1782,11 @@ impl App {
     }
 
     fn open_detail(&mut self) {
-        let Some(row) = self.rows.get(self.cursor) else {
+        let Some(row) = self.rows.get_mut(self.cursor) else {
             return;
         };
+        let lock = crate::plugin_trust::read_lock(&crate::lock_path());
+        row.trust.set_lock(lock.as_deref());
         self.detail_of = Some(self.cursor);
         self.detail_cursor = 0;
         self.detail_scroll = 0;
