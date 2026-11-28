@@ -578,12 +578,9 @@ mod tests {
             let plain = Spec::parse(transport);
             let pinned = Spec::parse(&format!("{transport}@v1.2.3+build.4"));
             for (spec, expected_ref) in [(plain, None), (pinned, Some("v1.2.3+build.4"))] {
-                let (mut report, payload) = Report::for_bundle(
-                    &spec.display(),
-                    &[installed("owner/plugin", SHA)],
-                    None,
-                    &[],
-                );
+                let records = [installed("owner/plugin", SHA)];
+                let (mut report, payload) =
+                    Report::for_bundle(&spec.display(), &records, None, &[]);
                 assert_eq!(report.repository.as_ref().unwrap().0, "owner/plugin");
                 assert_eq!(report.requested.as_deref(), expected_ref);
                 assert_eq!(report.resolved.as_deref(), Some(SHA));
