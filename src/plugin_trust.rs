@@ -5,7 +5,7 @@ use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::Path;
 
-use crate::{registry, Installed};
+use crate::{json, registry, Installed};
 
 const UNKNOWN: &str = "Unknown";
 const MAX_IDENTITY_INPUT: usize = 320;
@@ -150,18 +150,51 @@ pub(crate) enum SourceScope {
 }
 
 impl SourceScope {
+    pub(crate) fn from_source(source: Option<&json::Value>) -> Self {
+        let fields = match source {
+            None => return Self::Absent,
+            Some(json::Value::Obj(fields)) => fields,
+            Some(_) => return Self::Invalid(None),
+        };
+        // Keep the legacy `git` URL-only and absent-kind forms. A present
+        // malformed or unsupported kind is not equivalent to either.
+        let kind = fields.get("kind").map_or("unknown", |value| {
+            value
+                .as_str()
+                .filter(|kind| matches!(*kind, "github" | "local" | "git"))
+                .unwrap_or_default()
+        });
+        if kind == "local"
+            && fields
+                .get("url")
+                .is_some_and(|value| !value.as_str().is_some_and(is_local_file_url))
+        {
+            return Self::Invalid(None);
+        }
+        Self::from_fields(
+            kind,
+            fields.get("owner"),
+            fields.get("repo"),
+            fields.get("subdir"),
+        )
+    }
+
     pub(crate) fn from_fields(
         kind: &str,
-        owner: Option<&crate::json::Value>,
-        repo: Option<&crate::json::Value>,
-        subdir: Option<&crate::json::Value>,
+        owner: Option<&json::Value>,
+        repo: Option<&json::Value>,
+        subdir: Option<&json::Value>,
     ) -> Self {
         if owner.is_none() && repo.is_none() && subdir.is_none() {
-            return Self::Absent;
+            return if kind.trim().is_empty() {
+                Self::Invalid(None)
+            } else {
+                Self::Absent
+            };
         }
         let (Some(owner), Some(repo)) = (
-            owner.and_then(crate::json::Value::as_str),
-            repo.and_then(crate::json::Value::as_str),
+            owner.and_then(json::Value::as_str),
+            repo.and_then(json::Value::as_str),
         ) else {
             return Self::Invalid(None);
         };
@@ -192,6 +225,34 @@ impl SourceScope {
         }
         Self::GitHub(canonical)
     }
+}
+
+// The canonical local source has no URL. Accept the legacy absolute file URL
+// without treating an arbitrary non-GitHub URL as valid local source metadata.
+fn is_local_file_url(url: &str) -> bool {
+    let Some(path) = url.strip_prefix("file:///") else {
+        return false;
+    };
+    if path.is_empty() {
+        return false;
+    }
+    let mut bytes = path.bytes();
+    while let Some(byte) = bytes.next() {
+        match byte {
+            b'%' => {
+                let encoded = (bytes.next(), bytes.next());
+                if !matches!(encoded, (Some(high), Some(low))
+                    if high.is_ascii_hexdigit() && low.is_ascii_hexdigit())
+                    || encoded == (Some(b'0'), Some(b'0'))
+                {
+                    return false;
+                }
+            }
+            _ if byte.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@/".contains(&byte) => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn join_raw_scope(prefix: &str, suffix: &str) -> Option<String> {
@@ -246,10 +307,19 @@ fn registry_identity(plugin: &Installed) -> RegistryIdentity {
             }
         }
         SourceScope::GitHub(slug) => RegistryIdentity::Known(slug.clone(), REGISTRY),
-        SourceScope::Absent if plugin.source_kind != "local" => alias
-            .map(|slug| RegistryIdentity::Known(slug.to_owned(), "installed registry URL"))
-            .unwrap_or(RegistryIdentity::Unidentified),
-        SourceScope::Absent => RegistryIdentity::Unidentified,
+        // Upstream's local-link source has no repository scope. A URL is not GitHub
+        // provenance for an explicitly local link; it can still be addressed by ID.
+        SourceScope::Absent if plugin.source_kind == "local" => RegistryIdentity::Unidentified,
+        SourceScope::Absent => match &plugin.source_url {
+            SourceUrl::Absent => RegistryIdentity::Unidentified,
+            SourceUrl::Invalid => RegistryIdentity::Conflict {
+                structured: None,
+                alias: None,
+            },
+            SourceUrl::GitHubRoot(slug) => {
+                RegistryIdentity::Known(slug.clone(), "installed registry URL")
+            }
+        },
     }
 }
 
@@ -568,6 +638,116 @@ mod tests {
 
     fn bundle(desired: &Spec, installed: &[Installed], market: &[registry::Entry]) -> Report {
         Report::for_bundle(&desired.display(), installed, installed.first(), market).0
+    }
+
+    fn parsed_registry(source_field: &str) -> Vec<Installed> {
+        crate::parse_plugin_list(&format!(
+            r#"{{"result":{{"plugins":[{{"plugin_id":"fixture.plugin","enabled":false,
+                "actions":[{{"id":"fixture.action","title":"Fixture action"}}]{source_field}
+            }}]}}}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn malformed_kind_blocks_clone_url_fallback_but_not_lifecycle_matching() {
+        let spec = Spec::parse("owner/plugin");
+        for (kind, lifecycle_kind) in [
+            ("null", "unknown"),
+            ("42", "unknown"),
+            ("false", "unknown"),
+            ("[]", "unknown"),
+            ("{}", "unknown"),
+            (r#""""#, ""),
+            (r#"" ""#, " "),
+            (r#""unsupported""#, "unsupported"),
+        ] {
+            let records = parsed_registry(&format!(
+                r#","source":{{"kind":{kind},"url":"https://github.com/owner/plugin.git","resolved_commit":"{SHA}"}}"#
+            ));
+            let plugin = &records[0];
+            assert_eq!(plugin.matches(&spec), crate::Match::Strong, "{kind}");
+            assert_eq!(plugin.resolved_commit.as_deref(), Some(SHA), "{kind}");
+            assert_eq!(plugin.source_kind, lifecycle_kind, "{kind}");
+            let (report, payload) =
+                Report::for_bundle(&spec.display(), &records, Some(plugin), &[]);
+            assert_eq!(report.resolved, None, "{kind}");
+            assert!(payload.is_none(), "{kind}");
+            let (report, payload) = Report::for_install(plugin, &records, &[]);
+            assert_eq!(report.repository, None, "{kind}");
+            assert_eq!(report.resolved, None, "{kind}");
+            assert!(payload.is_none(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn invalid_url_without_scope_blocks_direct_id_payload() {
+        for url in [
+            "null",
+            "42",
+            r#""""#,
+            r#""https://example.invalid/owner/plugin.git""#,
+            r#""https://github.com/owner/plugin/tree/main""#,
+        ] {
+            for kind in ["", r#""kind":"github","#] {
+                let records = parsed_registry(&format!(
+                    r#","source":{{{kind}"url":{url},"resolved_commit":"{SHA}","installed_unix_ms":123}}"#
+                ));
+                let plugin = &records[0];
+                assert_eq!(plugin.installed_unix_ms, Some(123));
+                assert_eq!(plugin.resolved_commit.as_deref(), Some(SHA));
+                let (report, payload) = Report::for_install(plugin, &records, &[]);
+                assert!(payload.is_none(), "{kind}{url}");
+                assert_eq!(report.resolved, None, "{kind}{url}");
+                assert_eq!(report.installed_ms, None, "{kind}{url}");
+                assert_eq!(report.source, None, "{kind}{url}");
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_source_is_not_an_unidentified_or_local_install() {
+        for source in [
+            "null",
+            "[]",
+            r#""local""#,
+            "42",
+            r#"{"kind":null}"#,
+            r#"{"kind":""}"#,
+            r#"{"kind":"local","url":null}"#,
+            r#"{"kind":"local","url":"\u0000"}"#,
+            r#"{"kind":"local","url":"file:///invalid%00path"}"#,
+            r#"{"kind":"local","url":"file:///invalid%path"}"#,
+            r#"{"kind":"local","url":"https://github.com/owner/plugin"}"#,
+            r#"{"kind":"local","owner":"owner","repo":"plugin"}"#,
+        ] {
+            let records = parsed_registry(&format!(r#","source":{source}"#));
+            let (report, payload) = Report::for_install(&records[0], &records, &[]);
+            assert!(payload.is_none(), "{source}");
+            assert_eq!(report.source, None, "{source}");
+        }
+
+        for (source_field, expected_provenance) in [
+            ("", None),
+            (r#","source":{}"#, None),
+            (r#","source":{"kind":"local"}"#, Some("Local link")),
+            (
+                r#","source":{"kind":"local","url":"file:///local/plugin"}"#,
+                Some("Local link"),
+            ),
+        ] {
+            let records = parsed_registry(source_field);
+            let plugin = &records[0];
+            let (report, payload) = Report::for_install(plugin, &records, &[]);
+            assert_eq!(report.repository, None, "{source_field}");
+            assert_eq!(report.source, expected_provenance, "{source_field}");
+            let payload = payload.expect("a unique ID can authorize a direct payload");
+            assert_eq!(payload.actions[0].0, "fixture.action");
+            assert!(!payload.enabled);
+            let (_, bundle_payload) =
+                Report::for_bundle("owner/plugin", &records, Some(plugin), &[]);
+            assert!(bundle_payload.is_none(), "{source_field}");
+        }
     }
 
     #[test]
