@@ -710,7 +710,7 @@ pub(crate) struct Installed {
     /// `owner/repo` rebuilt from `source.owner` + `source.repo`. herdr stores them as two
     /// separate fields, never as a joined slug, so this has to be assembled.
     pub(crate) slug: Option<String>,
-    /// Structured attribution evidence, independent of the flattened lifecycle slug.
+    /// Source shape and structured attribution, independent of the lifecycle kind and slug.
     source_scope: plugin_trust::SourceScope,
     /// Broadcast to every record: duplicate keys anywhere can hide a competing claim or ID.
     registry_duplicate_observed: bool,
@@ -920,12 +920,7 @@ pub(crate) fn parse_plugin_list(stdout: &str) -> Result<Vec<Installed>, String> 
                         _ => None,
                     }),
                 slug,
-                source_scope: plugin_trust::SourceScope::from_fields(
-                    source_kind,
-                    owner,
-                    repo,
-                    source.and_then(|s| s.get("subdir")),
-                ),
+                source_scope: plugin_trust::SourceScope::from_source(source),
                 registry_duplicate_observed,
                 resolved_commit: p
                     .path(&["source", "resolved_commit"])
