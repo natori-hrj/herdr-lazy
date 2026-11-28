@@ -693,11 +693,7 @@ fn rows_with_herdr_version(
             maybe_stale: hit.map(|(p, _)| stale(p, Some(spec))).unwrap_or(false),
             picked: false,
             detail: hit.map(|(p, _)| detail_of(p)),
-            trust: crate::plugin_trust::Report::from_snapshots(
-                Some(spec),
-                hit.map(|(p, _)| p),
-                market,
-            ),
+            trust: crate::plugin_trust::Report::for_bundle(spec, installed, market),
         });
     }
 
@@ -725,7 +721,7 @@ fn rows_with_herdr_version(
             maybe_stale: stale(p, None),
             picked: false,
             detail: Some(detail_of(p)),
-            trust: crate::plugin_trust::Report::from_snapshots(None, Some(p), market),
+            trust: crate::plugin_trust::Report::for_install(p, market),
         });
     }
 
@@ -5186,6 +5182,56 @@ mod tests {
                 have: SHA.to_string()
             }
         );
+    }
+
+    #[test]
+    fn bundle_provenance_does_not_use_the_operational_tie_breaker() {
+        let desired = [Spec::parse("owner/plugin/Tools")];
+        let mut exact = github("OWNER", "PLUGIN/Tools", SHA, true);
+        exact.plugin_id = "exact".into();
+        let mut duplicate = github("owner", "plugin/Tools", OTHER, false);
+        duplicate.plugin_id = "duplicate".into();
+        let mut sibling = github("owner", "plugin/tools", OTHER, false);
+        sibling.plugin_id = "sibling".into();
+        let root = github("owner", "plugin", OTHER, true);
+
+        for candidates in [
+            [exact.clone(), duplicate.clone()],
+            [duplicate, exact.clone()],
+        ] {
+            let r = rows(&desired, &candidates);
+            let winner = &candidates[1];
+            assert_eq!(
+                r[0].installed.as_ref().map(|(id, _)| id),
+                Some(&winner.plugin_id)
+            );
+            assert_eq!(r[0].enabled, Some(winner.enabled));
+            assert_eq!(r[0].commit, winner.resolved_commit);
+            assert_eq!(
+                r[0].status,
+                if winner.enabled {
+                    Status::Ok
+                } else {
+                    Status::Disabled
+                }
+            );
+            for line in [
+                "Resolved revision · Unknown",
+                "Provenance · Unknown",
+                "Installation recorded · Unknown",
+            ] {
+                assert!(r[0].trust.lines().iter().any(|fact| fact == line));
+            }
+        }
+
+        let expected = format!("Resolved revision · {SHA} (installed registry)");
+        for candidates in [
+            [exact.clone(), root.clone(), sibling.clone()],
+            [sibling, root, exact],
+        ] {
+            let r = rows(&desired, &candidates);
+            assert!(r[0].trust.lines().contains(&expected));
+        }
     }
 
     /// A local link must never be shown as prunable: `--prune` protects it, and a UI that

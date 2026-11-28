@@ -109,16 +109,22 @@ fn safe_ref(value: &str) -> Option<&str> {
         && !value.starts_with('-')
         && !value.starts_with('/')
         && !value.ends_with('/')
+        && !value.ends_with('.')
+        && value != "@"
+        && !value.contains("@{")
         && !value.contains("..")
         && !value.contains("//")
+        && !value
+            .split('/')
+            .any(|component| component.starts_with('.') || component.ends_with(".lock"))
         && value
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"._/-".contains(&b)))
+            .all(|b| b.is_ascii_graphic() && !b"~^:?*[\\".contains(&b)))
     .then_some(value)
 }
 
-fn commit(value: &str) -> Option<&str> {
-    ((7..=64).contains(&value.len()) && crate::is_commit_ref(value)).then_some(value)
+fn full_digest(value: &str) -> Option<&str> {
+    (matches!(value.len(), 40 | 64) && crate::is_commit_ref(value)).then_some(value)
 }
 
 fn registry_identity(plugin: &Installed) -> Option<(String, &'static str)> {
@@ -163,29 +169,6 @@ fn lock_record(line: &str) -> Option<(String, Option<&str>)> {
     Some((repository(repo)?, reference))
 }
 
-fn lock_consistency(resolved: &str, locked: &str) -> &'static str {
-    let (have_full, lock_full) = (
-        matches!(resolved.len(), 40 | 64),
-        matches!(locked.len(), 40 | 64),
-    );
-    // Full hashes in different formats don't establish either equality or drift. An apparent
-    // abbreviation longer than a full hash is also not valid evidence in that hash format.
-    if (have_full && locked.len() > resolved.len()) || (lock_full && resolved.len() > locked.len())
-    {
-        return UNKNOWN;
-    }
-    let shared = resolved.len().min(locked.len());
-    if !resolved[..shared].eq_ignore_ascii_case(&locked[..shared]) {
-        "Registry revision differs from lock"
-    } else if !have_full {
-        UNKNOWN
-    } else if lock_full {
-        "Registry revision matches lock"
-    } else {
-        "Registry revision matches lock prefix"
-    }
-}
-
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Report {
     repository: Option<(String, &'static str)>,
@@ -199,43 +182,49 @@ pub(crate) struct Report {
 }
 
 impl Report {
-    pub(crate) fn from_snapshots(
-        desired: Option<&Spec>,
-        selected_install: Option<&Installed>,
+    pub(crate) fn for_bundle(
+        desired: &Spec,
+        installed: &[Installed],
         market: &[registry::Entry],
     ) -> Self {
-        let registry_repo = selected_install.and_then(registry_identity);
-        let repository = match desired {
-            Some(spec) => repository(&spec.repo).map(|slug| (slug, BUNDLE)),
-            None => registry_repo.clone(),
-        };
-        // Existing callers can select by name or a repository-root match. Those choices still
-        // drive actions, but can't supply revision evidence for another plugin in a monorepo.
-        let installed = selected_install.filter(|_| {
-            desired.is_none()
-                || repository
-                    .as_ref()
-                    .zip(registry_repo.as_ref())
-                    .is_some_and(|((wanted, _), (recorded, _))| wanted == recorded)
+        let repository = repository(&desired.repo).map(|slug| (slug, BUNDLE));
+        // Action routing deliberately tolerates root/name matches and ties. A bundle report
+        // instead needs exactly one registry record for the normalized entry.
+        let evidence = repository.as_ref().and_then(|(wanted, _)| {
+            let mut exact = installed.iter().filter(|plugin| {
+                registry_identity(plugin).is_some_and(|(recorded, _)| &recorded == wanted)
+            });
+            let plugin = exact.next()?;
+            exact.next().is_none().then_some(plugin)
         });
-        let requested = desired
-            .and_then(|spec| spec.reference.as_deref())
-            .and_then(safe_ref);
+        Self::from_evidence(repository, desired.reference.as_deref(), evidence, market)
+    }
+
+    pub(crate) fn for_install(plugin: &Installed, market: &[registry::Entry]) -> Self {
+        Self::from_evidence(registry_identity(plugin), None, Some(plugin), market)
+    }
+
+    fn from_evidence(
+        repository: Option<(String, &'static str)>,
+        requested: Option<&str>,
+        installed: Option<&Installed>,
+        market: &[registry::Entry],
+    ) -> Self {
         let last_push = repository
             .as_ref()
             .and_then(|(slug, _)| cached_last_push(&crate::repo_root(slug), market));
         let source = installed.and_then(|plugin| match plugin.source_kind.as_str() {
             "github" => Some("GitHub"),
             "local" => Some("Local link"),
-            _ if registry_repo.is_some() => Some("GitHub URL"),
+            _ if repository.is_some() => Some("GitHub URL"),
             _ => None,
         });
         Self {
             repository,
-            requested: requested.map(str::to_owned),
+            requested: requested.and_then(safe_ref).map(str::to_owned),
             resolved: installed
                 .and_then(|plugin| plugin.resolved_commit.as_deref())
-                .and_then(commit)
+                .and_then(full_digest)
                 .map(str::to_owned),
             source,
             installed_ms: installed.and_then(|plugin| plugin.installed_unix_ms),
@@ -256,10 +245,27 @@ impl Report {
             }
             reference.map(str::to_owned)
         });
-        self.consistency = self.resolved.as_deref().and_then(|resolved| {
-            let locked = self.lock_ref.as_deref().and_then(commit)?;
-            Some(lock_consistency(resolved, locked))
-        });
+        self.consistency =
+            self.resolved
+                .as_deref()
+                .zip(self.locked_revision())
+                .map(|(resolved, locked)| {
+                    if resolved.eq_ignore_ascii_case(locked) {
+                        "Registry revision matches lock"
+                    } else {
+                        "Registry revision differs from lock"
+                    }
+                });
+    }
+
+    fn locked_revision(&self) -> Option<&str> {
+        let locked = self.lock_ref.as_deref().and_then(full_digest)?;
+        match self.resolved.as_deref() {
+            // With mixed hash formats, show the lockfile ref literally but don't interpret it
+            // as a revision of the same checkout.
+            Some(resolved) if resolved.len() != locked.len() => None,
+            _ => Some(locked),
+        }
     }
 
     pub(crate) fn lines(&self) -> [String; 12] {
@@ -282,11 +288,7 @@ impl Report {
             // The registry supplies one revision, not a second reading of the checkout.
             format!("Installed revision · {UNKNOWN} (checkout not independently inspected)"),
             fact("Lockfile ref", self.lock_ref.as_deref(), LOCK),
-            fact(
-                "Locked revision",
-                self.lock_ref.as_deref().and_then(commit),
-                LOCK,
-            ),
+            fact("Locked revision", self.locked_revision(), LOCK),
             format!("Lock consistency · {}", self.consistency.unwrap_or(UNKNOWN)),
             fact("Provenance", self.source, REGISTRY),
             fact("Installation recorded", installed_time.as_deref(), REGISTRY),
@@ -347,22 +349,18 @@ mod tests {
 
     #[test]
     fn reports_local_evidence_without_inventing_a_second_revision() {
-        let desired = Spec::parse("Owner/Plugin@stable");
+        let desired = Spec::parse("Owner/Plugin@v1.2.3+build.4");
         let market = registry::Entry {
             full_name: "OWNER/PLUGIN".into(),
             pushed_at: "2024-01-02T00:00:00Z".into(),
             ..registry::Entry::default()
         };
-        let mut report = Report::from_snapshots(
-            Some(&desired),
-            Some(&installed("owner/PLUGIN", SHA)),
-            &[market],
-        );
+        let mut report = Report::for_bundle(&desired, &[installed("owner/PLUGIN", SHA)], &[market]);
         report.set_lock(Some(&format!("git@GITHUB.COM:OWNER/PLUGIN.GIT@{SHA}")));
         let text = report.lines().join("\n");
         for fact in [
             "Repository · owner/plugin (bundle list)",
-            "Requested ref · stable (bundle list)",
+            "Requested ref · v1.2.3+build.4 (bundle list)",
             &format!("Resolved revision · {SHA} (installed registry)"),
             "Installed revision · Unknown",
             &format!("Locked revision · {SHA} (plugins.lock)"),
@@ -381,11 +379,7 @@ mod tests {
     #[test]
     fn lock_uses_exact_subdirectory_case_and_rejects_duplicate_identities() {
         let desired = Spec::parse("Owner/Plugin/Tools");
-        let mut report = Report::from_snapshots(
-            Some(&desired),
-            Some(&installed("OWNER/PLUGIN/Tools", SHA)),
-            &[],
-        );
+        let mut report = Report::for_bundle(&desired, &[installed("OWNER/PLUGIN/Tools", SHA)], &[]);
         let first = format!("OWNER/plugin/Tools@{SHA}");
         report.set_lock(Some(&format!("{first}\nowner/plugin/tools@other")));
         assert_eq!(report.lock_ref.as_deref(), Some(SHA));
@@ -398,7 +392,7 @@ mod tests {
         report.set_lock(Some(&format!("owner/plugin@{SHA}")));
         assert_eq!(report.lock_ref, None);
 
-        let mut root = Report::from_snapshots(None, Some(&installed("Owner/Plugin", SHA)), &[]);
+        let mut root = Report::for_install(&installed("Owner/Plugin", SHA), &[]);
         root.set_lock(Some(&format!(
             "https://github.com/OWNER/plugin.git@{SHA}\nowner/PLUGIN@{SHA}"
         )));
@@ -418,9 +412,19 @@ mod tests {
         ))
         .unwrap();
         let root = Spec::parse("owner/plugin");
-        let report = Report::from_snapshots(Some(&root), plugins.first(), &[]);
+        let report = Report::for_bundle(&root, &plugins, &[]);
         assert_eq!(report.resolved.as_deref(), Some(SHA));
         assert_eq!(report.source, Some("GitHub URL"));
+
+        let structured = installed("owner/plugin", SHA);
+        for candidates in [
+            [plugins[0].clone(), structured.clone()],
+            [structured, plugins[0].clone()],
+        ] {
+            let report = Report::for_bundle(&root, &candidates, &[]);
+            assert_eq!(report.resolved, None);
+            assert_eq!(report.source, None);
+        }
 
         let child = Spec::parse("owner/plugin/Tools");
         for plugin in [
@@ -428,7 +432,7 @@ mod tests {
             installed("OWNER/PLUGIN", SHA),
             installed("OWNER/PLUGIN/tools", SHA),
         ] {
-            let report = Report::from_snapshots(Some(&child), Some(&plugin), &[]);
+            let report = Report::for_bundle(&child, &[plugin], &[]);
             assert_eq!(report.resolved, None);
             assert_eq!(report.source, None);
         }
@@ -443,29 +447,43 @@ mod tests {
     }
 
     #[test]
-    fn full_hashes_match_exactly_and_short_hashes_prove_only_prefix_or_difference() {
+    fn only_full_digests_of_the_same_format_are_comparable() {
         let short = "0123456";
         let full_64 = "0123456789abcdef".repeat(4);
+        let upper = SHA.to_ascii_uppercase();
+        let different = "f".repeat(40);
+        let report_for = |resolved: &str, locked: &str| {
+            let mut report = Report::for_install(&installed("owner/plugin", resolved), &[]);
+            report.set_lock(Some(&format!("owner/plugin@{locked}")));
+            report
+        };
+        for (resolved, locked) in [(SHA, upper.as_str()), (full_64.as_str(), full_64.as_str())] {
+            assert_eq!(
+                report_for(resolved, locked).consistency,
+                Some("Registry revision matches lock")
+            );
+        }
         assert_eq!(
-            lock_consistency(SHA, &SHA.to_ascii_uppercase()),
-            "Registry revision matches lock"
+            report_for(SHA, &different).consistency,
+            Some("Registry revision differs from lock")
         );
-        assert_eq!(
-            lock_consistency(&full_64, &full_64),
-            "Registry revision matches lock"
-        );
-        assert_eq!(lock_consistency(SHA, &full_64), UNKNOWN);
-        assert_eq!(
-            lock_consistency(SHA, short),
-            "Registry revision matches lock prefix"
-        );
-        assert_eq!(lock_consistency(short, SHA), UNKNOWN);
-        assert_eq!(lock_consistency(short, short), UNKNOWN);
-        assert_eq!(
-            lock_consistency("0123457", SHA),
-            "Registry revision differs from lock"
-        );
-        assert!(commit(&"a".repeat(65)).is_none());
+        for locked in [short, "fffffff", full_64.as_str()] {
+            let report = report_for(SHA, locked);
+            assert_eq!(report.lock_ref.as_deref(), Some(locked));
+            assert_eq!(report.locked_revision(), None);
+            assert_eq!(report.consistency, None);
+        }
+        let mixed = report_for(&full_64, SHA);
+        assert_eq!(mixed.lock_ref.as_deref(), Some(SHA));
+        assert_eq!(mixed.locked_revision(), None);
+        assert_eq!(mixed.consistency, None);
+        for (resolved, locked) in [(short, SHA), ("fffffff", SHA), (short, short)] {
+            let report = report_for(resolved, locked);
+            assert_eq!(report.resolved, None);
+            assert_eq!(report.consistency, None);
+        }
+        assert!(full_digest(&"a".repeat(65)).is_none());
+        assert!(full_digest(&"z".repeat(40)).is_none());
     }
 
     #[test]
@@ -492,7 +510,7 @@ mod tests {
                 ..registry::Entry::default()
             },
         ];
-        let mut report = Report::from_snapshots(Some(&desired), Some(&plugin), &market);
+        let mut report = Report::for_bundle(&desired, std::slice::from_ref(&plugin), &market);
         report.set_lock(Some("different/plugin@release"));
         let text = report.lines().join("\n");
         for label in [
@@ -507,11 +525,31 @@ mod tests {
         }
         assert!(!text.contains("fixture-private") && !text.contains("credential"));
 
-        let local = Report::from_snapshots(None, Some(&plugin), &market);
+        let local = Report::for_install(&plugin, &market);
         assert_eq!(local.source, Some("Local link"));
         assert_eq!(local.repository, None);
         assert!(safe_ref(&"a".repeat(129)).is_none());
         assert!(repository(&format!("owner/{}", "x".repeat(320))).is_none());
+    }
+
+    #[test]
+    fn printable_git_refs_are_preserved_without_accepting_paths_or_revision_syntax() {
+        for reference in ["v1.2.3+build.4", "refs/tags/v1@rc_2", "release/test%2"] {
+            assert_eq!(safe_ref(reference), Some(reference));
+        }
+        for reference in [
+            "/private/repo",
+            r"C:\private\repo",
+            "a\u{1b}b",
+            "feature branch",
+            "main~1",
+            "main@{1}",
+            "v1:tag",
+            "refs/tags/.hidden",
+            "refs/tags/release.lock",
+        ] {
+            assert_eq!(safe_ref(reference), None, "{reference:?}");
+        }
     }
 
     #[test]
@@ -531,11 +569,11 @@ mod tests {
             pushed_at: "2024-01-02T01:02:03Z".into(),
             ..registry::Entry::default()
         };
-        let report = Report::from_snapshots(Some(&desired), None, std::slice::from_ref(&entry));
+        let report = Report::for_bundle(&desired, &[], std::slice::from_ref(&entry));
         assert!(report.lines().iter().any(|line| {
             line.starts_with("Last push · 2024-01-02") && line.contains("repository-wide")
         }));
-        let report = Report::from_snapshots(Some(&desired), None, &[entry.clone(), entry]);
+        let report = Report::for_bundle(&desired, &[], &[entry.clone(), entry]);
         assert!(report.lines().contains(&"Last push · Unknown".into()));
     }
 }
