@@ -167,7 +167,7 @@ impl SourceScope {
         if kind == "local"
             && fields
                 .get("url")
-                .is_some_and(|value| value.as_str().map_or(true, |url| url.trim().is_empty()))
+                .is_some_and(|value| !value.as_str().is_some_and(is_local_file_url))
         {
             return Self::Invalid(None);
         }
@@ -225,6 +225,34 @@ impl SourceScope {
         }
         Self::GitHub(canonical)
     }
+}
+
+// The canonical local source has no URL. Accept the legacy absolute file URL
+// without treating an arbitrary non-GitHub URL as valid local source metadata.
+fn is_local_file_url(url: &str) -> bool {
+    let Some(path) = url.strip_prefix("file:///") else {
+        return false;
+    };
+    if path.is_empty() {
+        return false;
+    }
+    let mut bytes = path.bytes();
+    while let Some(byte) = bytes.next() {
+        match byte {
+            b'%' => {
+                let encoded = (bytes.next(), bytes.next());
+                if !matches!(encoded, (Some(high), Some(low))
+                    if high.is_ascii_hexdigit() && low.is_ascii_hexdigit())
+                    || encoded == (Some(b'0'), Some(b'0'))
+                {
+                    return false;
+                }
+            }
+            _ if byte.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@/".contains(&byte) => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn join_raw_scope(prefix: &str, suffix: &str) -> Option<String> {
@@ -687,6 +715,10 @@ mod tests {
             r#"{"kind":null}"#,
             r#"{"kind":""}"#,
             r#"{"kind":"local","url":null}"#,
+            r#"{"kind":"local","url":"\u0000"}"#,
+            r#"{"kind":"local","url":"file:///invalid%00path"}"#,
+            r#"{"kind":"local","url":"file:///invalid%path"}"#,
+            r#"{"kind":"local","url":"https://github.com/owner/plugin"}"#,
             r#"{"kind":"local","owner":"owner","repo":"plugin"}"#,
         ] {
             let records = parsed_registry(&format!(r#","source":{source}"#));
