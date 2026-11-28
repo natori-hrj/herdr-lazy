@@ -64,12 +64,6 @@ fn capture_response(
                 Err(error) => break Err(error),
             }
         }
-        if stdout_done && stderr_done {
-            if let Some(status) = status {
-                break Ok((status, stdout, stderr));
-            }
-        }
-
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break Err(response_error_with_kind(
@@ -82,6 +76,9 @@ fn capture_response(
             ));
         }
         if stdout_done && stderr_done {
+            if let Some(status) = status {
+                break Ok((status, stdout, stderr));
+            }
             // EOF can precede direct-child exit (for example after it closes both streams).
             std::thread::sleep(next_child_delay(&mut child_backoff, remaining));
             continue;
@@ -106,7 +103,9 @@ fn capture_response(
                         Stream::Stdout => &mut stdout,
                         Stream::Stderr => &mut stderr,
                     };
-                    if count > max_stream_bytes.saturating_sub(target.len()) {
+                    let allowed = max_stream_bytes.saturating_sub(target.len());
+                    target.extend_from_slice(&buffer[..count.min(allowed)]);
+                    if count > allowed {
                         let name = match stream {
                             Stream::Stdout => "stdout",
                             Stream::Stderr => "stderr",
@@ -118,7 +117,6 @@ fn capture_response(
                             &stderr,
                         ));
                     }
-                    target.extend_from_slice(&buffer[..count]);
                 }
                 Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
                 Err(error) => {

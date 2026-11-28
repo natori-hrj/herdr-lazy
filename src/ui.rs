@@ -1258,22 +1258,28 @@ impl App {
                 Ok(profile) => (profile, None),
                 Err(error) => (None, Some(error)),
             };
-        let desired: Vec<Spec> = crate::desired_plugins()
-            .iter()
-            .map(|l| Spec::parse(l))
-            .collect();
+        let desired = crate::desired_plugins_result()
+            .map_err(|error| format!("Cannot read plugin list · {error}"));
         // The compatibility check is local, but the version comes from herdr itself. Read it
         // once for the whole refresh rather than once per installed plugin.
         let herdr_version = current_herdr_version();
         // Cached only: `false` never fetches. If nothing is cached the update column is
         // simply absent, which is better than making every pane open hit the network.
         let market = crate::registry::cached_entries();
-        match installed_plugins() {
-            Ok(installed) => App {
+        match desired.and_then(|lines| installed_plugins().map(|installed| (lines, installed))) {
+            Ok((lines, installed)) => App {
                 theme,
                 palette: None,
                 theme_picker: None,
-                rows: rows_with_herdr_version(&desired, &installed, &market, herdr_version),
+                rows: rows_with_herdr_version(
+                    &lines
+                        .iter()
+                        .map(|line| Spec::parse(line))
+                        .collect::<Vec<_>>(),
+                    &installed,
+                    &market,
+                    herdr_version,
+                ),
                 workspace_context: workspace_context.clone(),
                 workspace_profile: workspace_profile.clone(),
                 profile_error: profile_error.clone(),
@@ -1373,10 +1379,14 @@ impl App {
                 return;
             }
         };
-        let desired: Vec<Spec> = crate::desired_plugins()
-            .iter()
-            .map(|line| Spec::parse(line))
-            .collect();
+        let lines = match crate::desired_plugins_result() {
+            Ok(lines) => lines,
+            Err(error) => {
+                self.flash = Some(format!("Cannot read plugin list · {error}"));
+                return;
+            }
+        };
+        let desired: Vec<Spec> = lines.iter().map(|line| Spec::parse(line)).collect();
         let market = crate::registry::cached_entries();
         let collection =
             crate::machine::collect_machine_health(&installed, current_herdr_version());
@@ -2254,7 +2264,10 @@ impl App {
     fn open_browser(&mut self, force_refresh: bool) {
         self.flash = None;
         if self.browser.is_none() {
-            let listed = crate::desired_plugins()
+            let Some(lines) = self.read_list_for_picker() else {
+                return;
+            };
+            let listed = lines
                 .iter()
                 .map(|line| crate::Spec::parse(line).repo)
                 .collect();
@@ -2439,10 +2452,10 @@ impl App {
 
     /// `e` — open the extras picker.
     fn open_extras(&mut self) {
-        let listed: Vec<String> = crate::desired_plugins()
-            .iter()
-            .map(|l| crate::Spec::parse(l).repo)
-            .collect();
+        let Some(lines) = self.read_list_for_picker() else {
+            return;
+        };
+        let listed: Vec<String> = lines.iter().map(|l| crate::Spec::parse(l).repo).collect();
         match ExtrasPicker::new(&listed) {
             Some(p) => {
                 self.extras = Some(p);
@@ -2575,13 +2588,23 @@ impl App {
 
     /// Enter, at the prompt — fetch the list and show what it holds.
     fn load_adopt(&mut self) {
-        let listed: Vec<String> = crate::desired_plugins()
-            .iter()
-            .map(|l| crate::Spec::parse(l).repo)
-            .collect();
+        let Some(lines) = self.read_list_for_picker() else {
+            return;
+        };
+        let listed: Vec<String> = lines.iter().map(|l| crate::Spec::parse(l).repo).collect();
         let installed: Vec<String> = self.rows.iter().filter_map(|r| r.slug.clone()).collect();
         if let Some(a) = self.adopt.as_mut() {
             a.load(&listed, &installed);
+        }
+    }
+
+    fn read_list_for_picker(&mut self) -> Option<Vec<String>> {
+        match crate::desired_plugins_result() {
+            Ok(lines) => Some(lines),
+            Err(error) => {
+                self.flash = Some(format!("Cannot read plugin list · {error}"));
+                None
+            }
         }
     }
 

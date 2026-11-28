@@ -532,10 +532,6 @@ fn read_lines(p: &Path) -> Vec<String> {
     }
 }
 
-pub(crate) fn desired_plugins() -> Vec<String> {
-    desired_plugins_result().unwrap_or_default()
-}
-
 fn desired_plugins_result() -> io::Result<Vec<String>> {
     migrate_legacy_bundle()?;
     let body = match read_local_text(&bundle_path(), "plugin list") {
