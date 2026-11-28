@@ -42,7 +42,7 @@ use crate::{
 /// What the list says about one plugin.
 #[derive(Debug, Clone, PartialEq)]
 enum Status {
-    /// In the bundle and installed at the expected commit.
+    /// Installed at the expected commit, or installed when bundle membership is unknown.
     Ok,
     /// In the bundle, not installed.
     Missing,
@@ -115,6 +115,7 @@ impl Status {
 
 #[derive(Debug, Clone)]
 struct Row {
+    key: RowKey,
     label: String,
     commit: Option<String>,
     status: Status,
@@ -139,9 +140,25 @@ struct Row {
     /// Ticked for a bulk operation. Kept on the row rather than as a set of indices so it
     /// survives the list being rebuilt in a different order.
     picked: bool,
-    /// What this plugin can do, for the details view. Empty for anything not installed —
-    /// herdr only knows a manifest once it has fetched it.
+    /// Legacy operation payload, populated only from a validated legacy nominee.
     detail: Option<PluginDetail>,
+    /// Local evidence for Plugin Details, separate from operational matches and pins.
+    trust: crate::plugin_trust::Report,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RowKey {
+    Listed(String),
+    Direct {
+        plugin_id: String,
+        scope: Option<String>,
+    },
+}
+
+fn unique_row(rows: &[Row], key: &RowKey) -> Option<usize> {
+    let mut matches = rows.iter().enumerate().filter(|(_, row)| &row.key == key);
+    let (index, _) = matches.next()?;
+    matches.next().is_none().then_some(index)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +168,15 @@ struct HerdrVersionWarning {
 }
 
 impl Row {
+    fn plugin_detail(&self) -> Option<&PluginDetail> {
+        self.detail.as_ref()
+    }
+
+    fn detail_for(&self, key: &RowKey, plugin_id: &str) -> Option<&PluginDetail> {
+        self.plugin_detail()
+            .filter(|detail| &self.key == key && detail.plugin_id == plugin_id)
+    }
+
     fn marker(&self) -> &'static str {
         if self.herdr_warning.is_some() {
             "⚠"
@@ -190,14 +216,13 @@ impl Row {
             };
         }
         if self.maybe_stale && self.status_note().is_empty() {
-            return "updates available — press l to see what changed".to_string();
+            return "updates available — press l for details".to_string();
         }
         let note = self.status_note();
         if !note.is_empty() {
             return note;
         }
-        self.detail
-            .as_ref()
+        self.plugin_detail()
             .map(|d| d.description.clone())
             .unwrap_or_default()
     }
@@ -246,12 +271,20 @@ fn detail_of(p: &Installed) -> PluginDetail {
 #[derive(Debug, Clone, Default)]
 struct LogView {
     plugin_id: String,
+    row_key: Option<RowKey>,
     output: Option<String>,
     error: Option<String>,
     scroll: usize,
 }
 
 impl LogView {
+    fn originating_row(&self, rows: &[Row]) -> Option<usize> {
+        let key = self.row_key.as_ref()?;
+        let idx = unique_row(rows, key)?;
+        rows[idx].detail_for(key, &self.plugin_id)?;
+        Some(idx)
+    }
+
     fn from_result(plugin_id: String, result: Result<String, String>) -> Self {
         let mut view = Self {
             plugin_id,
@@ -324,6 +357,17 @@ impl MachineAction {
     }
 }
 
+fn machine_action_notification(
+    action: MachineAction,
+    target: &str,
+    outcome: Result<(), String>,
+) -> String {
+    match outcome {
+        Ok(()) => format!("{} started on {}", action.label(), target),
+        Err(error) => format!("{} on {}: {}", action.label(), target, error),
+    }
+}
+
 struct MachineEntry {
     health: crate::machine::MachineHealth,
     rows: Vec<Row>,
@@ -338,6 +382,7 @@ struct MachineView {
     detail_of: Option<usize>,
     plugin_cursor: usize,
     notice: Option<String>,
+    bundle_error: Option<String>,
 }
 
 const MACHINE_LIST_TOP: usize = 3;
@@ -346,7 +391,7 @@ const MACHINE_DETAIL_TOP: usize = 7;
 impl MachineView {
     fn new(
         collection: crate::machine::MachineCollection,
-        desired: &[Spec],
+        desired: Result<&[String], &crate::BundleError>,
         market: &[crate::registry::Entry],
     ) -> Self {
         let entries = collection
@@ -354,8 +399,8 @@ impl MachineView {
             .into_iter()
             .map(|health| {
                 let rows = if health.plugin_list_available {
-                    rows_with_herdr_version(
-                        desired,
+                    rows_from_bundle(
+                        desired.ok(),
                         &health.installed,
                         market,
                         health.herdr_version,
@@ -372,6 +417,7 @@ impl MachineView {
             detail_of: None,
             plugin_cursor: 0,
             notice: collection.notice,
+            bundle_error: desired.err().map(bundle_read_error),
         }
     }
 
@@ -445,9 +491,12 @@ fn machine_connection_label(
     }
 }
 
-fn machine_summary(entry: &MachineEntry) -> String {
+fn machine_summary(entry: &MachineEntry, bundle_available: bool) -> String {
     if !entry.health.plugin_list_available {
         return "plugin health unavailable".to_string();
+    }
+    if !bundle_available {
+        return format!("{} installed · bundle unknown", entry.rows.len());
     }
     if entry.rows.is_empty() {
         return "no plugins".to_string();
@@ -621,8 +670,36 @@ fn rows_with_updates(
 ///
 /// The version is supplied by the caller instead of being read here so building rows stays a
 /// pure operation and the UI shells out to `herdr --version` only once per refresh.
+#[cfg(test)]
 fn rows_with_herdr_version(
     desired: &[Spec],
+    installed: &[Installed],
+    market: &[crate::registry::Entry],
+    running_herdr: Option<HerdrVersion>,
+) -> Vec<Row> {
+    rows_from_bundle(
+        Some(&desired.iter().map(Spec::display).collect::<Vec<_>>()),
+        installed,
+        market,
+        running_herdr,
+    )
+}
+
+fn bundle_read_error(error: &crate::BundleError) -> String {
+    let diagnostic = error.to_string();
+    let mut chars = diagnostic
+        .chars()
+        .map(|ch| if ch.is_control() { '�' } else { ch });
+    let mut message = String::from("Cannot read plugin list · ");
+    message.extend(chars.by_ref().take(320));
+    if chars.next().is_some() {
+        message.push('…');
+    }
+    message
+}
+
+fn rows_from_bundle(
+    desired: Option<&[String]>,
     installed: &[Installed],
     market: &[crate::registry::Entry],
     running_herdr: Option<HerdrVersion>,
@@ -633,32 +710,21 @@ fn rows_with_herdr_version(
         };
         (required > running).then_some(HerdrVersionWarning { required, running })
     };
-    let stale = |p: &Installed, spec: Option<&Spec>| -> bool {
-        // A pinned entry is meant to sit still; calling it out of date is noise.
-        if spec.map(|s| s.reference.is_some()).unwrap_or(false) {
-            return false;
-        }
-        let (Some(slug), Some(ms)) = (p.slug.as_ref(), p.installed_unix_ms) else {
-            return false;
-        };
-        market
-            .iter()
-            .find(|e| e.full_name.eq_ignore_ascii_case(slug))
-            .map(|e| crate::registry::pushed_since(&e.pushed_at, ms))
-            .unwrap_or(false)
-    };
-    let maintenance = |p: &Installed| -> Option<crate::registry::MaintenanceStatus> {
-        let slug = p.slug.as_ref()?;
-        market
-            .iter()
-            .find(|e| e.full_name.eq_ignore_ascii_case(slug))
-            .map(|e| {
-                crate::registry::maintenance_status(&e.pushed_at, crate::registry::today_days())
-            })
-    };
     let mut rows = Vec::new();
+    use crate::plugin_trust::{registry_identity, BundleEvidence, Report};
+    let (bundle, specs) = match desired {
+        Some(lines) => (
+            BundleEvidence::new(lines.iter().map(String::as_str)),
+            lines
+                .iter()
+                .map(|line| Spec::parse(line))
+                .collect::<Vec<_>>(),
+        ),
+        None => (BundleEvidence::rejected(), Vec::new()),
+    };
+    let snapshot = crate::plugin_trust::InstalledSnapshot::new(installed);
 
-    for spec in desired {
+    for (index, (spec, line)) in specs.iter().zip(desired.unwrap_or_default()).enumerate() {
         let hit = installed
             .iter()
             .map(|p| (p, p.matches(spec)))
@@ -678,46 +744,69 @@ fn rows_with_herdr_version(
                 (status, commit)
             }
         };
+        let exact_record = bundle.listed_record(index, &snapshot);
+        let nominee = hit
+            .map(|(p, _)| p)
+            .filter(|p| bundle.allows_listed(index, &snapshot, p, exact_record));
+        let trust = Report::for_row(&bundle, index, exact_record, market);
+        let display = spec.display();
         rows.push(Row {
-            label: spec.display(),
+            key: RowKey::Listed(line.clone()),
+            label: display.clone(),
             commit,
             status,
-            herdr_warning: hit.and_then(|(p, _)| version_warning(p)),
-            listed_as: Some(spec.display()),
+            herdr_warning: nominee.and_then(version_warning),
+            listed_as: Some(display),
             slug: Some(spec.repo.clone()),
             installed: hit.map(|(p, _)| (p.plugin_id.clone(), p.source_kind.clone())),
             enabled: hit.map(|(p, _)| p.enabled),
-            maintenance: hit.and_then(|(p, _)| maintenance(p)),
-            maybe_stale: hit.map(|(p, _)| stale(p, Some(spec))).unwrap_or(false),
+            maintenance: trust.maintenance(),
+            // A pinned entry is meant to sit still; calling it out of date is noise.
+            maybe_stale: spec.reference.is_none() && trust.pushed_since_install(),
             picked: false,
-            detail: hit.map(|(p, _)| detail_of(p)),
+            detail: nominee.map(detail_of),
+            trust,
         });
     }
 
     for p in installed {
-        let claimed = desired.iter().any(|s| p.matches(s) != Match::None);
+        let claimed = specs.iter().any(|s| p.matches(s) != Match::None);
         if claimed {
             continue;
         }
+        let identity = registry_identity(p);
+        let nominee = bundle.allows_direct(&snapshot, p, &identity).then_some(p);
+        let trust = Report::for_direct(&bundle, p, &identity, market);
         rows.push(Row {
+            key: RowKey::Direct {
+                plugin_id: p.plugin_id.clone(),
+                scope: identity.scope().map(str::to_owned),
+            },
             label: p.slug.clone().unwrap_or_else(|| p.plugin_id.clone()),
             commit: p.resolved_commit.clone(),
-            status: if crate::is_self_id(&p.plugin_id) {
+            status: if desired.is_none() {
+                if p.enabled {
+                    Status::Ok
+                } else {
+                    Status::Disabled
+                }
+            } else if crate::is_self_id(&p.plugin_id) {
                 Status::SelfEntry
             } else if p.source_kind == "local" {
                 Status::ExtraLocal
             } else {
                 Status::Extra
             },
-            herdr_warning: version_warning(p),
+            herdr_warning: nominee.and_then(version_warning),
             listed_as: None,
             slug: p.slug.clone(),
             installed: Some((p.plugin_id.clone(), p.source_kind.clone())),
             enabled: Some(p.enabled),
-            maintenance: maintenance(p),
-            maybe_stale: stale(p, None),
+            maintenance: trust.maintenance(),
+            maybe_stale: trust.pushed_since_install(),
             picked: false,
-            detail: Some(detail_of(p)),
+            detail: nominee.map(detail_of),
+            trust,
         });
     }
 
@@ -1196,34 +1285,52 @@ struct App {
     /// Which action is highlighted in the details view.
     detail_cursor: usize,
     detail_scroll: usize,
-    /// Changes fetched for the currently open details, and which row they belong to. Keyed by
-    /// row so reopening the same plugin does not re-hit the network, and a stale result for a
-    /// different plugin never shows.
-    detail_changes: Option<(usize, crate::github::Changes)>,
     /// Recent command logs for the selected plugin. This is a modal overlay so the list/detail
     /// cursor remains where the user left it when they go back.
     log_view: Option<LogView>,
-    /// Machine health is a separate modal: its rows are snapshots for the selected local or
-    /// saved SSH target, never the local list's mutable selection.
+    /// Machine health is a separate modal: its rows have their own navigation and selection.
     machine_view: Option<MachineView>,
     /// An operation is held until the confirmation screen names the exact target.
     pending_machine: Option<(usize, MachineAction)>,
     /// Set while waiting for the letter to bind an action to.
     awaiting_bind: bool,
-    /// `(action_id, key)` chosen but not yet written, while the user confirms.
+    /// A binding chosen but not yet written, while the user confirms.
     ///
     /// Writing to `config.toml` cannot be sandboxed: the pane is launched by herdr, so an
     /// environment variable set in a shell never reaches it, and there is no "try it against
     /// a copy" mode to offer. The only honest safeguard is to show exactly what will be
     /// appended, and to where, before touching the file.
-    pending_bind: Option<(crate::BindTarget, String)>,
+    pending_bind: Option<PendingBind>,
     cursor: usize,
     /// Set when a refresh fails, so the pane explains itself instead of showing an empty list.
     error: Option<String>,
+    /// A rejected bundle is not empty; only independent installed facts can be shown.
+    bundle_error: Option<String>,
+    /// The observed contents and their logical location, not the target of a working link.
+    bundle: Option<crate::ObservedBundle>,
     /// Result of the last instant action (`a`/`d`), shown until the next keypress. Editing the
     /// list is fast and touches only a file, so it stays in the pane rather than dropping out
     /// of the alternate screen the way `sync` does.
     flash: Option<String>,
+}
+
+struct PendingBind {
+    row_key: RowKey,
+    plugin_id: String,
+    target: crate::BindTarget,
+    key: String,
+}
+
+impl PendingBind {
+    fn matches(&self, row: &Row) -> bool {
+        let Some(detail) = row.detail_for(&self.row_key, &self.plugin_id) else {
+            return false;
+        };
+        match &self.target {
+            crate::BindTarget::Action(id) => detail.actions.iter().any(|(action, _)| action == id),
+            crate::BindTarget::Pane(id) => detail.panes.iter().any(|(pane, _, _)| pane == id),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1235,149 +1342,135 @@ enum ProfileAction {
 
 impl App {
     fn load(theme: Theme) -> App {
+        let mut app = App {
+            theme,
+            ..App::default()
+        };
+        app.read_context();
+        app.read_main_snapshot(false);
+        app
+    }
+
+    fn read_context(&mut self) {
         let context = crate::context::read_context_from_env();
-        let last_event = context
-            .context
+        self.workspace_context = context.context;
+        self.last_event = self
+            .workspace_context
             .as_ref()
             .and_then(crate::context::last_event_for);
-        let workspace_context = context.context;
-        let context_warning = context.warning;
-        let (workspace_profile, profile_error) =
-            match crate::profile::discover(workspace_context.as_ref()) {
+        self.context_warning = context.warning;
+        (self.workspace_profile, self.profile_error) =
+            match crate::profile::discover(self.workspace_context.as_ref()) {
                 Ok(profile) => (profile, None),
                 Err(error) => (None, Some(error)),
             };
-        let desired: Vec<Spec> = crate::desired_plugins()
-            .iter()
-            .map(|l| Spec::parse(l))
-            .collect();
+    }
+
+    fn read_main_snapshot(&mut self, refresh_location: bool) {
+        let bundle = crate::observe_bundle(refresh_location);
         // The compatibility check is local, but the version comes from herdr itself. Read it
         // once for the whole refresh rather than once per installed plugin.
         let herdr_version = current_herdr_version();
         // Cached only: `false` never fetches. If nothing is cached the update column is
         // simply absent, which is better than making every pane open hit the network.
         let market = crate::registry::cached_entries();
-        match installed_plugins() {
-            Ok(installed) => App {
-                theme,
-                palette: None,
-                theme_picker: None,
-                rows: rows_with_herdr_version(&desired, &installed, &market, herdr_version),
-                workspace_context: workspace_context.clone(),
-                workspace_profile: workspace_profile.clone(),
-                profile_error: profile_error.clone(),
-                profile_open: false,
-                pending_profile: None,
-                context_warning: context_warning.clone(),
-                last_event: last_event.clone(),
-                browser: None,
-                marketplace_installed: Some(installed),
-                marketplace_refresh: None,
-                extras: None,
-                recommendations: None,
-                adopt: None,
-                help: None,
-                detail_of: None,
-                detail_cursor: 0,
-                detail_scroll: 0,
-                detail_changes: None,
-                log_view: None,
-                machine_view: None,
-                pending_machine: None,
-                awaiting_bind: false,
-                pending_bind: None,
-                cursor: 0,
-                error: None,
-                flash: None,
-            },
-            Err(e) => App {
-                theme,
-                palette: None,
-                theme_picker: None,
-                rows: Vec::new(),
-                workspace_context,
-                workspace_profile,
-                profile_error,
-                profile_open: false,
-                pending_profile: None,
-                context_warning,
-                last_event,
-                browser: None,
-                marketplace_installed: None,
-                marketplace_refresh: None,
-                extras: None,
-                recommendations: None,
-                adopt: None,
-                help: None,
-                detail_of: None,
-                detail_cursor: 0,
-                detail_scroll: 0,
-                detail_changes: None,
-                log_view: None,
-                machine_view: None,
-                pending_machine: None,
-                awaiting_bind: false,
-                pending_bind: None,
-                cursor: 0,
-                error: Some(e),
-                flash: None,
-            },
-        }
+        let installed = installed_plugins();
+        let rows = installed
+            .as_ref()
+            .map(|installed| {
+                rows_from_bundle(
+                    bundle.as_ref().ok().map(crate::ObservedBundle::lines),
+                    installed,
+                    &market,
+                    herdr_version,
+                )
+            })
+            .unwrap_or_default();
+        self.replace_main_snapshot(bundle, installed, rows);
+    }
+
+    fn replace_main_snapshot(
+        &mut self,
+        bundle: Result<crate::ObservedBundle, crate::BundleError>,
+        installed: Result<Vec<Installed>, String>,
+        rows: Vec<Row>,
+    ) {
+        self.cursor = self
+            .selected()
+            .and_then(|row| {
+                unique_row(&self.rows, &row.key)?;
+                unique_row(&rows, &row.key)
+            })
+            .unwrap_or_else(|| self.cursor.min(rows.len().saturating_sub(1)));
+        self.rows = rows;
+        self.detail_of = None;
+        self.detail_cursor = 0;
+        self.detail_scroll = 0;
+        self.log_view = None;
+        self.awaiting_bind = false;
+        self.pending_bind = None;
+        self.bundle_error = bundle.as_ref().err().map(bundle_read_error);
+        self.bundle = bundle.ok();
+        self.error = match &installed {
+            Ok(installed) if installed.is_empty() => self.bundle_error.clone(),
+            Ok(_) => None,
+            Err(error) => Some(match &self.bundle_error {
+                Some(bundle) => format!("{bundle}; installed registry: {error}"),
+                None => error.clone(),
+            }),
+        };
+        self.marketplace_installed = installed.ok();
     }
 
     fn refresh(&mut self) {
-        let (cursor, flash) = (self.cursor, self.flash.take());
-        let (browser, help) = (self.browser.take(), self.help);
-        let marketplace_refresh = self.marketplace_refresh.take();
-        let profile_open = self.profile_open;
-        let pending_profile = self.pending_profile;
-        let extras = self.extras.take();
-        let recommendations = self.recommendations.take();
-        let adopt = self.adopt.take();
-        let changes = self.detail_changes.take();
-        let logs = self.log_view.take();
-        *self = App::load(self.theme);
-        self.browser = browser;
-        self.marketplace_refresh = marketplace_refresh;
-        self.profile_open = profile_open;
-        self.pending_profile = pending_profile;
-        self.extras = extras;
-        self.recommendations = recommendations;
-        self.adopt = adopt;
-        self.help = help;
-        self.detail_changes = changes;
-        self.log_view = logs;
-        self.cursor = cursor.min(self.rows.len().saturating_sub(1));
-        self.flash = flash;
+        self.read_context();
+        self.read_main_snapshot(true);
     }
 
-    /// Open a read-only snapshot of the local machine and any saved SSH profiles. The local
-    /// list remains the source for the ordinary pane; this view owns its own rows so a remote
-    /// failure cannot turn into local missing-plugin state.
+    /// Open a machine snapshot, sharing its local observation with the ordinary pane. Remote
+    /// failures stay in their own entries and cannot change local rows.
     fn open_machine_view(&mut self) {
+        self.read_machine_view(false);
+    }
+
+    fn read_machine_view(&mut self, refresh_location: bool) {
+        self.machine_view = None;
+        self.pending_machine = None;
+        let bundle = crate::observe_bundle(refresh_location);
         let installed = match installed_plugins() {
             Ok(installed) => installed,
             Err(error) => {
-                self.flash = Some(format!("could not read machine health: {}", error));
+                self.flash = Some(format!("could not read machine health: {error}"));
+                self.replace_main_snapshot(bundle, Err(error), Vec::new());
                 return;
             }
         };
-        let desired: Vec<Spec> = crate::desired_plugins()
-            .iter()
-            .map(|line| Spec::parse(line))
-            .collect();
         let market = crate::registry::cached_entries();
         let collection =
             crate::machine::collect_machine_health(&installed, current_herdr_version());
-        self.machine_view = Some(MachineView::new(collection, &desired, &market));
-        self.pending_machine = None;
+        let view = MachineView::new(
+            collection,
+            bundle.as_ref().map(crate::ObservedBundle::lines),
+            &market,
+        );
+        let rows = view
+            .entries
+            .iter()
+            .find(|entry| entry.health.profile.is_none())
+            .map(|entry| entry.rows.clone())
+            .unwrap_or_default();
+        self.replace_main_snapshot(bundle, Ok(installed), rows);
+        self.machine_view = Some(view);
         self.flash = None;
     }
 
     fn reload_machine_view(&mut self) {
-        self.machine_view = None;
-        self.open_machine_view();
-        if self.machine_view.is_some() {
+        self.read_machine_view(true);
+        if self
+            .machine_view
+            .as_ref()
+            .is_some_and(|view| view.bundle_error.is_none())
+        {
             self.flash = Some("re-read local and saved-machine status".to_string());
         }
     }
@@ -1390,6 +1483,10 @@ impl App {
         let Some(entry) = view.entries.get(index) else {
             return;
         };
+        if entry.health.profile.is_none() && view.bundle_error.is_some() {
+            self.flash = Some("Local operation unavailable · bundle snapshot rejected".into());
+            return;
+        }
         match entry.health.connection {
             crate::machine::MachineConnection::Local
             | crate::machine::MachineConnection::Connected => {}
@@ -1495,16 +1592,22 @@ impl App {
 
         // Re-read after returning to the pane. Herdr action invocation is asynchronous, so this
         // may still show `running`; the log result remains visible and can be refreshed with r.
-        self.open_machine_view();
-        self.flash = Some(match outcome {
-            Ok(()) => format!("{} started on {}", action.label(), target),
-            Err(error) => format!("{} failed on {}: {}", action.label(), target, error),
-        });
+        self.read_machine_view(true);
+        self.flash = Some(machine_action_notification(action, &target, outcome));
         Ok(())
     }
 
     fn selected(&self) -> Option<&Row> {
         self.rows.get(self.cursor)
+    }
+
+    fn listed_repositories(&self) -> Vec<String> {
+        self.bundle
+            .as_ref()
+            .map_or(&[][..], crate::ObservedBundle::lines)
+            .iter()
+            .map(|line| Spec::parse(line).repo)
+            .collect()
     }
 
     /// Render workspace information when the user asks for the detailed keymap. The values were
@@ -1667,7 +1770,7 @@ impl App {
 
         match action {
             ProfileAction::Merge => {
-                let result = crate::merge_specs_into_list(&crate::bundle_path(), &profile.specs);
+                let result = crate::merge_specs_into_global_list(&profile.specs);
                 self.profile_open = false;
                 self.refresh();
                 self.flash = Some(match result {
@@ -1713,30 +1816,56 @@ impl App {
     }
 
     fn open_logs_for(&mut self, idx: usize) {
-        let Some(plugin_id) = self
-            .rows
-            .get(idx)
-            .and_then(|row| row.installed.as_ref())
-            .map(|(plugin_id, _)| plugin_id.clone())
+        let row = self.rows.get(idx);
+        let Some((row, detail)) =
+            row.and_then(|row| row.plugin_detail().map(|detail| (row, detail)))
         else {
-            self.flash = Some("logs are only available for an installed plugin".to_string());
+            let message = if self.bundle_error.is_some() {
+                "Logs unavailable · bundle snapshot rejected"
+            } else if row.is_some_and(|row| row.installed.is_some()) {
+                "Logs unavailable · plugin identity is uncertain"
+            } else {
+                "logs are only available for an installed plugin"
+            };
+            self.flash = Some(message.to_string());
             return;
         };
 
+        let plugin_id = detail.plugin_id.clone();
         self.flash = None;
-        self.log_view = Some(LogView::from_result(
-            plugin_id.clone(),
-            crate::plugin_logs(&plugin_id),
-        ));
+        let mut view = LogView::from_result(plugin_id.clone(), crate::plugin_logs(&plugin_id));
+        view.row_key = Some(row.key.clone());
+        self.log_view = Some(view);
     }
 
     fn reload_logs(&mut self) {
-        let Some(plugin_id) = self.log_view.as_ref().map(|view| view.plugin_id.clone()) else {
+        let Some(view) = self.log_view.take() else {
             return;
         };
-        let result = crate::plugin_logs(&plugin_id);
-        if let Some(view) = self.log_view.as_mut() {
-            view.set_result(result);
+        if matches!(view.row_key, Some(RowKey::Direct { scope: None, .. })) {
+            self.refresh();
+            self.flash =
+                Some("Logs unavailable · originating plugin row is no longer confirmed".into());
+            return;
+        }
+        let origin = view.originating_row(&self.rows);
+        let from_detail = origin.is_some() && self.detail_of == origin;
+        self.refresh();
+        if let Some(idx) = origin.and_then(|_| view.originating_row(&self.rows)) {
+            if from_detail {
+                let lock = self.detail_lock_path();
+                self.show_detail(idx, lock.as_deref());
+            }
+            self.open_logs_for(idx);
+        } else {
+            self.flash = Some(
+                if self.bundle_error.is_some() {
+                    "Logs unavailable · bundle snapshot rejected"
+                } else {
+                    "Logs unavailable · originating plugin row is no longer confirmed"
+                }
+                .into(),
+            );
         }
     }
 
@@ -1774,31 +1903,36 @@ impl App {
     }
 
     fn open_detail(&mut self) {
-        let Some(row) = self.rows.get(self.cursor) else {
-            return;
-        };
-        self.detail_of = Some(self.cursor);
+        let lock = self.detail_lock_path();
+        self.open_detail_at(lock.as_deref());
+    }
+
+    fn detail_lock_path(&self) -> Option<std::path::PathBuf> {
+        self.bundle
+            .as_ref()
+            .map(|bundle| crate::lock_beside(&bundle.path))
+    }
+
+    #[cfg(test)]
+    fn open_detail_with_lock(&mut self, path: &std::path::Path) {
+        self.open_detail_at(Some(path));
+    }
+
+    fn show_detail(&mut self, idx: usize, path: Option<&std::path::Path>) {
+        // Lock facts are observational and never change the row's authorized payload.
+        let lock = path.and_then(|path| crate::lockfile::read_text(path, false).ok());
+        self.rows[idx].trust.set_lock(lock.as_deref());
+        self.detail_of = Some(idx);
         self.detail_cursor = 0;
         self.detail_scroll = 0;
         self.flash = None;
+    }
 
-        // Fetch only for a plugin the offline marker already flagged. Opening the details of
-        // an up-to-date plugin must stay instant — going to the network for every `l` would
-        // make the common case (nothing changed) the slow one, which is backwards. The marker
-        // can lag a very recent push by up to a day; that a just-pushed plugin waits one more
-        // day for its diff is a fair price for `l` never blocking on a plugin that is current.
-        //
-        // Reuse a result already fetched for this row so reopening does not re-hit the network.
-        if matches!(&self.detail_changes, Some((i, _)) if *i == self.cursor) {
+    fn open_detail_at(&mut self, path: Option<&std::path::Path>) {
+        if self.selected().is_none() {
             return;
         }
-        self.detail_changes = None;
-        if row.maybe_stale {
-            if let (Some(slug), Some(commit)) = (row.slug.clone(), row.commit.clone()) {
-                let changes = crate::github::changes_since(&slug, &commit);
-                self.detail_changes = Some((self.cursor, changes));
-            }
-        }
+        self.show_detail(self.cursor, path);
     }
 
     /// Bind the highlighted action to `prefix+shift+<letter>`.
@@ -1841,10 +1975,13 @@ impl App {
 
     fn bind_selected(&mut self, letter: char) {
         let Some(idx) = self.detail_of else { return };
-        let Some(d) = self.rows.get(idx).and_then(|r| r.detail.clone()) else {
+        let Some(row) = self.rows.get(idx) else {
             return;
         };
-        let Some((target, _)) = Self::bindable(&d).into_iter().nth(self.detail_cursor) else {
+        let Some(d) = row.plugin_detail() else {
+            return;
+        };
+        let Some((target, _)) = Self::bindable(d).into_iter().nth(self.detail_cursor) else {
             return;
         };
         let key = format!("prefix+shift+{}", letter.to_ascii_lowercase());
@@ -1854,29 +1991,37 @@ impl App {
             self.flash = Some(msg);
             return;
         }
-        self.pending_bind = Some((target, key));
+        self.pending_bind = Some(PendingBind {
+            row_key: row.key.clone(),
+            plugin_id: d.plugin_id.clone(),
+            target,
+            key,
+        });
     }
 
     /// `y` on the confirmation screen.
     fn commit_bind(&mut self) {
-        let Some((target, key)) = self.pending_bind.take() else {
+        let Some(bind) = self.pending_bind.take() else {
             return;
         };
-        let Some(d) = self
+        if !self
             .detail_of
             .and_then(|i| self.rows.get(i))
-            .and_then(|r| r.detail.clone())
-        else {
+            .is_some_and(|row| bind.matches(row))
+        {
+            self.flash = Some("not bound · plugin or target is no longer confirmed".into());
             return;
-        };
-        self.flash = Some(match crate::bind_action(&d.plugin_id, &target, &key) {
-            Ok(msg) | Err(msg) => msg,
-        });
+        }
+        self.flash = Some(
+            match crate::bind_action(&bind.plugin_id, &bind.target, &bind.key) {
+                Ok(msg) | Err(msg) => msg,
+            },
+        );
     }
 
     fn run_detail_action(&mut self) {
         let Some(idx) = self.detail_of else { return };
-        let Some(d) = self.rows.get(idx).and_then(|r| r.detail.clone()) else {
+        let Some(d) = self.rows.get(idx).and_then(Row::plugin_detail).cloned() else {
             return;
         };
         let Some((target, _)) = Self::bindable(&d).into_iter().nth(self.detail_cursor) else {
@@ -1928,8 +2073,20 @@ impl App {
         }
     }
 
+    fn refuse_rejected_bundle(&mut self) -> bool {
+        if self.bundle_error.is_some() {
+            self.flash = Some("Operation unavailable · bundle snapshot rejected".into());
+            true
+        } else {
+            false
+        }
+    }
+
     /// Install every target that needs it, in one pass out of the alternate screen.
     fn install_targets(&mut self) -> io::Result<()> {
+        if self.refuse_rejected_bundle() {
+            return Ok(());
+        }
         let repos: Vec<String> = self
             .targets()
             .iter()
@@ -1951,6 +2108,9 @@ impl App {
     }
 
     fn update_targets(&mut self) -> io::Result<()> {
+        if self.refuse_rejected_bundle() {
+            return Ok(());
+        }
         let repos: Vec<String> = self
             .targets()
             .iter()
@@ -1974,6 +2134,9 @@ impl App {
     /// Uninstall every target. The only bulk operation that destroys anything, so it reports
     /// what it refused as well as what it did.
     fn uninstall_targets(&mut self) {
+        if self.refuse_rejected_bundle() {
+            return;
+        }
         let picked: Vec<(String, String, String)> = self
             .targets()
             .iter()
@@ -2010,6 +2173,9 @@ impl App {
     /// Enable or disable every selected installed plugin. The command changes herdr's local
     /// plugin state only; it never rewrites the bundle or lockfile.
     fn set_enabled_targets(&mut self, enabled: bool) {
+        if self.refuse_rejected_bundle() {
+            return;
+        }
         let mut ids = Vec::new();
         for i in self.targets() {
             let Some(row) = self.rows.get(i) else {
@@ -2049,6 +2215,9 @@ impl App {
 
     /// Adopt every target that is installed but unlisted.
     fn adopt_targets(&mut self) {
+        if self.refuse_rejected_bundle() {
+            return;
+        }
         let names: Vec<String> = self
             .targets()
             .iter()
@@ -2073,6 +2242,9 @@ impl App {
 
     /// `r` — put the targets back to the commits in the lockfile.
     fn restore_targets(&mut self) -> io::Result<()> {
+        if self.refuse_rejected_bundle() {
+            return Ok(());
+        }
         let repos: Vec<String> = self
             .targets()
             .iter()
@@ -2246,10 +2418,7 @@ impl App {
     fn open_browser(&mut self, force_refresh: bool) {
         self.flash = None;
         if self.browser.is_none() {
-            let listed = crate::desired_plugins()
-                .iter()
-                .map(|line| crate::Spec::parse(line).repo)
-                .collect();
+            let listed = self.listed_repositories();
             let (entries, note, fresh) = match crate::registry::browser_cache() {
                 Some(cache) => (cache.entries, cache.note, cache.fresh),
                 None => (Vec::new(), String::new(), false),
@@ -2431,10 +2600,7 @@ impl App {
 
     /// `e` — open the extras picker.
     fn open_extras(&mut self) {
-        let listed: Vec<String> = crate::desired_plugins()
-            .iter()
-            .map(|l| crate::Spec::parse(l).repo)
-            .collect();
+        let listed = self.listed_repositories();
         match ExtrasPicker::new(&listed) {
             Some(p) => {
                 self.extras = Some(p);
@@ -2457,13 +2623,7 @@ impl App {
             );
             return;
         };
-        // Opening a presentation-only recommendation view must not trigger the legacy-list
-        // migration performed by `desired_plugins`.
-        let listed: Vec<String> = crate::read_bundle_specs()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|spec| spec.repo)
-            .collect();
+        let listed = self.listed_repositories();
         match RecommendationsPicker::new(&agent, &listed) {
             Some(picker) => {
                 self.recommendations = Some(picker);
@@ -2567,10 +2727,7 @@ impl App {
 
     /// Enter, at the prompt — fetch the list and show what it holds.
     fn load_adopt(&mut self) {
-        let listed: Vec<String> = crate::desired_plugins()
-            .iter()
-            .map(|l| crate::Spec::parse(l).repo)
-            .collect();
+        let listed = self.listed_repositories();
         let installed: Vec<String> = self.rows.iter().filter_map(|r| r.slug.clone()).collect();
         if let Some(a) = self.adopt.as_mut() {
             a.load(&listed, &installed);
@@ -2629,6 +2786,9 @@ impl App {
 
     /// `d` — stop managing an entry. Never uninstalls; that is `x`.
     fn drop_selected(&mut self) {
+        if self.refuse_rejected_bundle() {
+            return;
+        }
         let Some(row) = self.selected() else { return };
         let Some(line) = row.listed_as.clone() else {
             self.flash = Some(format!("{} is not in your list", row.label));
@@ -2654,7 +2814,10 @@ impl App {
             ManageCommand::Starter => self.flash = Some(crate::open_starter_pane()),
             ManageCommand::Refresh => {
                 self.refresh();
-                self.flash = Some("re-read your list and what is installed".to_string());
+                self.flash = self
+                    .bundle_error
+                    .is_none()
+                    .then(|| "re-read your list and what is installed".to_string());
             }
             ManageCommand::Help => self.help = Some(0),
         }
@@ -2708,15 +2871,15 @@ impl App {
 
     /// Show the exact change before making it.
     fn draw_bind_confirm(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
+        let bind = self.pending_bind.as_ref().expect("checked by caller");
         let success = self.theme.color(Role::Success);
         let rule = rule_line(width);
-        let (target, key) = self.pending_bind.clone().expect("checked by caller");
-        let plugin_id = self
-            .detail_of
-            .and_then(|i| self.rows.get(i))
-            .and_then(|r| r.detail.as_ref())
-            .map(|d| d.plugin_id.clone())
-            .unwrap_or_default();
+        let PendingBind {
+            plugin_id,
+            target,
+            key,
+            ..
+        } = bind;
         let path = crate::herdr_config_path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "(herdr's config.toml — location unknown)".to_string());
@@ -2726,7 +2889,7 @@ impl App {
         writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
         writeln!(out, " This appends to \x1b[1m{}\x1b[0m:\r", path)?;
         writeln!(out, "\r")?;
-        let (kind, command) = crate::bind_toml_fields(&target, &plugin_id);
+        let (kind, command) = crate::bind_toml_fields(target, plugin_id);
         for line in [
             "# added by herdr-lazy".to_string(),
             "[[keys.command]]".to_string(),
@@ -3293,9 +3456,13 @@ impl App {
         writeln!(
             out,
             " {}\r",
-            view.notice
+            view.bundle_error
                 .as_deref()
-                .map(|notice| format!("{warning}{}\x1b[0m", notice))
+                .or(view.notice.as_deref())
+                .map(|notice| {
+                    let (text, _) = clip(notice, width.saturating_sub(2) as usize);
+                    format!("{warning}{text}\x1b[0m")
+                })
                 .unwrap_or_else(|| {
                     "\x1b[2mread-only status; Enter inspects the selected target\x1b[0m".to_string()
                 })
@@ -3326,7 +3493,7 @@ impl App {
                 Some(false) => "incompatible",
                 None => "compat ?",
             };
-            let summary = machine_summary(entry);
+            let summary = machine_summary(entry, view.bundle_error.is_none());
             let label = machine_target(entry);
             writeln!(
                 out,
@@ -3408,11 +3575,15 @@ impl App {
             " last sync: {}\r",
             sync_result_text(entry.health.last_sync.as_ref())
         )?;
-        if let Some(error) = entry.health.error.as_deref() {
+        if let Some(error) = view
+            .bundle_error
+            .as_deref()
+            .or(entry.health.error.as_deref())
+        {
             writeln!(
                 out,
                 " {warning}note:\x1b[0m {}\r",
-                truncate(error, width.saturating_sub(10) as usize)
+                clip(error, width.saturating_sub(10) as usize).0
             )?;
         } else {
             writeln!(out, "\r")?;
@@ -3421,7 +3592,7 @@ impl App {
         writeln!(
             out,
             " \x1b[1mplugin health\x1b[0m  \x1b[2m{}\x1b[0m\r",
-            machine_summary(entry)
+            machine_summary(entry, view.bundle_error.is_none())
         )?;
 
         if !entry.health.plugin_list_available {
@@ -3465,6 +3636,9 @@ impl App {
 
         let footer = match &self.flash {
             Some(message) => format!("{accent}{}\x1b[0m", message),
+            None if entry.health.profile.is_none() && view.bundle_error.is_some() => {
+                "\x1b[1m[r]\x1b[0m refresh  \x1b[1m[esc/q]\x1b[0m back".to_string()
+            }
             None => "\x1b[1m[i]\x1b[0m sync this target  \x1b[1m[u]\x1b[0m update this target  \
                      \x1b[1m[r]\x1b[0m refresh  \x1b[1m[esc/q]\x1b[0m back"
                 .to_string(),
@@ -3495,7 +3669,7 @@ impl App {
             return Ok(());
         };
         let rule = rule_line(width);
-        let preview = machine_summary(entry);
+        let preview = machine_summary(entry, view.bundle_error.is_none());
 
         write!(out, "\x1b[H\x1b[2J")?;
         writeln!(
@@ -3551,7 +3725,21 @@ impl App {
     }
 
     fn draw_list(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
-        managed_list::draw(self, out, width, height)
+        managed_list::draw(self, out, width, height)?;
+        if let Some(error) = self
+            .bundle_error
+            .as_deref()
+            .filter(|_| width > 1 && height > 0 && !self.rows.is_empty())
+        {
+            // Keep independent rows and the transient footer; replace the divider with
+            // the persistent diagnostic. Empty views already show an error in the body.
+            let line = footer_start_row(height).max(2).min(height);
+            let (message, _) = clip(error, width.saturating_sub(1) as usize);
+            let danger = self.theme.color(Role::Danger);
+            write!(out, "\x1b[{line};1H\x1b[2K{danger}{message}\x1b[0m")?;
+            out.flush()?;
+        }
+        Ok(())
     }
 }
 
@@ -4028,10 +4216,19 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
         }
 
         // Details view: a short list of runnable actions.
-        // Confirmation is modal: only y / n / esc mean anything here.
+        // Confirmation is modal: only an unmodified y can write.
         if app.pending_bind.is_some() {
-            match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => app.commit_bind(),
+            match classify(&key) {
+                Action::Quit => return Ok(()),
+                Action::Command('y' | 'Y') => app.commit_bind(),
+                Action::Ignore
+                    if key.code == KeyCode::Char('r')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    app.refresh();
+                    app.flash = Some("not bound · local snapshot refreshed".into());
+                }
                 _ => {
                     app.pending_bind = None;
                     app.flash = Some("not bound".to_string());
@@ -4074,8 +4271,10 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
 
         if app.log_view.is_some() {
             if key.modifiers.contains(KeyModifiers::CONTROL) {
-                if key.code == KeyCode::Char('c') {
-                    return Ok(());
+                match key.code {
+                    KeyCode::Char('c') => return Ok(()),
+                    KeyCode::Char('r') => app.refresh(),
+                    _ => {}
                 }
                 continue;
             }
@@ -4188,7 +4387,7 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
             let n = app
                 .rows
                 .get(idx)
-                .and_then(|r| r.detail.as_ref())
+                .and_then(Row::plugin_detail)
                 .map(|d| App::bindable(d).len())
                 .unwrap_or(0);
             // Ctrl-chords first: a plain `j` moves, but Ctrl+J is a pty's Enter, and a
@@ -4201,6 +4400,7 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                         }
                     }
                     KeyCode::Char('c') => return Ok(()),
+                    KeyCode::Char('r') => app.refresh(),
                     _ => {}
                 }
                 continue;
@@ -5115,6 +5315,12 @@ mod tests {
             enabled,
             source_kind: "github".to_string(),
             slug: Some(format!("{}/{}", owner, repo)),
+            source_scope: crate::plugin_trust::SourceScope::from_fields(
+                "github",
+                Some(&crate::json::Value::Str(owner.to_owned())),
+                Some(&crate::json::Value::Str(repo.to_owned())),
+                None,
+            ),
             resolved_commit: Some(commit.to_string()),
             source_values: vec![owner.to_string(), repo.to_string()],
             ..Default::default()
@@ -5176,6 +5382,274 @@ mod tests {
                 have: SHA.to_string()
             }
         );
+    }
+
+    #[test]
+    fn bundle_provenance_does_not_use_the_operational_tie_breaker() {
+        let desired = [Spec::parse("owner/plugin/Tools")];
+        let mut exact = github("OWNER", "PLUGIN/Tools", SHA, true);
+        exact.plugin_id = "exact".into();
+        let mut duplicate = github("owner", "plugin/Tools", OTHER, false);
+        duplicate.plugin_id = "duplicate".into();
+        let mut sibling = github("owner", "plugin/tools", OTHER, false);
+        sibling.plugin_id = "sibling".into();
+        let root = github("owner", "plugin", OTHER, true);
+
+        for candidates in [
+            [exact.clone(), duplicate.clone()],
+            [duplicate, exact.clone()],
+        ] {
+            let r = rows(&desired, &candidates);
+            let winner = &candidates[1];
+            assert_eq!(
+                r[0].installed.as_ref().map(|(id, _)| id),
+                Some(&winner.plugin_id)
+            );
+            assert_eq!(r[0].enabled, Some(winner.enabled));
+            assert_eq!(r[0].commit, winner.resolved_commit);
+            assert!(r[0].plugin_detail().is_none());
+            assert_eq!(
+                r[0].status,
+                if winner.enabled {
+                    Status::Ok
+                } else {
+                    Status::Disabled
+                }
+            );
+            for line in [
+                "Resolved revision · Unknown",
+                "Provenance · Unknown",
+                "Installation recorded · Unknown",
+            ] {
+                assert!(r[0].trust.lines().iter().any(|fact| fact == line));
+            }
+        }
+
+        for candidates in [
+            [exact.clone(), root.clone(), sibling.clone()],
+            [sibling, root, exact],
+        ] {
+            let r = rows(&desired, &candidates);
+            assert!(r[0]
+                .trust
+                .lines()
+                .contains(&"Resolved revision · Unknown".to_string()));
+            assert!(r[0].plugin_detail().is_none());
+        }
+    }
+
+    #[test]
+    fn row_payload_ids_are_unique_across_the_snapshot_and_case_sensitive() {
+        let desired = [Spec::parse("owner/plugin")];
+        let exact = github("owner", "plugin", SHA, true);
+        for (id, unique) in [("plugin", false), ("Plugin", true)] {
+            let mut malformed = local(id);
+            malformed.name = "unrelated".into();
+            malformed.source_scope = crate::plugin_trust::SourceScope::Invalid(None);
+            for candidates in [
+                [exact.clone(), malformed.clone()],
+                [malformed, exact.clone()],
+            ] {
+                for specs in [&[][..], &desired[..]] {
+                    let r = rows(specs, &candidates);
+                    let row = r
+                        .iter()
+                        .find(|row| row.slug.as_deref() == Some("owner/plugin"))
+                        .unwrap();
+                    assert_eq!(row.plugin_detail().is_some(), unique, "{id}, {specs:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bundle_ref_competition_is_order_independent_and_exact_scope_only() {
+        let roots = [github("owner", "plugin", SHA, true)];
+        let ambiguous = "Requested ref · Ambiguous request (bundle list)".to_owned();
+        let resolved = format!("Resolved revision · {SHA} (installed registry)");
+        for second in ["git@github.com:OWNER/PLUGIN.git@v2", "OWNER/PLUGIN"] {
+            for specs in [["owner/plugin@v1", second], [second, "owner/plugin@v1"]] {
+                let desired = specs.map(Spec::parse);
+                let r = rows(&desired, &roots);
+                assert_eq!(r.len(), 2);
+                for row in &r {
+                    assert!(row.plugin_detail().is_none());
+                    let facts = row.trust.lines();
+                    assert!(facts.contains(&ambiguous));
+                    assert!(facts.contains(&resolved));
+                }
+            }
+        }
+
+        for specs in [
+            ["owner/plugin@v1", "https://github.com/OWNER/PLUGIN.git@v1"],
+            ["owner/plugin@v1", "owner/plugin@v1"],
+            ["owner/plugin", "git@github.com:OWNER/PLUGIN.git"],
+        ] {
+            let r = rows(&specs.map(Spec::parse), &roots);
+            assert!(r[0].plugin_detail().is_some(), "{specs:?}");
+            assert!(r.iter().all(|row| row.trust.bundle_problem().is_none()));
+        }
+
+        let mut child = github("owner", "plugin/Tools", SHA, true);
+        child.plugin_id = "upper-tools".into();
+        let desired = ["owner/plugin/Tools@v1", "OWNER/PLUGIN/tools@v2"].map(Spec::parse);
+        let r = rows(&desired, &[child]);
+        assert!(r[0].plugin_detail().is_some());
+        assert!(r[1].plugin_detail().is_none());
+        assert!(r.iter().all(|row| row.trust.bundle_problem().is_none()));
+    }
+
+    #[test]
+    fn observed_transport_whitespace_cannot_fabricate_a_competing_request() {
+        let installed = [github("owner", "plugin", SHA, true)];
+        let wanted = "owner/plugin@v1";
+        let normalized = "git@github.com:owner/plugin.git@v2";
+        let malformed = "git @github.com:owner/plugin.git@v2";
+        for lines in [[malformed, wanted], [wanted, malformed]] {
+            let desired = lines.map(str::to_string);
+            let rows = rows_from_bundle(Some(&desired), &installed, &[], None);
+            assert_eq!(rows.len(), 2);
+            for (line, row) in lines.into_iter().zip(&rows) {
+                if line == wanted {
+                    assert!(row.plugin_detail().is_some());
+                    assert_eq!(row.trust.bundle_problem(), None);
+                    assert!(row
+                        .trust
+                        .lines()
+                        .contains(&"Requested ref · v1 (bundle list)".into()));
+                } else {
+                    assert_eq!(row.label, normalized);
+                    assert_eq!(row.status, Status::Missing);
+                    assert!(row.plugin_detail().is_none());
+                    assert!(row
+                        .trust
+                        .lines()
+                        .contains(&"Requested ref · Unknown".into()));
+                }
+            }
+        }
+        let genuine = [wanted.into(), normalized.into()];
+        let rows = rows_from_bundle(Some(&genuine), &installed, &[], None);
+        assert!(rows.iter().all(|row| row.plugin_detail().is_none()));
+        assert!(rows[0]
+            .trust
+            .lines()
+            .contains(&"Requested ref · Ambiguous request (bundle list)".into()));
+    }
+
+    #[test]
+    fn retained_intent_requires_the_originating_row_and_exact_typed_target() {
+        let mut plugin = github("owner", "plugin", SHA, true);
+        plugin.actions.push(("entry".into(), "Action".into()));
+        plugin
+            .panes
+            .push(("entry".into(), "Pane".into(), String::new()));
+        let installed = [plugin];
+        let listed = [Spec::parse("owner/plugin@v1")];
+        let original = rows(&listed, &installed);
+        let id = original[0].plugin_detail().unwrap().plugin_id.clone();
+        let mut log = LogView::from_result(id.clone(), Ok(String::new()));
+        log.row_key = Some(original[0].key.clone());
+        let bind = PendingBind {
+            row_key: original[0].key.clone(),
+            plugin_id: id.clone(),
+            target: crate::BindTarget::Action("entry".into()),
+            key: "prefix+shift+k".into(),
+        };
+        assert!(bind.matches(&original[0]));
+        assert_eq!(log.originating_row(&original), Some(0));
+
+        let direct = rows(&[], &installed);
+        assert_eq!(direct[0].plugin_detail().unwrap().plugin_id, id);
+        assert!(!bind.matches(&direct[0]));
+        assert_eq!(log.originating_row(&direct), None);
+
+        let duplicated = rows(&[listed[0].clone(), listed[0].clone()], &installed);
+        assert!(duplicated.iter().all(|row| row.plugin_detail().is_some()));
+        assert_eq!(log.originating_row(&duplicated), None);
+
+        let mut pane_only = installed.clone();
+        pane_only[0].actions.clear();
+        let pane_only = rows(&listed, &pane_only);
+        assert_eq!(log.originating_row(&pane_only), Some(0));
+        assert!(!bind.matches(&pane_only[0]));
+    }
+
+    #[test]
+    fn malformed_bundle_ref_blocks_only_its_own_bundle_payload() {
+        let installed = [github("owner", "plugin", SHA, true)];
+        for malformed in ["owner/plugin@v1@{1}", "OWNER/PLUGIN@"] {
+            for specs in [
+                [malformed, "owner/plugin@stable@rc"],
+                ["owner/plugin@stable@rc", malformed],
+            ] {
+                let r = rows(&specs.map(Spec::parse), &installed);
+                assert_eq!(r.len(), 2);
+                for (row, spec) in r.iter().zip(specs) {
+                    assert_eq!(row.plugin_detail().is_none(), spec == malformed);
+                    assert_eq!(row.trust.bundle_problem().is_some(), spec == malformed);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_bundle_refs_close_only_exact_direct_fallbacks() {
+        let mut installed = [
+            github("alias", "root", SHA, true),
+            github("owner", "plugin/Tools", SHA, true),
+            github("owner", "plugin/tools", SHA, true),
+            github("other", "unrelated", SHA, true),
+            local("local-plugin"),
+        ];
+        installed[1].plugin_id = "upper-tools".into();
+        installed[2].plugin_id = "lower-tools".into();
+        for (specs, blocked) in [
+            (vec!["OWNER/PLUGIN/Tools@"], "owner/plugin/Tools"),
+            (
+                vec![
+                    "git@github.com:ALIAS/ROOT.git@v1",
+                    "ssh://git@github.com/alias/root@v2",
+                ],
+                "alias/root",
+            ),
+        ] {
+            let desired: Vec<_> = specs.iter().map(|spec| Spec::parse(spec)).collect();
+            let r = rows(&desired, &installed);
+            assert_eq!(r.len(), specs.len() + installed.len());
+            for row in &r[..specs.len()] {
+                assert_eq!(row.status, Status::Missing);
+                assert!(row.plugin_detail().is_none());
+            }
+            for row in &r[specs.len()..] {
+                let reject = row.label == blocked;
+                assert_eq!(row.plugin_detail().is_none(), reject, "{}", row.label);
+                assert_eq!(row.trust.bundle_problem().is_some(), reject);
+                assert_eq!(
+                    row.status,
+                    if row.label == "local-plugin" {
+                        Status::ExtraLocal
+                    } else {
+                        Status::Extra
+                    }
+                );
+                if reject {
+                    assert!(row
+                        .trust
+                        .lines()
+                        .contains(&format!("Repository · {blocked} (installed registry)")));
+                }
+            }
+        }
+        let identical = [
+            "git@github.com:ALIAS/ROOT.git@v1",
+            "ssh://git@github.com/alias/root@v1",
+        ]
+        .map(Spec::parse);
+        let r = rows(&identical, &installed);
+        assert_eq!(r[2].label, "alias/root");
+        assert!(r[2].plugin_detail().is_some());
     }
 
     /// A local link must never be shown as prunable: `--prune` protects it, and a UI that
@@ -5873,6 +6347,58 @@ mod tests {
     }
 
     #[test]
+    fn managed_maintenance_uses_the_desired_root_not_a_weak_hit() {
+        let installed = [installed_at("other", "plugin", 0)];
+        let desired = [Spec::parse("owner/plugin")];
+        assert_eq!(installed[0].matches(&desired[0]), Match::Weak);
+        let unrelated = market("other/plugin", "1970-01-01T00:00:00Z");
+        let rows = rows_with_updates(&desired, &installed, std::slice::from_ref(&unrelated));
+        assert!(rows[0].maintenance.is_none());
+        assert!(!rows[0].maybe_stale);
+
+        let market = [unrelated, market("OWNER/PLUGIN", "2024-10-05T00:00:00Z")];
+        let rows = rows_with_updates(&desired, &installed, &market);
+        assert_eq!(
+            rows[0].maintenance,
+            Some(crate::registry::maintenance_status(
+                &market[1].pushed_at,
+                crate::registry::today_days()
+            ))
+        );
+        // The cache supplies repository facts, not facts about the weakly matched install.
+        assert!(!rows[0].maybe_stale);
+
+        let invalid = [Spec::parse("../plugin")];
+        let rows = rows_with_updates(&invalid, &installed, &market);
+        assert!(rows[0].maintenance.is_none());
+    }
+
+    #[test]
+    fn parsed_child_uses_root_for_cache_but_keeps_scoped_report() {
+        for repo in ["REPO", "REPO/Tools"] {
+            let installed = crate::parse_plugin_list(&format!(
+                r#"{{"result":{{"plugins":[{{"plugin_id":"example.plugin","source":{{
+                    "kind":"github","owner":"Owner","repo":"{repo}","subdir":"Tools",
+                    "resolved_commit":"{SHA}","installed_unix_ms":1
+                }}}}]}}}}"#
+            ))
+            .unwrap();
+            let desired = [Spec::parse("owner/repo/Tools")];
+            let market = [market("OWNER/REPO", "2024-10-05T00:00:00Z")];
+            for desired in [desired.as_slice(), &[]] {
+                let rows = rows_with_updates(desired, &installed, &market);
+                assert!(rows[0].maintenance.is_some());
+                assert!(rows[0].maybe_stale);
+                assert!(rows[0]
+                    .trust
+                    .lines()
+                    .iter()
+                    .any(|line| line.starts_with("Repository · owner/repo/Tools (")));
+            }
+        }
+    }
+
+    #[test]
     fn the_main_list_surfaces_only_common_actions() {
         let app = App {
             rows: rows(&[Spec::parse("owner/missing")], &[]),
@@ -6357,7 +6883,7 @@ mod tests {
         connection: crate::machine::MachineConnection,
         plugin_list_available: bool,
     ) -> MachineView {
-        let desired = [Spec::parse("owner/repo")];
+        let desired = ["owner/repo".into()];
         let installed = vec![github("owner", "repo", SHA, true)];
         MachineView::new(
             crate::machine::MachineCollection {
@@ -6381,9 +6907,43 @@ mod tests {
                 ],
                 notice: None,
             },
-            &desired,
+            Ok(&desired),
             &[],
         )
+    }
+
+    #[test]
+    fn machine_health_with_rejected_bundle_uses_only_installed_facts() {
+        let error = crate::BundleError::Location("fixture discovery failed");
+        let mut view = MachineView::new(
+            crate::machine::MachineCollection {
+                machines: vec![machine_health(
+                    None,
+                    crate::machine::MachineConnection::Local,
+                    true,
+                    vec![github("owner", "repo", SHA, true)],
+                )],
+                notice: None,
+            },
+            Err(&error),
+            &[],
+        );
+        let row = &view.entries[0].rows[0];
+        assert!(row.plugin_detail().is_none());
+        assert_eq!(row.label, "owner/repo");
+        view.open_selected();
+        let mut app = App {
+            machine_view: Some(view),
+            ..App::default()
+        };
+        let mut output = Vec::new();
+        app.draw_machines(&mut output, 120, 24).unwrap();
+        let frame = String::from_utf8(output).unwrap();
+        assert!(frame.contains("Cannot read plugin list"));
+        assert!(frame.contains("1 installed · bundle unknown"));
+        assert!(frame.contains("owner/repo"));
+        app.request_machine_action(MachineAction::Sync);
+        assert!(app.pending_machine.is_none());
     }
 
     #[test]
@@ -6468,5 +7028,47 @@ mod tests {
             .flash
             .as_deref()
             .is_some_and(|message| message.contains("update action is unavailable")));
+    }
+
+    #[test]
+    fn machine_action_notifications_keep_unknown_and_explicit_failure_distinct() {
+        let cases = [
+            (
+                "machine action acknowledgement timed out; action state is unknown: fixture",
+                "sync on Build machine (dev@example.com): machine action acknowledgement timed out; action state is unknown: fixture",
+                "sync failed on",
+            ),
+            (
+                "machine action failed: fixture exited 42",
+                "sync on Build machine (dev@example.com): machine action failed: fixture exited 42",
+                "acknowledgement timed out",
+            ),
+        ];
+
+        for (error, expected, absent) in cases {
+            let view = machine_view_for_test(crate::machine::MachineConnection::Connected, true);
+            let app = App {
+                machine_view: Some(view),
+                flash: Some(machine_action_notification(
+                    MachineAction::Sync,
+                    "Build machine (dev@example.com)",
+                    Err(error.to_string()),
+                )),
+                ..Default::default()
+            };
+            let mut buffer = Vec::new();
+
+            app.draw_machines(&mut buffer, 180, 24).unwrap();
+
+            let visible = String::from_utf8(buffer).unwrap();
+            assert!(
+                visible.contains(expected),
+                "unexpected notification: {visible}"
+            );
+            assert!(
+                !visible.contains(absent),
+                "unexpected notification: {visible}"
+            );
+        }
     }
 }
