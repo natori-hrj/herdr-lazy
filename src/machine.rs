@@ -6,6 +6,7 @@
 //! disconnected machine is data for the view, never a reason to change the local installation.
 
 use std::io;
+use std::time::Duration;
 
 use crate::{json, HerdrVersion, Installed, PLUGIN_ID};
 
@@ -59,7 +60,7 @@ pub(crate) struct MachineCollection {
 /// advertised option avoids sending a command that an older client will reject, and gives the
 /// manage pane a safe local-only fallback.
 pub(crate) fn machine_forwarding_supported() -> bool {
-    match crate::run_herdr(&["--help"]) {
+    match crate::run_herdr_response(&["--help"]) {
         Ok((true, stdout, stderr)) => help_advertises_machine(&format!("{}\n{}", stdout, stderr)),
         _ => false,
     }
@@ -75,7 +76,7 @@ fn help_advertises_machine(help: &str) -> bool {
 }
 
 pub(crate) fn machine_profiles() -> Result<Vec<MachineProfile>, String> {
-    match crate::run_herdr(&["machine", "list", "--json"]) {
+    match crate::run_herdr_response(&["machine", "list", "--json"]) {
         Ok((true, stdout, _)) => parse_machine_list(&stdout),
         Ok((false, stdout, stderr)) => Err(command_error(
             "could not list saved machines",
@@ -160,6 +161,7 @@ fn one_line(value: &str) -> String {
         .join(" ")
 }
 
+#[allow(dead_code)] // Retained for callers that intentionally dispatch interactive machine work.
 pub(crate) fn run_machine(profile_id: &str, args: &[&str]) -> io::Result<(bool, String, String)> {
     if !valid_machine_id(profile_id) {
         return Err(io::Error::new(
@@ -172,8 +174,36 @@ pub(crate) fn run_machine(profile_id: &str, args: &[&str]) -> io::Result<(bool, 
     crate::run_herdr_owned(&owned)
 }
 
+fn run_machine_response(profile_id: &str, args: &[&str]) -> io::Result<(bool, String, String)> {
+    if !valid_machine_id(profile_id) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unsafe machine id",
+        ));
+    }
+    let mut owned = vec!["--machine".to_string(), profile_id.to_string()];
+    owned.extend(args.iter().map(|arg| (*arg).to_string()));
+    let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+    crate::run_herdr_response(&refs)
+}
+
+const ACTION_ACK_TIMEOUT: Duration = Duration::from_secs(3);
+
+fn run_machine_action_ack(profile_id: &str, args: &[&str]) -> io::Result<(bool, String, String)> {
+    if !valid_machine_id(profile_id) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unsafe machine id",
+        ));
+    }
+    let mut owned = vec!["--machine".to_string(), profile_id.to_string()];
+    owned.extend(args.iter().map(|arg| (*arg).to_string()));
+    let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+    crate::run_herdr_response_with_timeout(&refs, ACTION_ACK_TIMEOUT)
+}
+
 fn remote_server_status(profile_id: &str) -> Result<ServerStatus, String> {
-    match run_machine(profile_id, &["status", "server", "--json"]) {
+    match run_machine_response(profile_id, &["status", "server", "--json"]) {
         Ok((true, stdout, _)) => parse_server_status(&stdout),
         Ok((false, stdout, stderr)) => {
             Err(command_error("server status unavailable", &stdout, &stderr))
@@ -228,7 +258,7 @@ fn parse_server_status(stdout: &str) -> Result<ServerStatus, String> {
 }
 
 fn remote_plugin_list(profile_id: &str) -> Result<Vec<Installed>, String> {
-    match run_machine(profile_id, &["plugin", "list", "--json"]) {
+    match run_machine_response(profile_id, &["plugin", "list", "--json"]) {
         Ok((true, stdout, _)) => crate::parse_plugin_list(&stdout),
         Ok((false, stdout, stderr)) => {
             Err(command_error("plugin list unavailable", &stdout, &stderr))
@@ -238,7 +268,7 @@ fn remote_plugin_list(profile_id: &str) -> Result<Vec<Installed>, String> {
 }
 
 fn remote_action_ids(profile_id: &str) -> Result<Vec<String>, String> {
-    match run_machine(
+    match run_machine_response(
         profile_id,
         &["plugin", "action", "list", "--plugin", PLUGIN_ID],
     ) {
@@ -291,7 +321,7 @@ pub(crate) fn action_for(actions: &[String], base: &str) -> Option<String> {
 }
 
 fn remote_sync_result(profile_id: &str) -> Option<SyncResult> {
-    let output = run_machine(
+    let output = run_machine_response(
         profile_id,
         &[
             "plugin", "log", "list", "--plugin", PLUGIN_ID, "--limit", "100",
@@ -370,7 +400,7 @@ pub(crate) fn invoke_machine_action(profile_id: &str, action_id: &str) -> Result
     if !valid_cli_value(action_id) {
         return Err("unsafe plugin action id".to_string());
     }
-    match run_machine(
+    match run_machine_action_ack(
         profile_id,
         &[
             "plugin", "action", "invoke", action_id, "--plugin", PLUGIN_ID,
@@ -380,7 +410,32 @@ pub(crate) fn invoke_machine_action(profile_id: &str, action_id: &str) -> Result
         Ok((false, stdout, stderr)) => {
             Err(command_error("machine action failed", &stdout, &stderr))
         }
-        Err(error) => Err(format!("could not run herdr: {}", error)),
+        Err(error) => Err(machine_action_transport_error(&error)),
+    }
+}
+
+fn machine_action_transport_error(error: &io::Error) -> String {
+    if error.kind() == io::ErrorKind::TimedOut {
+        format!(
+            "machine action acknowledgement timed out; action state is unknown: {}",
+            error
+        )
+    } else {
+        format!("could not run herdr: {}", error)
+    }
+}
+
+fn saved_machine_connection(
+    plugin_list_available: bool,
+    server_running: Option<bool>,
+    compatible: Option<bool>,
+) -> MachineConnection {
+    if !plugin_list_available || server_running != Some(true) {
+        MachineConnection::Disconnected
+    } else if compatible == Some(false) {
+        MachineConnection::Incompatible
+    } else {
+        MachineConnection::Connected
     }
 }
 
@@ -483,13 +538,7 @@ fn collect_saved_machine(profile: MachineProfile) -> MachineHealth {
         (Vec::new(), None, None)
     };
 
-    let connection = if !plugin_list_available || server_running == Some(false) {
-        MachineConnection::Disconnected
-    } else if compatible == Some(false) {
-        MachineConnection::Incompatible
-    } else {
-        MachineConnection::Connected
-    };
+    let connection = saved_machine_connection(plugin_list_available, server_running, compatible);
     let error = [server_error, plugin_error, action_error]
         .into_iter()
         .flatten()
@@ -528,6 +577,35 @@ mod tests {
         assert_eq!(machines[0].label, "Build machine");
         assert!(machines[0].enabled);
         assert!(!machines[1].enabled);
+    }
+
+    #[test]
+    fn machine_action_ack_has_its_own_short_deadline() {
+        assert!(ACTION_ACK_TIMEOUT <= Duration::from_secs(3));
+        assert!(ACTION_ACK_TIMEOUT < crate::herdr_output::RESPONSE_TIMEOUT);
+    }
+
+    #[test]
+    fn successful_plugin_list_does_not_hide_unknown_server_health() {
+        assert_eq!(
+            saved_machine_connection(true, None, None),
+            MachineConnection::Disconnected
+        );
+        assert_eq!(
+            saved_machine_connection(true, Some(true), None),
+            MachineConnection::Connected
+        );
+    }
+
+    #[test]
+    fn action_timeout_reports_unknown_acknowledgement_not_action_failure() {
+        let message = machine_action_transport_error(&io::Error::new(
+            io::ErrorKind::TimedOut,
+            "fixture timeout",
+        ));
+        assert!(message.contains("acknowledgement timed out"));
+        assert!(message.contains("state is unknown"));
+        assert!(!message.contains("action failed"));
     }
 
     #[test]

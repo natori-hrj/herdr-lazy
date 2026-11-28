@@ -5,7 +5,6 @@ use super::{
     terminal_text::{clip, one_line, wrap_line},
     App, Color, Role,
 };
-use crate::github::Changes;
 
 struct Line {
     text: String,
@@ -55,6 +54,14 @@ impl Body {
     }
 }
 
+fn push_trust(body: &mut Body, report: &crate::plugin_trust::Report, width: usize) {
+    body.push("");
+    body.push_styled("Plugin provenance", Color::Plain, true);
+    for fact in report.lines() {
+        body.push_wrapped(&fact, width);
+    }
+}
+
 fn body(app: &App, width: u16) -> Body {
     let mut body = Body::default();
     let Some(idx) = app.detail_of else {
@@ -65,6 +72,25 @@ fn body(app: &App, width: u16) -> Body {
     };
 
     let text_width = usize::from(width).saturating_sub(2).max(1);
+    let detail = row.plugin_detail();
+    let bundle_problem = row.trust.bundle_problem();
+    if row.installed.is_some() && detail.is_none() {
+        body.push_color("Installation · Unknown", app.theme.color(Role::Warning));
+        if let Some(problem) = bundle_problem {
+            body.push_wrapped(problem, text_width);
+            body.push_wrapped(
+                "Manifest, actions, compatibility, and logs are unavailable here.",
+                text_width,
+            );
+        } else {
+            body.push_wrapped(
+                "The installed record cannot be attributed to this entry. Manifest, actions, compatibility, and logs are unavailable here.",
+                text_width,
+            );
+        }
+        push_trust(&mut body, &row.trust, text_width);
+        return body;
+    }
     let (status, role) = match (row.installed.is_some(), row.enabled) {
         (false, _) => ("Not installed", Role::Warning),
         (true, Some(true)) => ("Installed · enabled", Role::Success),
@@ -72,18 +98,8 @@ fn body(app: &App, width: u16) -> Body {
         (true, None) => ("Installed", Role::Success),
     };
     body.push_color(status, app.theme.color(role));
-    if let Some(slug) = row.slug.as_deref() {
-        body.push_wrapped(&format!("Repository · {slug}"), text_width);
-    }
-    if let Some(commit) = row.commit.as_deref() {
-        body.push_wrapped(&format!("Resolved commit · {commit}"), text_width);
-    }
-    if let Some(reference) = row
-        .listed_as
-        .as_deref()
-        .and_then(|line| crate::Spec::parse(line).reference)
-    {
-        body.push_wrapped(&format!("Listed ref · {reference}"), text_width);
+    if let Some(problem) = bundle_problem {
+        body.push_wrapped_color(problem, text_width, app.theme.color(Role::Warning));
     }
     if let Some(warning) = row.herdr_warning {
         body.push_wrapped_color(
@@ -97,28 +113,18 @@ fn body(app: &App, width: u16) -> Body {
     }
     body.push("");
 
-    let Some(detail) = row.detail.as_ref() else {
+    let Some(detail) = detail else {
         body.push_wrapped(
             "Esc returns to the list. Press i there to install.",
             text_width,
         );
+        push_trust(&mut body, &row.trust, text_width);
         return body;
     };
 
     if !detail.description.is_empty() {
         body.push_wrapped(&detail.description, text_width);
         body.push("");
-    }
-
-    if let Some(maintenance) = row.maintenance.as_ref() {
-        if let Some(age) = maintenance.age() {
-            let quiet = if maintenance.is_quiet() {
-                " · quiet"
-            } else {
-                ""
-            };
-            body.push(format!("Maintenance · last pushed {age} ago{quiet}"));
-        }
     }
 
     let items = App::bindable(detail);
@@ -168,43 +174,13 @@ fn body(app: &App, width: u16) -> Body {
         body.push("");
     }
 
-    if let Some((row_idx, changes)) = &app.detail_changes {
-        if *row_idx == idx {
-            let warning = app.theme.color(Role::Warning);
-            match changes {
-                Changes::Commits(subjects) if !subjects.is_empty() => {
-                    body.push_styled(
-                        format!("Changes · {} new commits", subjects.len()),
-                        warning,
-                        true,
-                    );
-                    for subject in subjects.iter().take(8) {
-                        body.push(format!("  · {subject}"));
-                    }
-                    if subjects.len() > 8 {
-                        body.push(format!("  … and {} more", subjects.len() - 8));
-                    }
-                    body.push("Esc returns to the list. Press u there to update.");
-                }
-                Changes::Commits(_) => {}
-                Changes::ManyPlus(count) => {
-                    body.push_styled(format!("Changes · {count}+ commits behind"), warning, true);
-                    body.push("Esc returns to the list. Press u there to update.");
-                }
-                Changes::Unknown(reason) => {
-                    body.push(format!("Could not check for changes · {reason}"))
-                }
-            }
-            body.push("");
-        }
-    }
-
     if let Some((target, _)) = items.get(app.detail_cursor) {
         let (kind, command) = crate::bind_toml_fields(target, &detail.plugin_id);
         body.push_styled("Binding preview", Color::Plain, true);
         body.push(format!("  type = \"{kind}\""));
         body.push_wrapped(&format!("  command = \"{command}\""), text_width);
     }
+    push_trust(&mut body, &row.trust, text_width);
     body
 }
 
@@ -349,7 +325,7 @@ pub(super) fn draw(app: &App, out: &mut impl Write, width: u16, height: u16) -> 
                     " · ↑/↓ Select · Enter Run · b Bind"
                 });
             }
-            if row.installed.is_some() {
+            if row.plugin_detail().is_some() {
                 hints.push_str(if compact { " · L" } else { " · L Logs" });
             }
             let (footer, _) = clip(&hints, columns);
@@ -367,24 +343,47 @@ pub(super) fn draw(app: &App, out: &mut impl Write, width: u16, height: u16) -> 
 
 #[cfg(test)]
 mod tests {
+    use super::super::{bundle_read_error, rows, rows_from_bundle, rows_with_herdr_version, Row};
     use super::*;
-    use crate::Installed;
+    use crate::{Installed, Spec};
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    struct ScratchDir(std::path::PathBuf);
+
+    impl ScratchDir {
+        fn new() -> Self {
+            let path = crate::lock_temp_path(&std::env::temp_dir().join("herdr-lazy-details"));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn fixture() -> App {
         let plugin = Installed {
             plugin_id: "example.plugin".into(),
             name: "Plugin 界".into(),
             description: "Navigation and workspace setup. ".repeat(3),
+            slug: Some("example/plugin".into()),
+            source_kind: "github".into(),
+            source_scope: crate::plugin_trust::SourceScope::GitHub("example/plugin".into()),
+            resolved_commit: Some(SHA.into()),
             actions: (0..12)
                 .map(|i| (format!("example.plugin.action-{i}"), format!("Command {i}")))
                 .collect(),
             events: vec!["workspace.created".into()],
             ..Default::default()
         };
+        let rows = rows(&[], &[plugin]);
         App {
-            rows: super::super::rows(&[], &[plugin]),
+            rows,
             detail_of: Some(0),
-            detail_changes: Some((0, Changes::Commits(vec!["Fix workspaces".into()]))),
             ..Default::default()
         }
     }
@@ -431,7 +430,7 @@ mod tests {
         app.rows[0].label = "owner/long-plugin-name".into();
         let end = render(&app, 40, 11);
         assert!(end.contains("Selected: Command 1"));
-        assert!(end.contains("\x1b[1m Binding preview\x1b[0m"));
+        assert!(end.contains("Lock comparison does not authenticate"));
         assert!(end.contains("Pg↑"));
         assert!(!end.contains("Pg↓"));
         assert!(!end.contains("\x1b[1mEnter\x1b[0m"));
@@ -457,7 +456,7 @@ mod tests {
             scrolled.push_str(&render(&app, 40, 10));
         }
         assert!(scrolled.contains("Selected: Command 10"));
-        assert!(scrolled.contains("Fix workspaces"));
+        assert!(scrolled.contains("Plugin provenance"));
         assert!(scrolled.contains("Binding preview"));
         assert_eq!(app.detail_cursor, 10);
     }
@@ -473,39 +472,583 @@ mod tests {
     }
 
     #[test]
-    fn detail_lists_only_available_local_metadata() {
+    fn detail_shows_source_labelled_evidence_and_unknowns_for_missing_rows() {
         let mut app = fixture();
-        let row = &mut app.rows[0];
-        row.slug = Some("example/plugin".into());
-        row.enabled = Some(false);
-        row.commit = Some("0123456789abcdef0123456789abcdef01234567".into());
-        row.listed_as = Some("example/plugin@stable".into());
-        row.herdr_warning = Some(super::super::HerdrVersionWarning {
+        let sha = SHA;
+        let plugin = Installed {
+            plugin_id: "fixture.plugin".into(),
+            slug: Some("Example/Plugin".into()),
+            source_kind: "github".into(),
+            source_scope: crate::plugin_trust::SourceScope::GitHub("example/plugin".into()),
+            resolved_commit: Some(sha.into()),
+            ..Installed::default()
+        };
+        let spec = crate::Spec::parse("example/plugin@stable");
+        app.rows = super::super::rows(&[spec], &[plugin]);
+        app.rows[0]
+            .trust
+            .set_lock(Some(&format!("example/plugin@{sha}")));
+        app.rows[0].herdr_warning = Some(super::super::HerdrVersionWarning {
             required: crate::HerdrVersion::parse("0.10.0").unwrap(),
             running: crate::HerdrVersion::parse("0.9.5").unwrap(),
         });
         let wide = render(&app, 120, 24);
         for fact in [
             "Installed · disabled",
-            "Repository · example/plugin",
-            "Resolved commit · 0123456789abcdef0123456789abcdef01234567",
-            "Listed ref · stable",
             "Requires Herdr 0.10.0 · running 0.9.5",
+            "Plugin provenance",
+            "Repository · example/plugin (bundle list)",
+            "Resolved revision · 0123456789abcdef0123456789abcdef01234567 (installed registry)",
+            "Requested ref · stable (bundle list)",
+            "Registry revision matches lock",
         ] {
-            assert!(wide.contains(fact), "missing {fact}");
+            assert!(wide.contains(fact), "missing {fact}: {wide:?}");
         }
         let narrow = body(&app, 25);
         let text: String = narrow.lines.into_iter().map(|line| line.text).collect();
-        assert!(text.contains("0123456789abcdef0123456789abcdef01234567"));
+        assert!(text.contains(sha));
 
         let spec = crate::Spec::parse("example/missing@v1");
         app.rows = super::super::rows(&[spec], &[]);
-        let missing = render(&app, 80, 10);
+        let missing = render(&app, 80, 24);
         assert!(missing.contains("Not installed"));
-        assert!(missing.contains("Repository · example/missing"));
-        assert!(missing.contains("Listed ref · v1"));
-        assert!(!missing.contains("Resolved commit"));
+        assert!(missing.contains("Repository · example/missing (bundle list)"));
+        assert!(missing.contains("Requested ref · v1 (bundle list)"));
+        assert!(missing.contains("Resolved revision · Unknown"));
         assert!(!missing.contains("Requires Herdr"));
+    }
+
+    fn assert_unattributed(spec: &str, plugins: &[Installed]) {
+        let mut app = App {
+            rows: rows_with_herdr_version(
+                &[Spec::parse(spec)],
+                plugins,
+                &[],
+                crate::HerdrVersion::parse("0.9.5"),
+            ),
+            ..App::default()
+        };
+        assert_eq!(app.rows[0].enabled, Some(true));
+        assert!(app.rows[0].herdr_warning.is_none());
+        assert!(app.rows[0].plugin_detail().is_none());
+        let list = render(&app, 160, 24);
+        assert!(!list.contains("Other manifest description"), "{list:?}");
+        assert!(!list.contains("needs herdr"), "{list:?}");
+        assert!(!list.contains("Requires newer Herdr"), "{list:?}");
+        app.open_logs();
+        assert!(app.log_view.is_none());
+        assert_eq!(
+            app.flash.take().as_deref(),
+            Some("Logs unavailable · plugin identity is uncertain")
+        );
+
+        app.detail_of = Some(0);
+        let frame = render(&app, 120, 24);
+        assert!(frame.contains("Installation · Unknown"));
+        assert!(frame.contains(&format!("Repository · {spec} (bundle list)")));
+        for hidden in [
+            "Installed ·",
+            "Other manifest description",
+            "Other action",
+            "Other pane",
+            "other.event",
+            "Requires Herdr",
+            "Other plugin changes",
+            "Binding preview",
+            "Enter Run",
+            "L Logs",
+        ] {
+            assert!(!frame.contains(hidden), "unexpected {hidden}: {frame:?}");
+        }
+        assert!(!confirm_selection_visible(&mut app, 120, 24));
+        app.flash = None;
+        app.run_detail_action();
+        app.detail_cursor = 1;
+        app.run_detail_action();
+        assert!(app.flash.is_none());
+        app.bind_selected('t');
+        assert!(app.pending_bind.is_none());
+        app.open_logs_for(0);
+        assert!(app.log_view.is_none());
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("Logs unavailable · plugin identity is uncertain")
+        );
+    }
+
+    fn registry_source_fixture(id: &str, source_fields: &str) -> Installed {
+        crate::parse_plugin_list(&format!(
+            r#"{{"result":{{"plugins":[{{
+                "plugin_id":"{id}","name":"plugin","description":"Other manifest description",
+                "min_herdr_version":"0.10.0",
+                "source":{{"resolved_commit":"{SHA}"{source_fields}}},
+                "actions":[{{"id":"other.action","title":"Other action"}}],
+                "panes":[{{"id":"other.pane","title":"Other pane"}}],
+                "events":[{{"on":"other.event"}}]
+            }}]}}}}"#
+        ))
+        .unwrap()
+        .pop()
+        .unwrap()
+    }
+
+    fn registry_fixture(repo: &str, id: &str, fields: &str) -> Installed {
+        registry_source_fixture(
+            id,
+            &format!(r#","kind":"github","owner":"example","repo":"{repo}"{fields}"#),
+        )
+    }
+
+    #[test]
+    fn rejected_bundle_ref_keeps_facts_but_hides_and_blocks_the_payload() {
+        let plugin = registry_fixture("plugin", "fixture.plugin", r#","installed_unix_ms":123"#);
+        let market = [crate::registry::Entry {
+            full_name: "example/plugin".into(),
+            pushed_at: "2024-01-02T00:00:00Z".into(),
+            ..Default::default()
+        }];
+        let desired = [Spec::parse("example/plugin@stable@{1}")];
+        let mut app = App {
+            rows: rows_with_herdr_version(
+                &desired,
+                &[plugin],
+                &market,
+                crate::HerdrVersion::parse("0.9.5"),
+            ),
+            detail_of: Some(0),
+            ..App::default()
+        };
+        let row = &mut app.rows[0];
+        row.trust.set_lock(Some(&format!("example/plugin@{SHA}")));
+        assert!(row.maintenance.is_some());
+        let frame = render(&app, 120, 24);
+        for fact in [
+            "Requested ref · Invalid suffix (bundle list)",
+            "Provenance · GitHub (installed registry)",
+            "Installation recorded · 123 Unix ms (installed registry)",
+            "Registry revision matches lock",
+            "Last push · 2024-01-02",
+        ] {
+            assert!(frame.contains(fact), "{frame:?}");
+        }
+        for hidden in [
+            "Other manifest description",
+            "Other action",
+            "Other pane",
+            "other.event",
+            "Requires Herdr",
+            "Binding preview",
+            "Enter Run",
+            "L Logs",
+        ] {
+            assert!(!frame.contains(hidden), "unexpected {hidden}: {frame:?}");
+        }
+        app.run_detail_action();
+        assert!(app.flash.is_none());
+        app.bind_selected('t');
+        assert!(app.pending_bind.is_none());
+        app.open_logs_for(0);
+        assert!(app.log_view.is_none());
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("Logs unavailable · plugin identity is uncertain")
+        );
+    }
+
+    fn assert_no_registry_revision(row: &Row) {
+        assert!(row
+            .trust
+            .lines()
+            .iter()
+            .any(|line| line == "Resolved revision · Unknown"));
+    }
+
+    #[test]
+    fn child_does_not_get_payload_from_weak_or_competing_registry_claims() {
+        let spec = "example/plugin/Tools";
+        let root = registry_fixture("plugin", "other-plugin", "");
+        let second_root = registry_fixture("plugin", "second-plugin", "");
+        let exact = registry_fixture("plugin/Tools", "exact-plugin", "");
+        let sibling = registry_fixture("plugin/tools", "other-plugin", "");
+        let url_only = registry_source_fixture(
+            "other-plugin",
+            r#","url":"https://github.com/example/plugin.git""#,
+        );
+        for candidates in [
+            vec![root.clone()],
+            vec![second_root, root.clone()],
+            vec![root, exact.clone()],
+            vec![sibling.clone()],
+            vec![exact.clone(), sibling],
+            vec![url_only.clone()],
+            vec![url_only, exact],
+        ] {
+            assert_unattributed(spec, &candidates);
+        }
+    }
+
+    #[test]
+    fn a_path_in_source_owner_is_not_a_scoped_claim() {
+        let records = crate::parse_plugin_list(
+            r#"{"result":{"plugins":[{"plugin_id":"other-plugin","source":{
+                "kind":"github","owner":"example/plugin","repo":"Tools"
+            }}]}}"#,
+        )
+        .unwrap();
+        assert_unattributed("example/plugin/Tools", &records);
+    }
+
+    #[test]
+    fn a_present_bad_url_never_falls_back_to_absent() {
+        for value in [
+            "null".to_string(),
+            "42".to_string(),
+            r#"{"raw":"https://github.com/example/plugin"}"#.into(),
+            r#""not a URL""#.into(),
+            format!(r#""https://github.com/example/plugin/{}""#, "x".repeat(320)),
+        ] {
+            let field = format!(r#","url":{value}"#);
+            for repo in ["plugin", "plugin/Tools"] {
+                let plugin = registry_fixture(repo, "other-plugin", &field);
+                assert_unattributed(&format!("example/{repo}"), &[plugin]);
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_structured_fields_cannot_be_replaced_by_a_clone_url() {
+        let url = r#","url":"https://github.com/example/plugin.git""#;
+        for fields in [
+            r#","kind":"github","owner":null,"repo":"plugin""#,
+            r#","kind":"github","owner":"example","repo":null"#,
+            r#","kind":"github","owner":42,"repo":"plugin""#,
+            r#","kind":"github","owner":"example","repo":["plugin"]"#,
+            r#","kind":"github","owner":"example""#,
+            r#","kind":"github","repo":"plugin""#,
+            r#","kind":"github","owner":"","repo":"plugin""#,
+            r#","kind":"github","owner":"https://github.com/example","repo":"plugin""#,
+            r#","kind":"github","owner":"example","repo":"plugin/..""#,
+            r#","kind":"github","owner":"example","repo":"plugin.git""#,
+            r#","kind":"git","owner":"example","repo":"plugin""#,
+            r#","owner":"example","repo":"plugin""#,
+            r#","subdir":"Tools""#,
+        ] {
+            let plugin = registry_source_fixture("other-plugin", &format!("{fields}{url}"));
+            let records = [plugin];
+            assert_unattributed("example/plugin", &records);
+            assert_no_registry_revision(&rows(&[Spec::parse("example/plugin")], &records)[0]);
+            let direct = rows(&[], &records);
+            assert!(direct[0].plugin_detail().is_none(), "{fields}");
+            assert_no_registry_revision(&direct[0]);
+        }
+        for fields in ["", r#","kind":"github""#, r#","kind":"git""#] {
+            let plugin = registry_source_fixture("other-plugin", &format!("{fields}{url}"));
+            let records = [plugin];
+            let bundle = rows(&[Spec::parse("example/plugin")], &records);
+            assert!(bundle[0].plugin_detail().is_some(), "{fields}");
+            assert!(rows(&[], &records)[0].plugin_detail().is_some(), "{fields}");
+        }
+    }
+
+    #[test]
+    fn canonical_subdir_proves_only_its_exact_scope_without_changing_lifecycle_match() {
+        for repo in ["PLUGIN", "PLUGIN/Tools/Way"] {
+            let child = registry_source_fixture(
+                "other-plugin",
+                &format!(
+                    r#","kind":"github","owner":"EXAMPLE","repo":"{repo}","subdir":"Tools/Way","url":"git@github.com:example/plugin.git""#
+                ),
+            );
+            assert_eq!(
+                child.slug.as_deref(),
+                Some(format!("EXAMPLE/{repo}").as_str())
+            );
+            let records = [child];
+            let (root, exact) = ("example/plugin", "example/plugin/Tools/Way");
+            assert_eq!(
+                records[0].matches(&Spec::parse(exact)),
+                crate::Match::Strong
+            );
+            assert!(rows(&[Spec::parse(exact)], &records)[0]
+                .plugin_detail()
+                .is_some());
+            for nonmatching in [root, "example/plugin/tools/Way"] {
+                assert_unattributed(nonmatching, &records);
+                assert_no_registry_revision(&rows(&[Spec::parse(nonmatching)], &records)[0]);
+            }
+            let direct = rows(&[], &records);
+            assert!(direct[0].plugin_detail().is_some());
+            assert!(direct[0]
+                .trust
+                .lines()
+                .iter()
+                .any(|line| line == "Repository · example/plugin/Tools/Way (installed registry)"));
+        }
+        let root = registry_fixture("plugin", "other-plugin", "");
+        assert!(rows(&[Spec::parse("example/plugin")], &[root])[0]
+            .plugin_detail()
+            .is_some());
+    }
+
+    #[test]
+    fn malformed_or_contradictory_subdir_is_not_an_absent_subdir() {
+        for (repo, subdir) in [
+            ("plugin", "null"),
+            ("plugin", "42"),
+            ("plugin", r#""""#),
+            ("plugin", r#""Tools/../Other""#),
+            ("plugin", r#""/Tools""#),
+            ("plugin/Tools", r#""Other""#),
+            ("plugin/Tools", r#""tools""#),
+        ] {
+            let plugin = registry_fixture(repo, "other-plugin", &format!(r#","subdir":{subdir}"#));
+            let records = [plugin];
+            assert_unattributed("example/plugin", &records);
+            assert_unattributed("example/plugin/Tools", &records);
+            assert_no_registry_revision(&rows(&[Spec::parse("example/plugin")], &records)[0]);
+            assert!(rows(&[], &records)[0].plugin_detail().is_none());
+        }
+    }
+
+    #[test]
+    fn duplicate_registry_keys_withhold_bundle_and_direct_payloads_in_both_orders() {
+        let url = r#""https://github.com/example/plugin.git""#;
+        for (first, last) in [("null", url), (url, "null")] {
+            let records = crate::parse_plugin_list(&format!(
+                r#"{{"result":{{"plugins":[{{
+                    "plugin_id":"other-plugin","source":{{
+                        "kind":"github","owner":"example","repo":"plugin","resolved_commit":"{SHA}",
+                        "url":{first},"url":{last}
+                    }}
+                }},{{"plugin_id":"unrelated","source":{{"kind":"local","resolved_commit":"{SHA}"}},
+                     "actions":[{{"id":"test","title":"Normally available"}}]
+                }}]}}}}"#
+            ))
+            .unwrap();
+            assert_eq!(records.len(), 2);
+            assert_eq!(
+                records[0]
+                    .source_values
+                    .iter()
+                    .any(|s| s == "https://github.com/example/plugin.git"),
+                last == url
+            );
+            let spec = "example/plugin";
+            assert_eq!(records[0].matches(&Spec::parse(spec)), crate::Match::Strong);
+            assert_unattributed(spec, &records);
+            assert_no_registry_revision(&rows(&[Spec::parse(spec)], &records)[0]);
+            for row in rows(&[], &records) {
+                assert_eq!(row.commit.as_deref(), Some(SHA));
+                assert_eq!(row.enabled, Some(true));
+                assert!(row.plugin_detail().is_none());
+                assert_no_registry_revision(&row);
+            }
+        }
+    }
+
+    #[test]
+    fn exact_scope_still_requires_a_usable_unique_id() {
+        let spec = "example/plugin";
+        for id in ["", " ", "--invalid"] {
+            assert_unattributed(spec, &[registry_fixture("plugin", id, "")]);
+        }
+        let exact = registry_fixture("plugin", "other-plugin", "");
+        let unrelated = registry_fixture("different", "other-plugin", "");
+        assert_unattributed(spec, &[exact, unrelated]);
+    }
+
+    #[test]
+    fn unique_root_and_case_exact_child_keep_their_payload() {
+        for (spec, repo, field) in [
+            ("example/plugin", "plugin", ""),
+            (
+                "example/plugin/Tools",
+                "PLUGIN/Tools",
+                r#","url":"git@github.com:EXAMPLE/plugin.git""#,
+            ),
+        ] {
+            let p = registry_fixture(repo, "other-plugin", field);
+            let mut app = App {
+                rows: rows_with_herdr_version(
+                    &[Spec::parse(spec)],
+                    &[p],
+                    &[],
+                    crate::HerdrVersion::parse("0.9.5"),
+                ),
+                detail_of: Some(0),
+                ..App::default()
+            };
+            let frame = render(&app, 120, 30);
+            for shown in [
+                "Other manifest description",
+                "Other action",
+                "Other pane",
+                "other.event",
+                "Requires Herdr",
+                "Binding preview",
+                "L Logs",
+            ] {
+                assert!(frame.contains(shown), "{shown}: {frame:?}");
+            }
+            assert!(confirm_selection_visible(&mut app, 120, 30));
+        }
+    }
+
+    #[test]
+    fn an_unlisted_github_row_can_use_its_direct_id() {
+        let p = registry_fixture("plugin", "other-plugin", "");
+        let app = App {
+            rows: rows(&[], &[p]),
+            detail_of: Some(0),
+            ..App::default()
+        };
+        let frame = render(&app, 120, 24);
+        assert!(frame.contains("Other action"));
+        assert!(frame.contains("Binding preview"));
+        assert!(frame.contains("L Logs"));
+    }
+
+    #[test]
+    fn rejected_bundle_bytes_never_authorize_direct_details() {
+        let dir = ScratchDir::new();
+        let path = dir.0.join("plugins.list");
+        let records = [
+            registry_fixture("plugin", "fixture.plugin", ""),
+            Installed {
+                plugin_id: "local-plugin".into(),
+                source_kind: "local".into(),
+                actions: vec![("local.action".into(), "Local action".into())],
+                ..Default::default()
+            },
+        ];
+        let prefix = b"other/plugin@v1\n";
+        let mut invalid = prefix.to_vec();
+        invalid.push(0xff);
+        let mut oversized = prefix.to_vec();
+        oversized.resize(crate::MAX_LOCAL_INPUT_BYTES as usize + 1, b'a');
+        for rejected in [invalid, oversized] {
+            std::fs::write(&path, rejected).unwrap();
+            let error = crate::read_ui_bundle(&path).unwrap_err();
+            let mut app = App {
+                rows: rows_from_bundle(None, &records, &[], None),
+                bundle_error: Some(bundle_read_error(&error)),
+                ..App::default()
+            };
+            assert_eq!(app.rows.len(), 2);
+            assert_eq!(app.rows[0].label, "example/plugin");
+            let list = render(&app, 120, 24);
+            assert!(list.contains("Cannot read plugin list"));
+            assert!(!list.contains("other/plugin"));
+            assert!(!list.contains("Unlisted"));
+            app.detail_of = Some(0);
+            let frame = render(&app, 120, 24);
+            assert!(frame.contains("bundle snapshot rejected"));
+            assert!(frame.contains(&format!("Resolved revision · {SHA} (installed registry)")));
+            for index in 0..app.rows.len() {
+                assert!(app.rows[index].plugin_detail().is_none());
+                app.detail_of = Some(index);
+                assert!(!confirm_selection_visible(&mut app, 120, 24));
+                app.flash = None;
+                app.run_detail_action();
+                assert!(app.flash.is_none());
+                app.bind_selected('t');
+                assert!(app.pending_bind.is_none());
+                app.open_logs_for(index);
+                assert!(app.log_view.is_none());
+                assert_eq!(
+                    app.flash.as_deref(),
+                    Some("Logs unavailable · bundle snapshot rejected")
+                );
+            }
+        }
+        let empty = rows_from_bundle(Some(&[]), &records, &[], None);
+        assert!(empty.iter().all(|row| row.plugin_detail().is_some()));
+    }
+
+    #[test]
+    fn details_reject_invalid_or_aliased_lock_snapshots_without_revoking_payload() {
+        let dir = ScratchDir::new();
+        let lock = dir.0.join("plugins.lock");
+        let actual = format!("example/plugin@{SHA}\n");
+        let mut app = fixture();
+        std::fs::write(&lock, actual.as_bytes()).unwrap();
+        app.open_detail_with_lock(&lock);
+        assert!(render(&app, 120, 45).contains("Registry revision matches lock"));
+
+        let mut invalid = actual.as_bytes().to_vec();
+        invalid.push(0xff);
+        let mut oversized = actual.as_bytes().to_vec();
+        oversized.resize(crate::MAX_LOCAL_INPUT_BYTES as usize + 1, b'a');
+        let assert_unknown = |app: &App| {
+            let frame = render(app, 120, 45);
+            assert!(frame.contains("Lockfile ref · Unknown"), "{frame:?}");
+            assert!(frame.contains("Locked revision · Unknown"), "{frame:?}");
+            assert!(frame.contains("Lock consistency · Unknown"), "{frame:?}");
+            assert!(frame.contains("Binding preview"), "{frame:?}");
+            assert!(frame.contains("L Logs"), "{frame:?}");
+        };
+        for bytes in [invalid, oversized] {
+            std::fs::write(&lock, bytes).unwrap();
+            app.open_detail_with_lock(&lock);
+            assert_unknown(&app);
+        }
+
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&lock).unwrap();
+            let target = dir.0.join("alias-target");
+            std::fs::write(&target, actual).unwrap();
+            std::os::unix::fs::symlink(&target, &lock).unwrap();
+            app.open_detail_with_lock(&lock);
+            assert_unknown(&app);
+            std::fs::remove_file(&lock).unwrap();
+            std::fs::hard_link(&target, &lock).unwrap();
+            app.open_detail_with_lock(&lock);
+            assert_unknown(&app);
+        }
+    }
+
+    #[test]
+    fn weak_local_claim_does_not_authorize_a_bundle_row_but_direct_id_still_works() {
+        let plugin = Installed {
+            plugin_id: "local-plugin".into(),
+            name: "plugin".into(),
+            enabled: true,
+            source_kind: "local".into(),
+            actions: vec![("local.action".into(), "Local action".into())],
+            ..Installed::default()
+        };
+        assert_unattributed("example/plugin", std::slice::from_ref(&plugin));
+        let mut app = App {
+            rows: rows(&[], &[plugin]),
+            detail_of: Some(0),
+            ..App::default()
+        };
+        let frame = render(&app, 120, 24);
+        assert!(frame.contains("Installed · enabled"));
+        assert!(frame.contains("Local action"));
+        assert!(frame.contains("L Logs"));
+        assert!(confirm_selection_visible(&mut app, 120, 24));
+    }
+
+    #[test]
+    fn detail_scroll_stays_local_and_log_modal_keeps_precedence() {
+        let mut app = fixture();
+        let cursor = app.detail_cursor;
+        scroll_rows(&mut app, 80, 9, isize::MAX);
+        assert!(render(&app, 80, 9).contains("Lock comparison does not authenticate"));
+        let offset = app.detail_scroll;
+        app.log_view = Some(super::super::LogView::from_result(
+            "example.plugin".into(),
+            Ok("example log".into()),
+        ));
+        let modal = render(&app, 80, 24);
+        assert!(modal.contains("example log"));
+        assert!(!modal.contains("Lock comparison"));
+        app.log_view = None;
+        assert_eq!(app.detail_scroll, offset);
+        assert_eq!(app.detail_cursor, cursor);
+        assert!(render(&app, 80, 9).contains("Lock comparison does not authenticate"));
     }
 
     #[test]
