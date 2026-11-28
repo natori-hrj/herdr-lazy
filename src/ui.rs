@@ -5319,9 +5319,10 @@ mod tests {
             assert!(r.iter().all(|row| row.trust.bundle_ref_problem().is_none()));
         }
 
-        let child = [github("owner", "plugin/Tools", SHA, true)];
+        let mut child = github("owner", "plugin/Tools", SHA, true);
+        child.plugin_id = "upper-tools".into();
         let desired = ["owner/plugin/Tools@v1", "OWNER/PLUGIN/tools@v2"].map(Spec::parse);
-        let r = rows(&desired, &child);
+        let r = rows(&desired, &[child]);
         assert!(r[0].plugin_detail().is_some());
         assert!(r[1].plugin_detail().is_none());
         assert!(r.iter().all(|row| row.trust.bundle_ref_problem().is_none()));
@@ -5347,13 +5348,15 @@ mod tests {
 
     #[test]
     fn rejected_bundle_refs_close_only_exact_direct_fallbacks() {
-        let installed = [
+        let mut installed = [
             github("alias", "root", SHA, true),
             github("owner", "plugin/Tools", SHA, true),
             github("owner", "plugin/tools", SHA, true),
             github("other", "unrelated", SHA, true),
             local("local-plugin"),
         ];
+        installed[1].plugin_id = "upper-tools".into();
+        installed[2].plugin_id = "lower-tools".into();
         for (specs, blocked) in [
             (vec!["OWNER/PLUGIN/Tools@"], "owner/plugin/Tools"),
             (
