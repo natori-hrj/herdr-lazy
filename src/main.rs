@@ -28,7 +28,9 @@ mod context;
 mod download;
 mod extras;
 mod github;
+mod herdr_output;
 mod json;
+mod lockfile;
 mod machine;
 mod profile;
 mod recommendations;
@@ -46,11 +48,88 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub(crate) const MAX_LOCAL_INPUT_BYTES: u64 = 64 * 1024;
+
+fn open_local_regular_file(path: &Path, label: &str) -> io::Result<fs::File> {
+    let not_regular = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{label} {} is not a regular file", path.display()),
+        )
+    };
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(open_error) => {
+            #[cfg(windows)]
+            if open_error.kind() == io::ErrorKind::PermissionDenied
+                && matches!(fs::metadata(path), Ok(metadata) if metadata.is_dir())
+            {
+                return Err(not_regular());
+            }
+            return Err(open_error);
+        }
+    };
+    if !file.metadata()?.file_type().is_file() {
+        return Err(not_regular());
+    }
+    Ok(file)
+}
+
 /// Read a byte stream up to its budget. `None` means the budget was exceeded.
 pub(crate) fn read_limited(reader: impl Read, max_bytes: u64) -> io::Result<Option<Vec<u8>>> {
     let mut body = Vec::new();
     reader.take(max_bytes + 1).read_to_end(&mut body)?;
     Ok(((body.len() as u64) <= max_bytes).then_some(body))
+}
+
+pub(crate) fn read_local_text(path: &Path, label: &str) -> io::Result<String> {
+    let file = open_local_regular_file(path, label)?;
+    let bytes = read_limited(file, MAX_LOCAL_INPUT_BYTES)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{label} {} exceeds {} bytes",
+                path.display(),
+                MAX_LOCAL_INPUT_BYTES
+            ),
+        )
+    })?;
+    String::from_utf8(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{label} {} is not valid UTF-8", path.display()),
+        )
+    })
+}
+
+fn validate_local_text_size(body: &[u8], label: &str, path: &Path) -> io::Result<()> {
+    validate_local_text_len(body.len(), label, path)
+}
+
+fn validate_local_text_len(len: usize, label: &str, path: &Path) -> io::Result<()> {
+    if len as u64 > MAX_LOCAL_INPUT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{label} {} exceeds {} bytes",
+                path.display(),
+                MAX_LOCAL_INPUT_BYTES
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn write_local_text(path: &Path, body: &str, label: &str) -> io::Result<()> {
+    validate_local_text_size(body.as_bytes(), label, path)?;
+    fs::write(path, body)
 }
 
 /// Curated "batteries-included" default set — the distro layer.
@@ -122,7 +201,7 @@ pub(crate) fn config_dir() -> PathBuf {
         if let Ok(d) = env::var("HERDR_PLUGIN_CONFIG_DIR") {
             return PathBuf::from(d);
         }
-        if let Ok((true, out, _)) = run_herdr(&["plugin", "config-dir", PLUGIN_ID]) {
+        if let Ok((true, out, _)) = run_herdr_response(&["plugin", "config-dir", PLUGIN_ID]) {
             let p = out.trim();
             if !p.is_empty() {
                 return PathBuf::from(p);
@@ -170,12 +249,10 @@ fn lock_beside(list: &Path) -> PathBuf {
     list.with_file_name("plugins.lock")
 }
 
-/// Keep a short, file-based history of lockfile contents next to the active lock.
-///
-/// Three generations are enough to undo a recent bad sync without turning the config
-/// directory into an unbounded archive. The suffix is deliberately part of the filename so
-/// the snapshots remain easy to inspect and copy by hand.
-const MAX_PREVIOUS_LOCKFILES: usize = 3;
+#[cfg(test)]
+use lockfile::MAX_PREVIOUS_LOCKFILES;
+use lockfile::{lock_history_beside, write_lock_contents};
+
 static LOCK_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn lock_file_name(lock: &Path) -> String {
@@ -184,87 +261,11 @@ fn lock_file_name(lock: &Path) -> String {
         .unwrap_or_else(|| "plugins.lock".to_string())
 }
 
-fn lock_history_beside(lock: &Path, generation: usize) -> PathBuf {
-    assert!((1..=MAX_PREVIOUS_LOCKFILES).contains(&generation));
-    lock.with_file_name(format!("{}.{}", lock_file_name(lock), generation))
-}
-
-fn previous_lock_path() -> PathBuf {
-    lock_history_beside(&lock_path(), 1)
-}
-
 fn remove_file_if_present(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
-    }
-}
-
-fn optional_file_contents(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    match fs::read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
-    }
-}
-
-fn restore_file_contents(path: &Path, contents: &Option<Vec<u8>>) -> io::Result<()> {
-    match contents {
-        Some(bytes) => write_bytes_atomically(path, bytes),
-        None => remove_file_if_present(path),
-    }
-}
-
-fn restore_lock_history(lock: &Path, previous: &[Option<Vec<u8>>]) -> io::Result<()> {
-    for (index, contents) in previous.iter().enumerate() {
-        restore_file_contents(&lock_history_beside(lock, index + 1), contents)?;
-    }
-    Ok(())
-}
-
-/// Shift existing snapshots back one slot, then copy the active lock into `.1`.
-///
-/// Copying rather than renaming keeps the active lock in place until the new contents have
-/// been written. If a history operation fails, the caller can still leave the current lock
-/// untouched instead of losing the only known-good state.
-fn rotate_lock_history(lock: &Path) -> io::Result<Vec<Option<Vec<u8>>>> {
-    let previous: Vec<Option<Vec<u8>>> = (1..=MAX_PREVIOUS_LOCKFILES)
-        .map(|generation| optional_file_contents(&lock_history_beside(lock, generation)))
-        .collect::<io::Result<_>>()?;
-
-    let result = (|| {
-        for generation in (2..=MAX_PREVIOUS_LOCKFILES).rev() {
-            let source = lock_history_beside(lock, generation - 1);
-            let destination = lock_history_beside(lock, generation);
-            match copy_file_atomically(&source, &destination) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    // Do not leave an old, out-of-order snapshot in a slot whose source vanished.
-                    remove_file_if_present(&destination)?;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        copy_file_atomically(lock, &lock_history_beside(lock, 1))
-    })();
-
-    match result {
-        Ok(()) => Ok(previous),
-        Err(error) => {
-            // The active lock was never touched. Restore all snapshot slots as well, so a
-            // failed rotation is a no-op from the user's point of view.
-            if let Err(rollback) = restore_lock_history(lock, &previous) {
-                return Err(io::Error::new(
-                    rollback.kind(),
-                    format!(
-                        "lock history rotation failed: {}; rollback failed: {}",
-                        error, rollback
-                    ),
-                ));
-            }
-            Err(error)
-        }
     }
 }
 
@@ -367,19 +368,6 @@ fn replace_lock(path: &Path, temporary: &Path) -> io::Result<()> {
     Err(error)
 }
 
-fn copy_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
-    let temporary = lock_temp_path(destination);
-    if let Err(error) = fs::copy(source, &temporary) {
-        let _ = remove_file_if_present(&temporary);
-        return Err(error);
-    }
-    let result = replace_lock(destination, &temporary);
-    if result.is_err() {
-        let _ = remove_file_if_present(&temporary);
-    }
-    result
-}
-
 pub(crate) fn write_bytes_atomically(path: &Path, body: &[u8]) -> io::Result<()> {
     let temporary = loop {
         let candidate = lock_temp_path(path);
@@ -389,23 +377,21 @@ pub(crate) fn write_bytes_atomically(path: &Path, body: &[u8]) -> io::Result<()>
             .open(&candidate)
         {
             Ok(mut file) => {
-                if let Err(e) = file.write_all(body) {
+                if let Err(error) = file.write_all(body) {
                     drop(file);
                     let _ = remove_file_if_present(&candidate);
-                    return Err(e);
+                    return Err(error);
                 }
-                drop(file);
                 break candidate;
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         }
     };
-
     if let Ok(metadata) = fs::metadata(path) {
-        if let Err(e) = fs::set_permissions(&temporary, metadata.permissions()) {
+        if let Err(error) = fs::set_permissions(&temporary, metadata.permissions()) {
             let _ = remove_file_if_present(&temporary);
-            return Err(e);
+            return Err(error);
         }
     }
     let result = replace_lock(path, &temporary);
@@ -413,46 +399,6 @@ pub(crate) fn write_bytes_atomically(path: &Path, body: &[u8]) -> io::Result<()>
         let _ = remove_file_if_present(&temporary);
     }
     result
-}
-
-fn write_lock_atomically(path: &Path, body: &str) -> io::Result<()> {
-    write_bytes_atomically(path, body.as_bytes())
-}
-
-/// Write a lock and rotate its history only when the contents actually change.
-///
-/// The boolean says whether a new active file was written. A no-op sync therefore preserves
-/// both the current file and every historical snapshot.
-fn write_lock_contents(path: &Path, body: &str) -> io::Result<bool> {
-    let current = match fs::read(path) {
-        Ok(bytes) => Some(bytes),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e),
-    };
-    if current.as_deref() == Some(body.as_bytes()) {
-        return Ok(false);
-    }
-
-    let previous = if current.is_some() {
-        Some(rotate_lock_history(path)?)
-    } else {
-        None
-    };
-    if let Err(error) = write_lock_atomically(path, body) {
-        if let Some(previous) = previous {
-            if let Err(rollback) = restore_lock_history(path, &previous) {
-                return Err(io::Error::new(
-                    rollback.kind(),
-                    format!(
-                        "lock write failed: {}; history rollback failed: {}",
-                        error, rollback
-                    ),
-                ));
-            }
-        }
-        return Err(error);
-    }
-    Ok(true)
 }
 
 fn ensure_parent(p: &Path) -> io::Result<()> {
@@ -469,6 +415,28 @@ pub(crate) fn run_herdr(args: &[&str]) -> io::Result<(bool, String, String)> {
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).to_string(),
         String::from_utf8_lossy(&out.stderr).to_string(),
+    ))
+}
+
+/// Run a Herdr command whose stdout/stderr are response data rather than an interactive task.
+pub(crate) fn run_herdr_response(args: &[&str]) -> io::Result<(bool, String, String)> {
+    let (status, stdout, stderr) = herdr_output::capture(&herdr_bin(), args)?;
+    Ok((
+        status.success(),
+        String::from_utf8_lossy(&stdout).to_string(),
+        String::from_utf8_lossy(&stderr).to_string(),
+    ))
+}
+
+pub(crate) fn run_herdr_response_with_timeout(
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> io::Result<(bool, String, String)> {
+    let (status, stdout, stderr) = herdr_output::capture_with_timeout(&herdr_bin(), args, timeout)?;
+    Ok((
+        status.success(),
+        String::from_utf8_lossy(&stdout).to_string(),
+        String::from_utf8_lossy(&stderr).to_string(),
     ))
 }
 
@@ -548,13 +516,13 @@ fn numeric_component(part: &str) -> Option<u64> {
 
 /// Read the running herdr version once for a view refresh.
 pub(crate) fn current_herdr_version() -> Option<HerdrVersion> {
-    let (ok, out, _) = run_herdr(&["--version"]).ok()?;
+    let (ok, out, _) = run_herdr_response(&["--version"]).ok()?;
     ok.then(|| HerdrVersion::parse(&out)).flatten()
 }
 
 /// Read a simple list file: one entry per line, `#` comments and blanks ignored.
 fn read_lines(p: &Path) -> Vec<String> {
-    match fs::read_to_string(p) {
+    match read_local_text(p, "plugin list") {
         Ok(s) => s
             .lines()
             .map(|l| l.trim().to_string())
@@ -564,9 +532,18 @@ fn read_lines(p: &Path) -> Vec<String> {
     }
 }
 
-pub(crate) fn desired_plugins() -> Vec<String> {
-    migrate_legacy_bundle();
-    read_lines(&bundle_path())
+fn desired_plugins_result() -> io::Result<Vec<String>> {
+    migrate_legacy_bundle()?;
+    let body = match read_local_text(&bundle_path(), "plugin list") {
+        Ok(body) => body,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    Ok(body
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect())
 }
 
 /// Move a bundle written by an earlier version into the location herdr gives us.
@@ -574,33 +551,39 @@ pub(crate) fn desired_plugins() -> Vec<String> {
 /// Only ever copies into an empty slot — if a bundle already exists at the real location,
 /// the legacy file is left alone and nothing is overwritten. Copy rather than move, so a
 /// mistake here cannot lose the user's list.
-fn migrate_legacy_bundle() {
+fn migrate_legacy_bundle() -> io::Result<()> {
     // When the location was chosen explicitly, do not auto-populate it. That path is likely a
     // dotfiles repo, and silently writing a legacy list into it is not ours to do — `init` or
     // `add` will, when the user asks.
     if env::var("HERDR_LAZY_LIST").is_ok_and(|v| !v.is_empty()) {
-        return;
+        return Ok(());
     }
     let current = bundle_path();
-    if current.exists() {
-        return;
-    }
     let legacy = legacy_config_dir().join("plugins.list");
-    if !legacy.exists() || legacy == current {
-        return;
+    migrate_legacy_bundle_at(&current, &legacy)
+}
+
+fn migrate_legacy_bundle_at(current: &Path, legacy: &Path) -> io::Result<()> {
+    if current.exists() {
+        return Ok(());
     }
-    let Ok(body) = fs::read_to_string(&legacy) else {
-        return;
+    if legacy == current {
+        return Ok(());
+    }
+    let body = match read_local_text(legacy, "legacy plugin list") {
+        Ok(body) => body,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
     };
-    if ensure_parent(&current).is_err() || fs::write(&current, &body).is_err() {
-        return;
-    }
+    ensure_parent(current)?;
+    write_local_text(current, &body, "plugin list")?;
     println!(
         "moved your plugin list to the location herdr uses:\n  {} -> {}\n  (the old copy is \
          left in place; delete it when you are happy)",
         legacy.display(),
         current.display()
     );
+    Ok(())
 }
 
 /// "owner/repo" or "owner/repo/subdir" -> "repo"
@@ -653,7 +636,7 @@ impl Spec {
 /// This is deliberately fallible: a read-only check must not turn an unreadable list into an
 /// apparently empty one.
 fn read_specs(path: &Path) -> io::Result<Vec<Spec>> {
-    let body = fs::read_to_string(path)?;
+    let body = read_local_text(path, "plugin list")?;
     Ok(body
         .lines()
         .map(|line| line.trim().to_string())
@@ -922,7 +905,7 @@ pub(crate) fn parse_plugin_list(stdout: &str) -> Result<Vec<Installed>, String> 
 
 /// Snapshot the installed set via `plugin list --json`.
 pub(crate) fn installed_plugins() -> Result<Vec<Installed>, String> {
-    match run_herdr(&["plugin", "list", "--json"]) {
+    match run_herdr_response(&["plugin", "list", "--json"]) {
         Ok((true, out, _)) => parse_plugin_list(&out),
         Ok((false, _, err)) => Err(format!("`herdr plugin list` failed: {}", err.trim())),
         Err(e) => Err(format!("could not run herdr: {}", e)),
@@ -973,7 +956,7 @@ fn cmd_probe(raw: bool) -> io::Result<()> {
     println!();
 
     // 1. Can we reach the herdr binary at all?
-    let version = match run_herdr(&["--version"]) {
+    let version = match run_herdr_response(&["--version"]) {
         Ok((ok, out, err)) => {
             println!("[herdr --version] success={} {}", ok, out.trim());
             if !err.trim().is_empty() {
@@ -995,7 +978,7 @@ fn cmd_probe(raw: bool) -> io::Result<()> {
     // once, and nearly cost a whole hand-rolled pinning layer. The surface is known now, so it
     // moves behind `--raw`: probe is the command someone runs to file a bug, and burying the
     // paths under a page of help text makes that report harder to write, not easier.
-    let help = match run_herdr(&["plugin", "--help"]) {
+    let help = match run_herdr_response(&["plugin", "--help"]) {
         Ok((ok, out, err)) => {
             println!("[herdr plugin --help] success={}", ok);
             if raw {
@@ -1010,7 +993,7 @@ fn cmd_probe(raw: bool) -> io::Result<()> {
     };
 
     // 3. The list format `sync` parses. `--json` is the contract.
-    let list = match run_herdr(&["plugin", "list", "--json"]) {
+    let list = match run_herdr_response(&["plugin", "list", "--json"]) {
         Ok((ok, out, err)) => {
             println!(
                 "[herdr plugin list --json] success={} {}",
@@ -1029,7 +1012,7 @@ fn cmd_probe(raw: bool) -> io::Result<()> {
     };
 
     if raw {
-        match run_herdr(&["plugin", "list"]) {
+        match run_herdr_response(&["plugin", "list"]) {
             Ok((ok, out, err)) => {
                 println!("[herdr plugin list] (human, for comparison) success={}", ok);
                 dump_block(&out, &err);
@@ -1137,6 +1120,34 @@ fn default_bundle_body(chosen: &[extras::Extra]) -> String {
             body.push('\n');
             seen.push(pl.clone());
         }
+    }
+    body
+}
+
+fn append_extras_to_body(mut body: String, chosen: &[extras::Extra]) -> String {
+    let mut entries: Vec<String> = body
+        .lines()
+        .filter(|line| is_entry_line(line))
+        .map(|line| line.trim().to_string())
+        .collect();
+    for extra in chosen {
+        let fresh = fresh_plugins(extra, &entries);
+        if fresh.is_empty() {
+            continue;
+        }
+        if !body.is_empty() {
+            if !body.ends_with('\n') {
+                body.push('\n');
+            }
+            body.push('\n');
+        }
+        body.push_str(&extra.header());
+        body.push('\n');
+        for plugin in &fresh {
+            body.push_str(plugin);
+            body.push('\n');
+        }
+        entries.extend(fresh);
     }
     body
 }
@@ -1286,32 +1297,18 @@ fn cmd_init(
         Some((_, body)) => body.clone(),
         None => default_bundle_body(&chosen),
     };
-    // Reading a list before it becomes your file is the point; this is the scriptable half.
-    //
-    // An adopted body is written verbatim and gets its extras from a second pass further down,
-    // so they have to be printed here too. `default_bundle_body` already contains them, which
-    // is why this only runs on the adopted path — printing both ways listed pluck twice.
+    let proposal = if adopted.is_some() {
+        append_extras_to_body(base, &chosen)
+    } else {
+        base
+    };
+    // Preview the same complete proposal that a real invocation would write.
     if dry_run {
-        print!("{}", base);
-        if adopted.is_some() {
-            for e in &chosen {
-                println!("\n{}", e.header());
-                for pl in &e.plugins {
-                    println!("{}", pl);
-                }
-            }
-        }
+        print!("{}", proposal);
         return Ok(());
     }
     ensure_parent(&p)?;
-    fs::write(&p, base)?;
-    // An adopted list is written verbatim, so any extras asked for still have to be appended —
-    // the same append the pane uses, so the two cannot produce different files.
-    if adopted.is_some() {
-        for e in &chosen {
-            let _ = add_extra_to_list(e);
-        }
-    }
+    write_local_text(&p, &proposal, "plugin list")?;
     match &adopted {
         Some((spec, body)) => {
             let n = body.lines().filter(|l| is_entry_line(l)).count();
@@ -1397,7 +1394,7 @@ fn repo_root(repo: &str) -> String {
 /// Facts only. Nothing is removed from the list and nothing is uninstalled — a plugin already
 /// installed keeps working, and the entry may be worth keeping while a replacement is chosen.
 fn cmd_doctor() -> io::Result<()> {
-    let desired = desired_plugins();
+    let desired = desired_plugins_result()?;
     if desired.is_empty() {
         println!(
             "no plugin list at {} — nothing to check.",
@@ -1447,17 +1444,23 @@ fn cmd_doctor() -> io::Result<()> {
 }
 
 fn cmd_list() -> io::Result<()> {
-    let desired = desired_plugins();
+    migrate_legacy_bundle()?;
+    let path = bundle_path();
+    let desired = match read_specs(&path) {
+        Ok(specs) => specs,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error),
+    };
     if desired.is_empty() {
         println!(
             "no plugin list at {} — run `herdr-lazy init`.",
-            bundle_path().display()
+            path.display()
         );
         return Ok(());
     }
     println!("desired plugins ({}):", desired.len());
     for d in &desired {
-        println!("  - {}", d);
+        println!("  - {}", d.display());
     }
     Ok(())
 }
@@ -1470,8 +1473,8 @@ fn cmd_list() -> io::Result<()> {
 /// writing the lock from it would drop every entry it did not look at.
 /// Read a lockfile as a set of specs, preserving I/O errors for callers that need to explain
 /// whether the file is missing or inaccessible.
-fn lock_specs_from(path: &Path) -> io::Result<Vec<Spec>> {
-    let body = fs::read_to_string(path)?;
+fn lock_specs_from(path: &Path, previous: bool) -> io::Result<Vec<Spec>> {
+    let body = lockfile::read_text(path, previous)?;
     Ok(body
         .lines()
         .map(str::trim)
@@ -1509,20 +1512,39 @@ fn restore_from_lock(
     previous: bool,
     installed: Option<Vec<Installed>>,
 ) -> io::Result<()> {
-    let all = match lock_specs_from(path) {
+    let display_path = if previous {
+        lock_history_beside(path, 1)
+    } else {
+        path.to_owned()
+    };
+    let all = match lock_specs_from(path, previous) {
         Ok(all) if !all.is_empty() => all,
         Ok(_) => {
-            print_missing_lock(path, previous);
+            print_missing_lock(&display_path, previous);
             return Ok(());
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            print_missing_lock(path, previous);
+            print_missing_lock(&display_path, previous);
             return Ok(());
         }
         Err(e) => return Err(e),
     };
     if previous {
-        println!("restoring from previous lockfile -> {}", path.display());
+        println!(
+            "restoring from previous lockfile -> {}",
+            display_path.display()
+        );
+    }
+    restore_lock_specs(&all, targets, installed)
+}
+
+fn restore_lock_specs(
+    all: &[Spec],
+    targets: &[&str],
+    installed: Option<Vec<Installed>>,
+) -> io::Result<()> {
+    if all.is_empty() {
+        return Ok(());
     }
     let unpinned = all.iter().filter(|s| s.reference.is_none()).count();
     if unpinned > 0 {
@@ -1534,8 +1556,8 @@ fn restore_from_lock(
         );
     }
     match installed {
-        Some(installed) => converge_with_installed(&all, targets, false, false, installed),
-        None => converge(&all, targets, false, false),
+        Some(installed) => converge_with_installed(all, targets, false, false, installed),
+        None => converge(all, targets, false, false),
     }
 }
 
@@ -1550,12 +1572,14 @@ pub(crate) fn cmd_restore(targets: &[&str]) -> io::Result<()> {
 /// escape hatch for undoing a recent sync. Keeping the active file untouched also means the
 /// user can inspect the result and choose whether to make the rollback permanent.
 fn cmd_restore_previous(targets: &[&str]) -> io::Result<()> {
-    let path = previous_lock_path();
-    restore_from_lock(&path, targets, true, None)
+    restore_from_lock(&lock_path(), targets, true, None)
 }
 
 pub(crate) fn cmd_sync(prune: bool, targets: &[&str]) -> io::Result<()> {
-    let all: Vec<Spec> = desired_plugins().iter().map(|l| Spec::parse(l)).collect();
+    let all: Vec<Spec> = desired_plugins_result()?
+        .iter()
+        .map(|l| Spec::parse(l))
+        .collect();
     if all.is_empty() {
         println!(
             "no plugin list at {} — run `herdr-lazy init` first.",
@@ -1605,20 +1629,20 @@ pub(crate) fn cmd_sync_profile(profile: &profile::WorkspaceProfile) -> io::Resul
 
 /// Restore the exact versions recorded by a workspace profile lockfile.
 pub(crate) fn cmd_restore_profile(profile: &profile::WorkspaceProfile) -> io::Result<()> {
-    let current = profile::discover_at(&profile.root).map_err(|error| {
+    let current = profile::discover_with_lock_at(&profile.root).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("workspace profile is no longer valid: {}", error),
         )
     })?;
-    let Some(current) = current else {
+    let Some((current, lock_specs)) = current else {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "workspace profile was removed before restore",
         ));
     };
     match current.lock_status {
-        profile::LockStatus::Ready(_) => restore_from_lock(&current.lock_path, &[], false, None),
+        profile::LockStatus::Ready(_) => restore_lock_specs(&lock_specs, &[], None),
         profile::LockStatus::Missing => Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
@@ -2238,11 +2262,17 @@ fn cmd_event() -> io::Result<()> {
 /// is excluded even when the marker is present: enabling auto-sync must not turn first launch
 /// into an unattended third-party install.
 fn cmd_startup() -> io::Result<()> {
+    // Bootstrap writes a new list when the current location is empty. Migrate first so an
+    // unreadable legacy list cannot be mistaken for a genuinely fresh machine and replaced.
+    migrate_legacy_bundle()?;
     let bootstrap = bootstrap_if_first_run();
     if !should_run_auto_sync(bootstrap, auto_sync_enabled()) {
         return Ok(()); // silent: the hook fires for everyone, most have not opted in
     }
-    let all: Vec<Spec> = desired_plugins().iter().map(|l| Spec::parse(l)).collect();
+    let all: Vec<Spec> = desired_plugins_result()?
+        .iter()
+        .map(|l| Spec::parse(l))
+        .collect();
     if all.is_empty() {
         return Ok(());
     }
@@ -2313,7 +2343,9 @@ enum BootstrapResult {
 
 fn write_first_run_list(path: &Path) -> io::Result<()> {
     ensure_parent(path)?;
-    write_bytes_atomically(path, default_bundle_body(&[]).as_bytes())
+    let body = default_bundle_body(&[]);
+    validate_local_text_size(body.as_bytes(), "plugin list", path)?;
+    write_bytes_atomically(path, body.as_bytes())
 }
 
 fn pending_default_plugin_count() -> usize {
@@ -2613,10 +2645,7 @@ fn converge_to(
 ) -> io::Result<()> {
     let installed = match installed_plugins() {
         Ok(v) => v,
-        Err(e) => {
-            eprintln!("{}", e);
-            return Ok(());
-        }
+        Err(e) => return Err(io::Error::other(e)),
     };
     converge_with_installed_at(all, targets, prune, lock_destination, installed)
 }
@@ -2776,10 +2805,12 @@ fn converge_with_installed_at(
     // Re-query: the snapshot above predates this run's installs, so it has no commits for
     // them. Locking against it would silently record the new plugins as unpinned.
     if let Some(lock_destination) = lock_destination {
-        let after = installed_plugins().unwrap_or_else(|e| {
-            eprintln!("warning: could not re-read plugin list for the lock: {}", e);
-            installed.clone()
-        });
+        let after = installed_plugins().map_err(|error| {
+            io::Error::other(format!(
+                "could not re-read plugin inventory; lock and history were left unchanged: {}",
+                error
+            ))
+        })?;
         write_lock_at(lock_destination, &all, &after)?;
     }
     if failed > 0 || prune_failed > 0 {
@@ -2922,6 +2953,14 @@ fn bound_keys(config: &str) -> Vec<String> {
         .collect()
 }
 
+fn read_bind_config(path: &Path) -> Result<String, String> {
+    match read_local_text(path, "Herdr config") {
+        Ok(body) => Ok(body),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(format!("could not read config.toml: {}", error)),
+    }
+}
+
 /// Would this key collide with something already bound?
 ///
 /// Separate from `bind_action` so the pane can check before showing a confirmation screen —
@@ -2930,7 +2969,7 @@ pub(crate) fn check_bind_conflict(key: &str) -> Result<(), String> {
     let Some(path) = herdr_config_path() else {
         return Err("cannot locate herdr's config.toml (no HERDR_SOCKET_PATH)".to_string());
     };
-    let existing = fs::read_to_string(&path).unwrap_or_default();
+    let existing = read_bind_config(&path)?;
     if bound_keys(&existing).iter().any(|k| k == key) {
         return Err(format!(
             "{} is already bound in config.toml — pick another, or edit it by hand",
@@ -2988,7 +3027,16 @@ pub(crate) fn bind_action(
     let Some(path) = herdr_config_path() else {
         return Err("cannot locate herdr's config.toml (no HERDR_SOCKET_PATH)".to_string());
     };
-    let existing = fs::read_to_string(&path).unwrap_or_default();
+    bind_action_at(&path, plugin_id, target, key)
+}
+
+fn bind_action_at(
+    path: &Path,
+    plugin_id: &str,
+    target: &BindTarget,
+    key: &str,
+) -> Result<String, String> {
+    let existing = read_bind_config(path)?;
 
     if bound_keys(&existing).iter().any(|k| k == key) {
         return Err(format!(
@@ -2997,14 +3045,8 @@ pub(crate) fn bind_action(
         ));
     }
 
-    // Back up before touching it. Same name every time: one restore point is what someone
-    // needs after a mistake, and a directory of timestamped copies is its own mess.
-    if !existing.is_empty() {
-        let _ = fs::write(path.with_extension("toml.herdr-lazy-backup"), &existing);
-    }
-
     let (kind, command) = target.toml_fields(plugin_id);
-    let mut body = existing;
+    let mut body = existing.clone();
     if !body.is_empty() && !body.ends_with('\n') {
         body.push('\n');
     }
@@ -3012,7 +3054,16 @@ pub(crate) fn bind_action(
         "\n# added by herdr-lazy\n[[keys.command]]\nkey = \"{}\"\ntype = \"{}\"\ncommand = \"{}\"\n",
         key, kind, command
     ));
-    fs::write(&path, body).map_err(|e| format!("could not write config.toml: {}", e))?;
+    validate_local_text_size(body.as_bytes(), "Herdr config", path)
+        .map_err(|e| format!("could not write config.toml: {}", e))?;
+
+    // Back up only after the complete proposal passes validation. Same name every time: one
+    // restore point is enough, and a rejected bind must preserve both config and prior backup.
+    if !existing.is_empty() {
+        let _ = fs::write(path.with_extension("toml.herdr-lazy-backup"), &existing);
+    }
+
+    fs::write(path, body).map_err(|e| format!("could not write config.toml: {}", e))?;
 
     // Ask herdr to pick it up; without this the binding does nothing until the next restart.
     let reloaded = matches!(run_herdr(&["server", "reload-config"]), Ok((true, _, _)));
@@ -3141,7 +3192,7 @@ where
 pub(crate) const PLUGIN_LOG_LIMIT: &str = "100";
 
 pub(crate) fn plugin_logs(plugin_id: &str) -> Result<String, String> {
-    plugin_logs_with(plugin_id, run_herdr)
+    plugin_logs_with(plugin_id, run_herdr_response)
 }
 
 fn plugin_logs_with<F>(plugin_id: &str, run: F) -> Result<String, String>
@@ -3188,7 +3239,10 @@ where
 /// commit is the one you want; silently moving it would make the lockfile a lie. To move a
 /// pin, edit the bundle.
 pub(crate) fn cmd_update(targets: &[&str]) -> io::Result<()> {
-    let desired: Vec<Spec> = desired_plugins().iter().map(|l| Spec::parse(l)).collect();
+    let desired: Vec<Spec> = desired_plugins_result()?
+        .iter()
+        .map(|l| Spec::parse(l))
+        .collect();
     if desired.is_empty() {
         println!(
             "no plugin list at {} — run `herdr-lazy init` first.",
@@ -3245,10 +3299,7 @@ pub(crate) fn update_specs_to(
 
     let before = match installed_plugins() {
         Ok(v) => v,
-        Err(e) => {
-            eprintln!("{}", e);
-            return Ok(());
-        }
+        Err(e) => return Err(io::Error::other(e)),
     };
     let commit_of = |set: &[Installed], spec: &Spec| -> Option<String> {
         set.iter()
@@ -3288,7 +3339,12 @@ pub(crate) fn update_specs_to(
 
         // Re-read rather than trusting the install output: `resolved_commit` is herdr's own
         // record, and it is what the lock will be written from.
-        let now = installed_plugins().unwrap_or_default();
+        let now = installed_plugins().map_err(|error| {
+            io::Error::other(format!(
+                "could not re-read plugin inventory after updating {}; lock and history were left unchanged: {}",
+                spec.repo, error
+            ))
+        })?;
         let new = commit_of(&now, spec);
         match (&old, &new) {
             (Some(o), Some(n)) if o == n => {
@@ -3315,7 +3371,12 @@ pub(crate) fn update_specs_to(
         changed, unchanged, pinned, failed
     );
 
-    let after = installed_plugins().unwrap_or(before);
+    let after = installed_plugins().map_err(|error| {
+        io::Error::other(format!(
+            "could not re-read plugin inventory; lock and history were left unchanged: {}",
+            error
+        ))
+    })?;
     write_lock_at(lock_destination, desired, &after)?;
     if failed > 0 {
         return Err(io::Error::other(format!(
@@ -3346,46 +3407,40 @@ fn write_lock(desired: &[Spec], installed: &[Installed]) -> io::Result<()> {
 }
 
 fn write_lock_at(p: &Path, desired: &[Spec], installed: &[Installed]) -> io::Result<()> {
-    ensure_parent(p)?;
-
     // Prefer the commit herdr actually checked out (`source.resolved_commit`) over the ref the
     // bundle asked for: a bundle may say `main`, but the lock must say which `main`. This is
     // what makes the lock reproducible rather than merely descriptive.
-    let mut lines = Vec::new();
-    let mut unresolved = 0;
-    let mut drifted = Vec::new();
-    for d in desired {
-        let hit = installed.iter().find(|p| p.matches(d) == Match::Strong);
-        // A commit pin that disagrees with what is installed means bundle and reality have
-        // diverged. Record the truth (what is installed), but never let it pass silently:
-        // a lock that quietly contradicts its bundle is worse than no lock.
-        if let Some(p) = hit {
-            if let PinState::Drifted { have } = pin_state(d, p) {
-                drifted.push(format!(
-                    "{} pins {} but {} is installed",
-                    d.repo,
-                    short(d.reference.as_deref().unwrap_or("")),
-                    short(&have)
-                ));
-            }
-        }
-        match hit.and_then(|p| p.resolved_commit.clone()) {
-            Some(c) => lines.push(format!("{}@{}", d.repo, c)),
-            None => {
-                unresolved += 1;
-                lines.push(d.display());
-            }
-        }
-    }
-
-    let mut body = String::new();
+    let mut body = String::with_capacity(MAX_LOCAL_INPUT_BYTES as usize);
     body.push_str("# herdr-lazy lock — resolved plugin set at last sync.\n");
     body.push_str("# Each `owner/repo@commit` reproduces exactly via `plugin install --ref`.\n");
     body.push_str("# Commits come from herdr's own `source.resolved_commit`.\n\n");
-    for l in &lines {
-        body.push_str(l);
+    let mut unresolved = 0;
+    let mut pin_checks = Vec::new();
+    for d in desired {
+        let hit = installed.iter().find(|p| p.matches(d) == Match::Strong);
+        let resolved = hit.and_then(|p| p.resolved_commit.as_deref());
+        let reference = resolved.or(d.reference.as_deref());
+        let next_len = body
+            .len()
+            .saturating_add(d.repo.len())
+            .saturating_add(reference.map_or(0, |r| r.len().saturating_add(1)))
+            .saturating_add(1);
+        validate_local_text_len(next_len, "plugin lock", p)?;
+        body.push_str(&d.repo);
+        if let Some(reference) = reference {
+            body.push('@');
+            body.push_str(reference);
+        }
         body.push('\n');
+        if resolved.is_none() {
+            unresolved += 1;
+        } else if let (Some(pin), Some(hit)) = (d.reference.as_deref(), hit) {
+            // At most one borrowed check per accepted line, with no diagnostic text yet.
+            pin_checks.push((d, pin, hit));
+        }
     }
+
+    ensure_parent(p)?;
     if write_lock_contents(p, &body)? {
         println!("wrote lock -> {}", p.display());
     } else {
@@ -3399,11 +3454,23 @@ fn write_lock_at(p: &Path, desired: &[Spec], installed: &[Installed]) -> io::Res
             desired.len()
         );
     }
-    if !drifted.is_empty() {
-        println!("WARNING: the lock disagrees with the bundle's pins:");
-        for d in &drifted {
-            println!("  ! {}", d);
+    // Report drift only for an accepted lock, in bundle order, without collecting warnings.
+    let mut warned = false;
+    for (d, pin, hit) in pin_checks {
+        if let PinState::Drifted { have } = pin_state(d, hit) {
+            if !warned {
+                println!("WARNING: the lock disagrees with the bundle's pins:");
+                warned = true;
+            }
+            println!(
+                "  ! {} pins {} but {} is installed",
+                d.repo,
+                short(pin),
+                short(&have)
+            );
         }
+    }
+    if warned {
         println!("  run `herdr-lazy sync` to restore the pinned commits.");
     }
     Ok(())
@@ -3420,18 +3487,23 @@ pub(crate) fn add_to_list(spec: &str) -> io::Result<String> {
             format!("`{}` is not an owner/repo entry", spec),
         ));
     }
+    migrate_legacy_bundle()?;
     let p = bundle_path();
     if read_lines(&p).iter().any(|l| l.as_str() == spec) {
         return Ok(format!("{} is already in your list", spec));
     }
     ensure_parent(&p)?;
-    let mut existing = fs::read_to_string(&p).unwrap_or_default();
+    let mut existing = match read_local_text(&p, "plugin list") {
+        Ok(body) => body,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
     if !existing.is_empty() && !existing.ends_with('\n') {
         existing.push('\n');
     }
     existing.push_str(spec);
     existing.push('\n');
-    fs::write(&p, existing)?;
+    write_local_text(&p, &existing, "plugin list")?;
     Ok(format!("added {} to your list", spec))
 }
 
@@ -3446,8 +3518,13 @@ pub(crate) struct ListMergeResult {
 /// A profile never calls this as part of discovery or sync. Existing global entries are kept
 /// unless the caller deliberately chooses merge; when the same repository has a different pin,
 /// the profile's pin becomes the global one and is reported as an update.
-pub(crate) fn merge_specs_into_list(path: &Path, specs: &[Spec]) -> io::Result<ListMergeResult> {
-    let existing = match fs::read_to_string(path) {
+pub(crate) fn merge_specs_into_global_list(specs: &[Spec]) -> io::Result<ListMergeResult> {
+    migrate_legacy_bundle()?;
+    merge_specs_into_list(&bundle_path(), specs)
+}
+
+fn merge_specs_into_list(path: &Path, specs: &[Spec]) -> io::Result<ListMergeResult> {
+    let existing = match read_local_text(path, "plugin list") {
         Ok(body) => body,
         Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(error),
@@ -3479,6 +3556,7 @@ pub(crate) fn merge_specs_into_list(path: &Path, specs: &[Spec]) -> io::Result<L
     ensure_parent(path)?;
     let mut body = lines.join("\n");
     body.push('\n');
+    validate_local_text_size(body.as_bytes(), "plugin list", path)?;
     write_bytes_atomically(path, body.as_bytes())?;
     Ok(result)
 }
@@ -3503,6 +3581,7 @@ fn fresh_plugins(e: &extras::Extra, existing: &[String]) -> Vec<String> {
 /// applied again is a no-op rather than a second copy of its entries. The header is only
 /// written when there is something to write under it, so a repeat leaves no orphan comment.
 pub(crate) fn add_extra_to_list(e: &extras::Extra) -> io::Result<Vec<String>> {
+    migrate_legacy_bundle()?;
     add_extra_at(&bundle_path(), e)
 }
 
@@ -3514,7 +3593,11 @@ fn add_extra_at(p: &Path, e: &extras::Extra) -> io::Result<Vec<String>> {
         return Ok(fresh);
     }
     ensure_parent(p)?;
-    let mut body = fs::read_to_string(p).unwrap_or_default();
+    let mut body = match read_local_text(p, "plugin list") {
+        Ok(body) => body,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
     // A blank line separates the block from what is above it — but only when there is
     // something above it, so a list created by this does not start with an empty line.
     if !body.is_empty() {
@@ -3529,7 +3612,7 @@ fn add_extra_at(p: &Path, e: &extras::Extra) -> io::Result<Vec<String>> {
         body.push_str(pl);
         body.push('\n');
     }
-    fs::write(p, body)?;
+    write_local_text(p, &body, "plugin list")?;
     Ok(fresh)
 }
 
@@ -3630,6 +3713,7 @@ fn classify_build(toml: &str) -> BuildCheck {
 /// One comment above the block rather than one per line: the provenance is a fact about the
 /// act of taking them, not about each plugin, and a list is meant to stay readable.
 pub(crate) fn add_adopted_to_list(spec: &str, entries: &[String]) -> io::Result<Vec<String>> {
+    migrate_legacy_bundle()?;
     let p = bundle_path();
     let listed: Vec<String> = read_lines(&p).iter().map(|l| Spec::parse(l).repo).collect();
     let fresh: Vec<String> = entries
@@ -3641,7 +3725,11 @@ pub(crate) fn add_adopted_to_list(spec: &str, entries: &[String]) -> io::Result<
         return Ok(fresh);
     }
     ensure_parent(&p)?;
-    let mut body = fs::read_to_string(&p).unwrap_or_default();
+    let mut body = match read_local_text(&p, "plugin list") {
+        Ok(body) => body,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
     if !body.is_empty() {
         if !body.ends_with('\n') {
             body.push('\n');
@@ -3653,15 +3741,20 @@ pub(crate) fn add_adopted_to_list(spec: &str, entries: &[String]) -> io::Result<
         body.push_str(e);
         body.push('\n');
     }
-    fs::write(&p, body)?;
+    write_local_text(&p, &body, "plugin list")?;
     Ok(fresh)
 }
 
 /// Drop an entry from the list. Does NOT uninstall — that is `sync --prune`.
 pub(crate) fn remove_from_list(spec: &str) -> io::Result<String> {
+    migrate_legacy_bundle()?;
     let p = bundle_path();
-    let Ok(content) = fs::read_to_string(&p) else {
-        return Ok(format!("no plugin list at {}", p.display()));
+    let content = match read_local_text(&p, "plugin list") {
+        Ok(body) => body,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(format!("no plugin list at {}", p.display()))
+        }
+        Err(error) => return Err(error),
     };
     let mut kept = String::new();
     let mut removed = false;
@@ -3676,7 +3769,7 @@ pub(crate) fn remove_from_list(spec: &str) -> io::Result<String> {
     if !removed {
         return Ok(format!("{} is not in your list", spec));
     }
-    fs::write(&p, kept)?;
+    write_local_text(&p, &kept, "plugin list")?;
     Ok(format!(
         "dropped {} from your list (still installed; `sync --prune` uninstalls it)",
         spec
@@ -3797,14 +3890,15 @@ fn main() {
                 Ok(())
             }
         },
-        "lock" => {
-            let specs: Vec<Spec> = desired_plugins().iter().map(|l| Spec::parse(l)).collect();
-            let installed = installed_plugins().unwrap_or_else(|e| {
-                eprintln!("warning: {} — locking without resolved commits", e);
-                Vec::new()
-            });
-            write_lock(&specs, &installed)
-        }
+        "lock" => match desired_plugins_result() {
+            Ok(desired) => {
+                let specs: Vec<Spec> = desired.iter().map(|l| Spec::parse(l)).collect();
+                installed_plugins()
+                    .map_err(io::Error::other)
+                    .and_then(|installed| write_lock(&specs, &installed))
+            }
+            Err(error) => Err(error),
+        },
         _ => {
             print_help();
             Ok(())
@@ -4329,6 +4423,19 @@ command = "something.else"
         assert!(bound_keys("onboarding = false\n[ui]\nx = 1\n").is_empty());
     }
 
+    #[test]
+    fn only_a_missing_bind_config_is_treated_as_empty() {
+        let config = scratch_lock("bind-config-read").with_file_name("config.toml");
+        assert_eq!(read_bind_config(&config).unwrap(), "");
+
+        fs::write(&config, vec![b'x'; MAX_LOCAL_INPUT_BYTES as usize + 1]).unwrap();
+        let before = fs::read(&config).unwrap();
+        let error = read_bind_config(&config).unwrap_err();
+        assert!(error.contains("exceeds 65536 bytes"));
+        assert_eq!(fs::read(&config).unwrap(), before);
+        clean_scratch_lock(&config);
+    }
+
     /// The config path comes from the socket herdr itself told us about, so a user with
     /// XDG_CONFIG_HOME pointed elsewhere does not get a second config file herdr never reads.
     #[test]
@@ -4462,6 +4569,329 @@ command = "something.else"
     }
 
     #[test]
+    fn hardlinked_history_rejects_noop_and_restore_without_touching_the_family() {
+        let lock = scratch_lock("hardlinked-history");
+        let history = lock_history_beside(&lock, 1);
+        let external = lock.with_file_name("external");
+        fs::write(&lock, "owner/current\n").unwrap();
+        fs::write(&external, "owner/old\n").unwrap();
+        fs::hard_link(&external, &history).unwrap();
+
+        let error = write_lock_contents(&lock, "owner/current\n").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let error = lock_specs_from(&lock, true).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&lock).unwrap(), b"owner/current\n");
+        assert_eq!(fs::read(&history).unwrap(), b"owner/old\n");
+        assert_eq!(fs::read(&external).unwrap(), b"owner/old\n");
+        clean_scratch_lock(&lock);
+    }
+
+    #[test]
+    fn oversized_lock_write_preserves_active_and_history() {
+        let lock = scratch_lock("oversized-write");
+        let history = lock_history_beside(&lock, 1);
+        fs::write(&lock, "known-good\n").unwrap();
+        fs::write(&history, "older-good\n").unwrap();
+        let oversized = "x".repeat(MAX_LOCAL_INPUT_BYTES as usize + 1);
+
+        let error = write_lock_contents(&lock, &oversized).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read_to_string(&lock).unwrap(), "known-good\n");
+        assert_eq!(fs::read_to_string(&history).unwrap(), "older-good\n");
+        clean_scratch_lock(&lock);
+    }
+
+    #[test]
+    fn oversized_existing_lock_preserves_every_history_slot() {
+        let lock = scratch_lock("oversized-existing-lock");
+        let oversized = vec![b'x'; MAX_LOCAL_INPUT_BYTES as usize + 1];
+        fs::write(&lock, &oversized).unwrap();
+        for generation in 1..=MAX_PREVIOUS_LOCKFILES {
+            fs::write(
+                lock_history_beside(&lock, generation),
+                format!("history-{generation}\n"),
+            )
+            .unwrap();
+        }
+
+        let error = write_lock_contents(&lock, "replacement\n").unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&lock).unwrap(), oversized);
+        for generation in 1..=MAX_PREVIOUS_LOCKFILES {
+            assert_eq!(
+                fs::read_to_string(lock_history_beside(&lock, generation)).unwrap(),
+                format!("history-{generation}\n")
+            );
+        }
+        clean_scratch_lock(&lock);
+    }
+
+    #[test]
+    fn oversized_saved_snapshot_aborts_before_rotating_any_slot() {
+        let lock = scratch_lock("oversized-saved-snapshot");
+        fs::write(&lock, "active\n").unwrap();
+        let snapshots = [
+            b"history-1\n".to_vec(),
+            vec![b'x'; MAX_LOCAL_INPUT_BYTES as usize + 1],
+            b"history-3\n".to_vec(),
+        ];
+        for (index, snapshot) in snapshots.iter().enumerate() {
+            fs::write(lock_history_beside(&lock, index + 1), snapshot).unwrap();
+        }
+
+        let error = write_lock_contents(&lock, "replacement\n").unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read_to_string(&lock).unwrap(), "active\n");
+        for (index, snapshot) in snapshots.iter().enumerate() {
+            assert_eq!(
+                fs::read(lock_history_beside(&lock, index + 1)).unwrap(),
+                *snapshot
+            );
+        }
+        clean_scratch_lock(&lock);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_history_slot_aborts_before_rotating_any_slot() {
+        use std::os::unix::fs::symlink;
+
+        let lock = scratch_lock("symlinked-history");
+        let first = lock_history_beside(&lock, 1);
+        let alias = lock_history_beside(&lock, 2);
+        let last = lock_history_beside(&lock, 3);
+        fs::write(&lock, "active\n").unwrap();
+        fs::write(&first, "history-1\n").unwrap();
+        symlink(lock.file_name().unwrap(), &alias).unwrap();
+        fs::write(&last, "history-3\n").unwrap();
+
+        let error = write_lock_contents(&lock, "replacement\n").unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read_link(&alias).unwrap(), Path::new("plugins.lock"));
+        assert_eq!(fs::read_to_string(&lock).unwrap(), "active\n");
+        assert_eq!(fs::read_to_string(&first).unwrap(), "history-1\n");
+        assert_eq!(fs::read_to_string(&last).unwrap(), "history-3\n");
+        clean_scratch_lock(&lock);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_lock_link_to_history_aborts_before_rotating_any_slot() {
+        use std::os::unix::fs::symlink;
+
+        let lock = scratch_lock("active-lock-links-to-history");
+        let first = lock_history_beside(&lock, 1);
+        let second = lock_history_beside(&lock, 2);
+        fs::write(&first, "active\n").unwrap();
+        fs::write(&second, "history-2\n").unwrap();
+        symlink(first.file_name().unwrap(), &lock).unwrap();
+
+        let error = write_lock_contents(&lock, "replacement\n").unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read_link(&lock).unwrap(), Path::new("plugins.lock.1"));
+        assert_eq!(fs::read_to_string(&first).unwrap(), "active\n");
+        assert_eq!(fs::read_to_string(&second).unwrap(), "history-2\n");
+        clean_scratch_lock(&lock);
+    }
+
+    #[test]
+    fn adopted_init_proposal_deduplicates_extras_before_its_only_write() {
+        let extra = extras::Extra {
+            id: "fixture".to_string(),
+            category: "test".to_string(),
+            description: "fixture extra".to_string(),
+            plugins: vec!["owner/pinned".to_string(), "owner/new".to_string()],
+            source: extras::Source::Bundled,
+        };
+        let proposal = append_extras_to_body("# adopted\nowner/pinned@v1\n".to_string(), &[extra]);
+
+        assert_eq!(
+            proposal,
+            "# adopted\nowner/pinned@v1\n\n# extra: fixture — fixture extra\nowner/new\n"
+        );
+    }
+
+    #[test]
+    fn oversized_legacy_list_is_an_error_not_an_empty_migration() {
+        let current = scratch_lock("oversized-legacy").with_file_name("current.list");
+        let legacy = current.with_file_name("legacy.list");
+        let oversized = vec![b'x'; MAX_LOCAL_INPUT_BYTES as usize + 1];
+        fs::write(&legacy, &oversized).unwrap();
+
+        let error = migrate_legacy_bundle_at(&current, &legacy).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!current.exists());
+        assert_eq!(fs::read(&legacy).unwrap(), oversized);
+        clean_scratch_lock(&current);
+    }
+
+    #[test]
+    fn bounded_list_writer_refuses_to_create_an_unreadable_result() {
+        let list = scratch_lock("oversized-list-write").with_file_name("plugins.list");
+        fs::write(&list, "known-good\n").unwrap();
+        let oversized = "x".repeat(MAX_LOCAL_INPUT_BYTES as usize + 1);
+
+        let error = write_local_text(&list, &oversized, "plugin list").unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read_to_string(&list).unwrap(), "known-good\n");
+        clean_scratch_lock(&list);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_direct_list_write_keeps_existing_symlink_and_inode() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+
+        let list = scratch_lock("symlink-write").with_file_name("plugins.list");
+        let target = list.with_file_name("dotfiles.list");
+        fs::write(&target, "old\n").unwrap();
+        let original = fs::metadata(&target).unwrap().ino();
+        symlink("dotfiles.list", &list).unwrap();
+
+        write_local_text(&list, "new\n", "plugin list").unwrap();
+
+        assert!(fs::symlink_metadata(&list)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_link(&list).unwrap(), Path::new("dotfiles.list"));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new\n");
+        assert_eq!(fs::metadata(&target).unwrap().ino(), original);
+        clean_scratch_lock(&list);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_atomic_writer_replaces_the_leaf_not_the_symlink_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let path = scratch_lock("atomic-modes");
+        let target = path.with_file_name("target");
+        fs::write(&target, "old\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o400)).unwrap();
+        symlink("target", &path).unwrap();
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+        write_bytes_atomically(&path, b"private\n").unwrap();
+        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_file());
+        assert_eq!(mode(&path), 0o400);
+        assert_eq!(fs::read(&path).unwrap(), b"private\n");
+        assert_eq!(fs::read(&target).unwrap(), b"old\n");
+        clean_scratch_lock(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_direct_write_preserves_symlink_and_target() {
+        use std::os::unix::fs::symlink;
+
+        let list = scratch_lock("symlink-write-error").with_file_name("plugins.list");
+        let target = list.with_file_name("dotfiles-dir");
+        fs::create_dir(&target).unwrap();
+        symlink("dotfiles-dir", &list).unwrap();
+
+        assert!(write_local_text(&list, "new\n", "plugin list").is_err());
+
+        assert!(fs::symlink_metadata(&list)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_link(&list).unwrap(), Path::new("dotfiles-dir"));
+        assert!(target.is_dir());
+        let entries: Vec<_> = fs::read_dir(list.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries.len(),
+            2,
+            "failed direct write must not create another entry"
+        );
+        clean_scratch_lock(&list);
+    }
+
+    #[test]
+    fn rejected_bind_preserves_config_and_existing_backup() {
+        let config = scratch_lock("bind-preflight").with_file_name("config.toml");
+        let backup = config.with_extension("toml.herdr-lazy-backup");
+        let existing = "x".repeat(MAX_LOCAL_INPUT_BYTES as usize);
+        fs::write(&config, &existing).unwrap();
+        fs::write(&backup, "prior-backup\n").unwrap();
+
+        let error = bind_action_at(
+            &config,
+            "example.plugin",
+            &BindTarget::Action("run".to_string()),
+            "prefix+x",
+        )
+        .unwrap_err();
+
+        assert!(error.contains("exceeds 65536 bytes"));
+        assert_eq!(fs::read_to_string(&config).unwrap(), existing);
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "prior-backup\n");
+        clean_scratch_lock(&config);
+    }
+
+    #[test]
+    fn local_text_reader_rejects_nonregular_handles() {
+        let directory = scratch_lock("nonregular-read")
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let error = read_local_text(&directory, "plugin list").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("not a regular file"));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_text_reader_preserves_locked_file_open_error() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let path = scratch_lock("shared-locked-read");
+        fs::write(&path, "owner/repo@main\n").unwrap();
+        let blocker = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+
+        let plain_error = fs::File::open(&path).unwrap_err();
+        let reader_error = read_local_text(&path, "plugin list").unwrap_err();
+        assert_eq!(reader_error.raw_os_error(), plain_error.raw_os_error());
+
+        drop(blocker);
+        clean_scratch_lock(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_text_reader_opens_fifo_without_blocking_then_rejects_it() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::time::{Duration, Instant};
+
+        let fifo = scratch_lock("fifo-read").with_file_name("plugins.list.fifo");
+        let path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let start = Instant::now();
+        let error = read_local_text(&fifo, "plugin list").unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("not a regular file"));
+        clean_scratch_lock(&fifo);
+    }
+
+    #[test]
     fn previous_lock_specs_are_read_without_touching_the_active_lock() {
         let lock = scratch_lock("read-previous");
         fs::write(&lock, "owner/current@1111111\n").unwrap();
@@ -4472,11 +4902,11 @@ command = "something.else"
         .unwrap();
 
         assert_eq!(
-            lock_specs_from(&lock_history_beside(&lock, 1)).unwrap(),
+            lock_specs_from(&lock, true).unwrap(),
             vec![Spec::parse("owner/old@2222222")]
         );
         assert_eq!(
-            lock_specs_from(&lock).unwrap(),
+            lock_specs_from(&lock, false).unwrap(),
             vec![Spec::parse("owner/current@1111111")]
         );
         clean_scratch_lock(&lock);
@@ -4494,13 +4924,7 @@ command = "something.else"
         )
         .unwrap();
 
-        restore_from_lock(
-            &previous,
-            &[],
-            true,
-            Some(vec![from_github("owner", "repo")]),
-        )
-        .unwrap();
+        restore_from_lock(&lock, &[], true, Some(vec![from_github("owner", "repo")])).unwrap();
 
         assert_eq!(fs::read_to_string(&lock).unwrap(), active_body);
         clean_scratch_lock(&lock);
@@ -4509,7 +4933,7 @@ command = "something.else"
     #[test]
     fn a_missing_lockfile_returns_not_found() {
         let lock = scratch_lock("missing");
-        let error = lock_specs_from(&lock).unwrap_err();
+        let error = lock_specs_from(&lock, false).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         clean_scratch_lock(&lock);
     }

@@ -324,6 +324,17 @@ impl MachineAction {
     }
 }
 
+fn machine_action_notification(
+    action: MachineAction,
+    target: &str,
+    outcome: Result<(), String>,
+) -> String {
+    match outcome {
+        Ok(()) => format!("{} started on {}", action.label(), target),
+        Err(error) => format!("{} on {}: {}", action.label(), target, error),
+    }
+}
+
 struct MachineEntry {
     health: crate::machine::MachineHealth,
     rows: Vec<Row>,
@@ -1247,22 +1258,27 @@ impl App {
                 Ok(profile) => (profile, None),
                 Err(error) => (None, Some(error)),
             };
-        let desired: Vec<Spec> = crate::desired_plugins()
-            .iter()
-            .map(|l| Spec::parse(l))
-            .collect();
+        let desired = crate::desired_plugins_result().map_err(|error| error.to_string());
         // The compatibility check is local, but the version comes from herdr itself. Read it
         // once for the whole refresh rather than once per installed plugin.
         let herdr_version = current_herdr_version();
         // Cached only: `false` never fetches. If nothing is cached the update column is
         // simply absent, which is better than making every pane open hit the network.
         let market = crate::registry::cached_entries();
-        match installed_plugins() {
-            Ok(installed) => App {
+        match desired.and_then(|lines| installed_plugins().map(|installed| (lines, installed))) {
+            Ok((lines, installed)) => App {
                 theme,
                 palette: None,
                 theme_picker: None,
-                rows: rows_with_herdr_version(&desired, &installed, &market, herdr_version),
+                rows: rows_with_herdr_version(
+                    &lines
+                        .iter()
+                        .map(|line| Spec::parse(line))
+                        .collect::<Vec<_>>(),
+                    &installed,
+                    &market,
+                    herdr_version,
+                ),
                 workspace_context: workspace_context.clone(),
                 workspace_profile: workspace_profile.clone(),
                 profile_error: profile_error.clone(),
@@ -1362,10 +1378,14 @@ impl App {
                 return;
             }
         };
-        let desired: Vec<Spec> = crate::desired_plugins()
-            .iter()
-            .map(|line| Spec::parse(line))
-            .collect();
+        let lines = match crate::desired_plugins_result() {
+            Ok(lines) => lines,
+            Err(error) => {
+                self.flash = Some(format!("Cannot read plugin list · {error}"));
+                return;
+            }
+        };
+        let desired: Vec<Spec> = lines.iter().map(|line| Spec::parse(line)).collect();
         let market = crate::registry::cached_entries();
         let collection =
             crate::machine::collect_machine_health(&installed, current_herdr_version());
@@ -1496,9 +1516,10 @@ impl App {
         // Re-read after returning to the pane. Herdr action invocation is asynchronous, so this
         // may still show `running`; the log result remains visible and can be refreshed with r.
         self.open_machine_view();
-        self.flash = Some(match outcome {
-            Ok(()) => format!("{} started on {}", action.label(), target),
-            Err(error) => format!("{} failed on {}: {}", action.label(), target, error),
+        let notification = machine_action_notification(action, &target, outcome);
+        self.flash = Some(match self.flash.take() {
+            Some(error) => format!("{notification}; {error}"),
+            None => notification,
         });
         Ok(())
     }
@@ -1667,7 +1688,7 @@ impl App {
 
         match action {
             ProfileAction::Merge => {
-                let result = crate::merge_specs_into_list(&crate::bundle_path(), &profile.specs);
+                let result = crate::merge_specs_into_global_list(&profile.specs);
                 self.profile_open = false;
                 self.refresh();
                 self.flash = Some(match result {
@@ -2246,7 +2267,10 @@ impl App {
     fn open_browser(&mut self, force_refresh: bool) {
         self.flash = None;
         if self.browser.is_none() {
-            let listed = crate::desired_plugins()
+            let Some(lines) = self.read_list_for_picker() else {
+                return;
+            };
+            let listed = lines
                 .iter()
                 .map(|line| crate::Spec::parse(line).repo)
                 .collect();
@@ -2431,10 +2455,10 @@ impl App {
 
     /// `e` — open the extras picker.
     fn open_extras(&mut self) {
-        let listed: Vec<String> = crate::desired_plugins()
-            .iter()
-            .map(|l| crate::Spec::parse(l).repo)
-            .collect();
+        let Some(lines) = self.read_list_for_picker() else {
+            return;
+        };
+        let listed: Vec<String> = lines.iter().map(|l| crate::Spec::parse(l).repo).collect();
         match ExtrasPicker::new(&listed) {
             Some(p) => {
                 self.extras = Some(p);
@@ -2458,12 +2482,16 @@ impl App {
             return;
         };
         // Opening a presentation-only recommendation view must not trigger the legacy-list
-        // migration performed by `desired_plugins`.
-        let listed: Vec<String> = crate::read_bundle_specs()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|spec| spec.repo)
-            .collect();
+        // migration performed by `desired_plugins_result`.
+        let specs = match crate::read_bundle_specs() {
+            Ok(specs) => specs,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => {
+                self.flash = Some(format!("Cannot read plugin list · {error}"));
+                return;
+            }
+        };
+        let listed: Vec<String> = specs.into_iter().map(|spec| spec.repo).collect();
         match RecommendationsPicker::new(&agent, &listed) {
             Some(picker) => {
                 self.recommendations = Some(picker);
@@ -2567,13 +2595,23 @@ impl App {
 
     /// Enter, at the prompt — fetch the list and show what it holds.
     fn load_adopt(&mut self) {
-        let listed: Vec<String> = crate::desired_plugins()
-            .iter()
-            .map(|l| crate::Spec::parse(l).repo)
-            .collect();
+        let Some(lines) = self.read_list_for_picker() else {
+            return;
+        };
+        let listed: Vec<String> = lines.iter().map(|l| crate::Spec::parse(l).repo).collect();
         let installed: Vec<String> = self.rows.iter().filter_map(|r| r.slug.clone()).collect();
         if let Some(a) = self.adopt.as_mut() {
             a.load(&listed, &installed);
+        }
+    }
+
+    fn read_list_for_picker(&mut self) -> Option<Vec<String>> {
+        match crate::desired_plugins_result() {
+            Ok(lines) => Some(lines),
+            Err(error) => {
+                self.flash = Some(format!("Cannot read plugin list · {error}"));
+                None
+            }
         }
     }
 
@@ -2654,7 +2692,10 @@ impl App {
             ManageCommand::Starter => self.flash = Some(crate::open_starter_pane()),
             ManageCommand::Refresh => {
                 self.refresh();
-                self.flash = Some("re-read your list and what is installed".to_string());
+                self.flash = self
+                    .error
+                    .is_none()
+                    .then(|| "re-read your list and what is installed".to_string());
             }
             ManageCommand::Help => self.help = Some(0),
         }
@@ -3249,7 +3290,10 @@ impl App {
         }
 
         let footer = match &self.flash {
-            Some(msg) => format!("{accent}{}\x1b[0m", msg),
+            Some(msg) => format!(
+                "{accent}{}\x1b[0m",
+                terminal_text::clip(msg, usize::from(width.saturating_sub(2))).0
+            ),
             None if a.asking() => {
                 "\x1b[1m[enter]\x1b[0m read it  \x1b[1m[esc]\x1b[0m back".to_string()
             }
@@ -6468,5 +6512,47 @@ mod tests {
             .flash
             .as_deref()
             .is_some_and(|message| message.contains("update action is unavailable")));
+    }
+
+    #[test]
+    fn machine_action_notifications_keep_unknown_and_explicit_failure_distinct() {
+        let cases = [
+            (
+                "machine action acknowledgement timed out; action state is unknown: fixture",
+                "sync on Build machine (dev@example.com): machine action acknowledgement timed out; action state is unknown: fixture",
+                "sync failed on",
+            ),
+            (
+                "machine action failed: fixture exited 42",
+                "sync on Build machine (dev@example.com): machine action failed: fixture exited 42",
+                "acknowledgement timed out",
+            ),
+        ];
+
+        for (error, expected, absent) in cases {
+            let view = machine_view_for_test(crate::machine::MachineConnection::Connected, true);
+            let app = App {
+                machine_view: Some(view),
+                flash: Some(machine_action_notification(
+                    MachineAction::Sync,
+                    "Build machine (dev@example.com)",
+                    Err(error.to_string()),
+                )),
+                ..Default::default()
+            };
+            let mut buffer = Vec::new();
+
+            app.draw_machines(&mut buffer, 180, 24).unwrap();
+
+            let visible = String::from_utf8(buffer).unwrap();
+            assert!(
+                visible.contains(expected),
+                "unexpected notification: {visible}"
+            );
+            assert!(
+                !visible.contains(absent),
+                "unexpected notification: {visible}"
+            );
+        }
     }
 }

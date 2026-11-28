@@ -91,9 +91,12 @@ pub(crate) fn local() -> (Vec<Extra>, Vec<String>) {
         let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        let Ok(body) = std::fs::read_to_string(&path) else {
-            bad.push(format!("{}: could not be read", path.display()));
-            continue;
+        let body = match crate::read_local_text(&path, "local extra") {
+            Ok(body) => body,
+            Err(error) => {
+                bad.push(error.to_string());
+                continue;
+            }
         };
         let e = parse(id, &body, Source::Local);
         if e.plugins.is_empty() {
