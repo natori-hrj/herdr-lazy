@@ -1,0 +1,84 @@
+name: Pinned integration CI
+
+on:
+  push:
+    branches: [validation/v047-pinned-ci]
+
+permissions:
+  contents: read
+
+env:
+  CANDIDATE: ae5b0fe6c28579e5e44179b3105002856914cc7d
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ env.CANDIDATE }}
+          persist-credentials: false
+      - shell: bash
+        run: test "$(git rev-parse HEAD | tee /dev/stderr)" = "$CANDIDATE"
+      - run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup target add ${{ matrix.target }}
+      - if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo fmt --check
+      - run: cargo check --locked --all-targets --target ${{ matrix.target }}
+      - run: cargo clippy --locked --all-targets --target ${{ matrix.target }} -- -D warnings
+      - if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          expected=$(sh scripts/build-fingerprint.sh)
+          actual=$(powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-fingerprint.ps1 | tr -d '\r')
+          test "$expected" = "$actual"
+      - run: cargo test --locked --target ${{ matrix.target }}
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ env.CANDIDATE }}
+          persist-credentials: false
+      - shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD | tee /dev/stderr)" = "$CANDIDATE"
+          msrv=$(sed -n 's/^rust-version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -1)
+          rustup toolchain install "$msrv" --profile minimal
+          rustup target add x86_64-unknown-linux-musl --toolchain "$msrv"
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          cargo "+$msrv" test --locked --target x86_64-unknown-linux-musl
+
+  rustsec:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ env.CANDIDATE }}
+          persist-credentials: false
+      - shell: bash
+        run: test "$(git rev-parse HEAD | tee /dev/stderr)" = "$CANDIDATE"
+      - working-directory: ${{ runner.temp }}
+        run: |
+          rustup toolchain install stable --profile minimal
+          cargo +stable install cargo-audit --locked --version 0.22.2 --no-default-features
+      - working-directory: ${{ runner.temp }}
+        env:
+          LOCKFILE: ${{ github.workspace }}/Cargo.lock
+        run: |
+          test -f "$LOCKFILE"
+          cargo +stable audit --file "$LOCKFILE"
