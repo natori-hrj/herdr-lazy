@@ -20,8 +20,9 @@ to identify your installed build.
 
 ## Generated locks and history
 
-Cooperating readers and writers share a guard, and updates validate the active
-lock and its history before publishing. Unsupported aliases are rejected.
+Cooperating readers and writers share a guard. Updates check the file type,
+identity and bounded readability of the active lock and its history. They
+reject unsupported aliases; rotation does not validate historical lock contents.
 Publication replaces individual files and attempts to roll back changes on
 failure; the lock family is not a crash-atomic transaction.
 

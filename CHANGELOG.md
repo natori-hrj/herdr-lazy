@@ -4,9 +4,9 @@
 
 ### Changed
 
-- Bound captured Herdr CLI output and give requests a deadline. After both streams close, check for the directly launched child's exit with adaptive backoff. On timeout or capture failure, cancel the request and attempt to reap that child.
+- Bound captured Herdr CLI output and set response deadlines. After both streams close, check for the directly launched child's exit with adaptive backoff. On timeout or capture failure, stop local capture and attempt to terminate and reap that child.
 - Bound reads of local plugin lists, locks, workspace profiles, and relevant configuration. Report unreadable or oversized inputs instead of treating them as an empty list in Manage.
-- Validate generated locks and their history before writing. Coordinate readers and writers, reject unsupported file or permission states, and preserve verified permission policies during publication.
+- Check generated locks and their history for supported file types, identities, sizes and permission policies before publishing. Coordinate cooperating readers and writers and preserve supported permissions.
 
 See [#146](https://github.com/natori-hrj/herdr-lazy/pull/146) and the [v0.47.0 release notes](docs/release-v0.47.0.md) for limits, platform boundaries, and the measured first-frame cost. Requires Herdr 0.9.0 or later.
 
