@@ -9,7 +9,20 @@
 //! build script. The list is the place where intent is recorded, so that is where a discovery
 //! lands.
 
-use crate::registry::Entry;
+use std::collections::HashSet;
+
+use crate::{
+    registry::{search_terms, Entry},
+    Installed, Match, Spec,
+};
+
+#[derive(Default)]
+enum InstallFilter {
+    #[default]
+    Any,
+    Installed,
+    NotInstalled,
+}
 
 /// State of the browser overlay.
 pub(crate) struct Browser {
@@ -24,10 +37,21 @@ pub(crate) struct Browser {
     /// The category filter, or `None` for everything. Cycled with tab; independent of the
     /// query, so "worktree plugins mentioning fzf" is two narrowings rather than one guess.
     pub(crate) category: Option<&'static str>,
+    installed: Option<HashSet<String>>,
+    install_filter: InstallFilter,
+    sort_by_name: bool,
+    // Keep the selection while an unavailable inventory hides the filtered results.
+    unavailable_selection: Option<String>,
 }
 
 impl Browser {
-    pub(crate) fn new(all: Vec<Entry>, source_note: String, listed: Vec<String>) -> Browser {
+    pub(crate) fn new(
+        all: Vec<Entry>,
+        source_note: String,
+        listed: Vec<String>,
+        installed: Option<&[Installed]>,
+    ) -> Browser {
+        let installed = installed.map(|snapshot| installed_entries(&all, snapshot));
         Browser {
             all,
             query: String::new(),
@@ -35,31 +59,81 @@ impl Browser {
             source_note,
             listed,
             category: None,
+            installed,
+            install_filter: InstallFilter::default(),
+            sort_by_name: false,
+            unavailable_selection: None,
         }
     }
 
-    pub(crate) fn replace_entries(&mut self, entries: Vec<Entry>, note: String) {
-        let selected = self.selected().map(|entry| entry.full_name.clone());
+    pub(crate) fn replace_entries(
+        &mut self,
+        entries: Vec<Entry>,
+        note: String,
+        installed: Option<&[Installed]>,
+    ) {
+        let selected = self
+            .selected()
+            .map(|entry| entry.full_name.clone())
+            .or_else(|| self.unavailable_selection.take());
+        self.installed = installed.map(|snapshot| installed_entries(&entries, snapshot));
         self.all = entries;
         self.source_note = note;
+        self.restore_selection(selected.as_deref());
+        self.unavailable_selection = selected.filter(|_| self.install_filter_unavailable());
+    }
+
+    fn restore_selection(&mut self, selected: Option<&str>) {
         self.cursor = selected
             .and_then(|name| {
                 self.results()
                     .iter()
-                    .position(|entry| entry.full_name == name)
+                    .position(|entry| entry.full_name.eq_ignore_ascii_case(name))
             })
             .unwrap_or(0);
     }
 
     pub(crate) fn results(&self) -> Vec<&Entry> {
-        self.all
+        let terms = search_terms(&self.query);
+        let is_eligible = |entry: &Entry| {
+            let install_matches = match self.install_filter {
+                InstallFilter::Any => true,
+                InstallFilter::Installed => self.is_installed(entry),
+                InstallFilter::NotInstalled => {
+                    self.installed.is_some() && !self.is_installed(entry)
+                }
+            };
+            install_matches
+                && self.category.map_or(true, |category| {
+                    crate::category::classify(entry) == category
+                })
+        };
+        let mut results: Vec<_> = self
+            .all
             .iter()
-            .filter(|e| e.matches(&self.query))
-            .filter(|e| match self.category {
-                Some(c) => crate::category::classify(e) == c,
-                None => true,
-            })
-            .collect()
+            .filter(|entry| entry.matches_terms(&terms) && is_eligible(entry))
+            .collect();
+        if results.is_empty() && terms.len() == 1 {
+            let term = self.query.trim();
+            if (3..=ABBREVIATION_LIMIT).contains(&term.len())
+                && term.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            {
+                results.extend(
+                    self.all
+                        .iter()
+                        .filter(|entry| repo_abbreviation(entry, term) && is_eligible(entry)),
+                );
+            }
+        }
+        if self.sort_by_name {
+            results.sort_by_cached_key(|&entry| {
+                (
+                    entry.full_name.to_ascii_lowercase(),
+                    entry.full_name.as_str(),
+                )
+            });
+        }
+        results
     }
 
     /// Tab — step through the categories, ending back at "everything".
@@ -89,7 +163,7 @@ impl Browser {
         } else {
             names.get(next - 1).copied()
         };
-        self.cursor = 0;
+        self.reset_selection();
     }
 
     /// What the header says is being shown.
@@ -97,12 +171,72 @@ impl Browser {
         self.category.unwrap_or("all")
     }
 
+    pub(crate) fn cycle_install_filter(&mut self) {
+        self.install_filter = match self.install_filter {
+            InstallFilter::Any => InstallFilter::Installed,
+            InstallFilter::Installed => InstallFilter::NotInstalled,
+            InstallFilter::NotInstalled => InstallFilter::Any,
+        };
+        self.reset_selection();
+    }
+
+    pub(crate) fn install_filter_label(&self) -> &'static str {
+        match self.install_filter {
+            InstallFilter::Any => "any",
+            InstallFilter::Installed => "installed",
+            InstallFilter::NotInstalled => "not installed",
+        }
+    }
+
+    pub(crate) fn install_filter_unavailable(&self) -> bool {
+        !matches!(self.install_filter, InstallFilter::Any) && self.inventory_unavailable()
+    }
+
+    pub(crate) fn inventory_unavailable(&self) -> bool {
+        self.installed.is_none()
+    }
+
+    pub(crate) fn toggle_sort(&mut self) {
+        let selected = self.selected().map(|entry| entry.full_name.clone());
+        self.sort_by_name = !self.sort_by_name;
+        self.restore_selection(selected.as_deref());
+    }
+
+    pub(crate) fn sort_label(&self) -> &'static str {
+        if self.sort_by_name {
+            "name"
+        } else {
+            "stars"
+        }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.query.clear();
+        self.category = None;
+        self.install_filter = InstallFilter::Any;
+        self.sort_by_name = false;
+        self.reset_selection();
+    }
+
+    fn reset_selection(&mut self) {
+        self.cursor = 0;
+        self.unavailable_selection = None;
+    }
+
     pub(crate) fn selected(&self) -> Option<&Entry> {
         self.results().get(self.cursor).copied()
     }
 
     pub(crate) fn is_listed(&self, e: &Entry) -> bool {
-        self.listed.iter().any(|l| l == &e.full_name)
+        self.listed
+            .iter()
+            .any(|l| l.eq_ignore_ascii_case(&e.full_name))
+    }
+
+    pub(crate) fn is_installed(&self, e: &Entry) -> bool {
+        self.installed
+            .as_ref()
+            .is_some_and(|names| names.contains(&e.full_name))
     }
 
     /// Keep the cursor inside the results as the query narrows them.
@@ -129,13 +263,72 @@ impl Browser {
     /// otherwise the cursor appears to jump to an unrelated row as characters are added.
     pub(crate) fn push(&mut self, c: char) {
         self.query.push(c);
-        self.cursor = 0;
+        self.reset_selection();
     }
 
     pub(crate) fn backspace(&mut self) {
         self.query.pop();
-        self.cursor = 0;
+        self.reset_selection();
     }
+}
+
+fn installed_entries(entries: &[Entry], snapshot: &[Installed]) -> HashSet<String> {
+    if snapshot.is_empty() {
+        return HashSet::new();
+    }
+    let slugs: HashSet<_> = snapshot
+        .iter()
+        .filter_map(|plugin| plugin.slug.as_ref())
+        .map(|slug| slug.to_ascii_lowercase())
+        .collect();
+    let legacy: Vec<_> = snapshot
+        .iter()
+        .filter(|plugin| plugin.slug.is_none())
+        .collect();
+    entries
+        .iter()
+        .filter(|entry| {
+            if slugs.contains(&entry.full_name.to_ascii_lowercase()) {
+                return true;
+            }
+            if legacy.is_empty() {
+                return false;
+            }
+            // Older records can still identify the repository through their source URL.
+            let spec = Spec::parse(&entry.full_name);
+            legacy
+                .iter()
+                .any(|plugin| plugin.matches(&spec) == Match::Strong)
+        })
+        .map(|entry| entry.full_name.clone())
+        .collect()
+}
+
+const ABBREVIATION_LIMIT: usize = 12;
+
+fn repo_abbreviation(entry: &Entry, term: &str) -> bool {
+    let Some((_, leaf)) = entry.full_name.rsplit_once('/') else {
+        return false;
+    };
+    let mut reached = [false; ABBREVIATION_LIMIT + 1];
+    reached[0] = true;
+    for token in leaf.split(['-', '_', '.']) {
+        // Walk backward so a path can consume only one prefix from each token.
+        for offset in (0..term.len()).rev() {
+            if reached[offset] {
+                let prefix_len = token
+                    .bytes()
+                    .zip(term.bytes().skip(offset))
+                    .take_while(|(actual, wanted)| actual.eq_ignore_ascii_case(wanted))
+                    .count();
+                reached[offset + 1..][..prefix_len].fill(true);
+            }
+        }
+        if reached[term.len()] {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -178,12 +371,128 @@ mod tests {
             ],
             "just refreshed".into(),
             vec!["c/herdr-remote".to_string()],
+            Some(&[]),
         )
     }
 
     #[test]
     fn an_empty_query_lists_everything() {
         assert_eq!(browser().results().len(), 3);
+    }
+
+    #[test]
+    fn whitespace_only_queries_keep_category_filtering_and_entry_order() {
+        let mut b = browser();
+        b.query = " \t\u{2003}".into();
+        assert!(b.results().into_iter().eq(b.all.iter()));
+
+        b.category = Some("worktree");
+        assert_eq!(b.results(), vec![&b.all[1]]);
+    }
+
+    #[test]
+    fn a_query_matches_unicode_terms_across_fields() {
+        let mut b = browser();
+        b.all[1].description = "fzf picker for worktrees: ΟΣ".into();
+        b.query = "  GIT-WORKTREE\u{2003}WORKTRUNK\tΟΣ  ".into();
+        assert_eq!(b.results(), vec![&b.all[1]]);
+
+        b.query.push_str(" Rust");
+        assert!(b.results().is_empty(), "language is excluded from search");
+    }
+
+    #[test]
+    fn repository_abbreviations_are_only_used_without_an_eligible_direct_hit() {
+        let mut b = Browser::new(
+            vec![
+                entry("wti/file-viewer", 100, "Plain viewer", &[]),
+                entry("worktree-task-inspector/plain", 95, "Plain plugin", &[]),
+                entry("a/file-viewer", 90, "Worktree Task Inspector", &[]),
+                entry("a/work-tree-inspector", 80, "Worktree utility", &[]),
+                entry("b/worktree-tools_icon", 70, "Worktree utility", &[]),
+                entry("c/notify", 10, "WTI notifications", &[]),
+            ],
+            String::new(),
+            Vec::new(),
+            Some(&[]),
+        );
+        b.query = "WTI".into();
+        assert_eq!(b.results(), vec![&b.all[0], &b.all[5]]);
+
+        b.cycle_category(true);
+        assert_eq!(b.results(), vec![&b.all[3], &b.all[4]]);
+        for query in [
+            "wt",
+            "w.t.i",
+            "wti utility",
+            "workspacetaski",
+            "wrei",
+            "日本語",
+        ] {
+            b.query = query.into();
+            assert!(b.results().is_empty(), "{query}");
+        }
+
+        b.category = None;
+        b.query = "wtin".into();
+        assert_eq!(b.results(), vec![&b.all[3]]);
+    }
+
+    #[test]
+    fn marketplace_abbreviation_requires_ascii_in_the_original_query() {
+        let mut b = browser();
+        b.all[0].full_name = "a/keymap-helper".into();
+        b.query = "  Khe\u{2003}".into();
+        assert_eq!(b.results(), vec![&b.all[0]]);
+
+        b.query = "  Khe\u{2003}".into();
+        assert!(
+            b.results().is_empty(),
+            "only ASCII can use abbreviation matching"
+        );
+
+        b.all[1].description = "khe integration".into();
+        assert_eq!(b.results(), vec![&b.all[1]]);
+    }
+
+    #[test]
+    fn install_filter_uses_repository_identity_independently_of_the_list() {
+        let installed = crate::parse_plugin_list(
+            r#"{"result":{"plugins":[
+                {"name":"different name","enabled":false,"source":{"url":"https://github.com/Z/tool.git"}},
+                {"name":"also-tool","source":{"kind":"local"}}
+            ]}}"#,
+        )
+        .unwrap();
+        let mut b = Browser::new(
+            vec![
+                entry("a/also-tool", 50, "worktree viewer", &[]),
+                entry("z/tool", 20, "worktree inspector", &[]),
+                entry("y/tool", 10, "notifications", &["worktree"]),
+            ],
+            "cached".into(),
+            vec!["a/also-tool".into()],
+            Some(&installed),
+        );
+        b.push('t');
+        b.cycle_category(true);
+        b.cycle_install_filter();
+        assert_eq!(b.results(), vec![&b.all[1]]);
+        assert!(!b.is_listed(b.selected().unwrap()));
+
+        b.cycle_install_filter();
+        assert_eq!(b.results(), vec![&b.all[0], &b.all[2]]);
+        assert!(b.is_listed(b.selected().unwrap()));
+
+        b.move_down();
+        b.toggle_sort();
+        b.reset();
+        assert_eq!(b.results(), b.all.iter().collect::<Vec<_>>());
+        assert_eq!(b.selected(), b.all.first());
+        assert!(b.query.is_empty());
+        assert_eq!(b.category_label(), "all");
+        assert_eq!(b.install_filter_label(), "any");
+        assert_eq!(b.sort_label(), "stars");
     }
 
     #[test]

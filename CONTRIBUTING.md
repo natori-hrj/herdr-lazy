@@ -27,8 +27,7 @@ change to the matcher or to `--prune` can delete work.
 - New behaviour comes with a test. Bug fixes come with a test that fails without the fix.
 - Comments explain *why*, not what. If a line looks redundant and is not, say why — the
   leading `./` in `herdr-plugin.toml` is the standing example.
-- No new dependencies without discussion. The project has exactly one (`crossterm`, because
-  std cannot set raw terminal mode) and each addition needs to clear the same bar.
+- Discuss new dependencies before adding them.
 
 Things that are held to a higher standard, because getting them wrong destroys user data:
 
@@ -112,6 +111,11 @@ From a clean `main`, run `scripts/release.sh <version> --dry-run` to preview the
 since the previous release tag. To release that batch, run `scripts/release.sh <version>`.
 The script checks the build, bumps the version, and pushes the version commit and tag
 together.
+
+When a release-preparation PR already stamps the version in `Cargo.toml`, `Cargo.lock`,
+and `herdr-plugin.toml`, `scripts/release.sh` rejects that version as already set.
+After the PR has merged and the release checks pass, the maintainer tags the verified
+`main` commit with the matching version.
 
 The tag starts the release workflow. After the audit and all five builds pass, the workflow
 uploads the archives and checksums to a draft, publishes it with GitHub-generated notes,

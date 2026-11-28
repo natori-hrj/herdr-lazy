@@ -19,6 +19,7 @@ use std::{
 };
 
 mod command_palette;
+mod list_columns;
 mod managed_list;
 mod marketplace;
 mod plugin_detail;
@@ -26,6 +27,7 @@ mod terminal_text;
 mod theme_picker;
 
 use command_palette::{ManageCommand, Palette, PaletteAction};
+use terminal_text::{clip, wrap_line, wrap_words};
 
 use crate::theme::{Color, Role, Theme};
 
@@ -587,35 +589,10 @@ fn native_log_response_is_empty(output: &str) -> bool {
 }
 
 fn wrap_log_lines(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut lines = Vec::new();
-    let mut truncated = false;
-    for line in text.lines() {
-        let chars: Vec<char> = line.chars().collect();
-        if chars.is_empty() {
-            if lines.len() >= MAX_LOG_DISPLAY_LINES {
-                truncated = true;
-                break;
-            }
-            lines.push(String::new());
-            continue;
-        }
-        for chunk in chars.chunks(width) {
-            if lines.len() >= MAX_LOG_DISPLAY_LINES {
-                truncated = true;
-                break;
-            }
-            lines.push(chunk.iter().collect());
-        }
-        if truncated {
-            break;
-        }
-    }
-    if truncated {
-        if lines.len() == MAX_LOG_DISPLAY_LINES {
-            lines.pop();
-        }
-        lines.push(LOG_TRUNCATION_MARKER.to_string());
+    let mut wrapped = text.lines().flat_map(|line| wrap_line(line, width));
+    let mut lines: Vec<_> = wrapped.by_ref().take(MAX_LOG_DISPLAY_LINES).collect();
+    if wrapped.next().is_some() {
+        lines[MAX_LOG_DISPLAY_LINES - 1] = LOG_TRUNCATION_MARKER.to_string();
     }
     lines
 }
@@ -1182,7 +1159,13 @@ impl AdoptPicker {
     }
 }
 
-type MarketplaceResult = Result<(Vec<crate::registry::Entry>, String), String>;
+struct MarketplaceUpdate {
+    entries: Vec<crate::registry::Entry>,
+    note: String,
+    installed: Option<Vec<Installed>>,
+}
+
+type MarketplaceResult = Result<MarketplaceUpdate, String>;
 
 /// `Default` so tests can build one from just the rows they care about; this struct grows a
 /// field per view, and every fixture should not have to know about all of them.
@@ -1209,6 +1192,7 @@ struct App {
     last_event: Option<crate::context::PluginEvent>,
     /// Present while the marketplace browser is open; the pane draws that instead of the list.
     browser: Option<crate::browse::Browser>,
+    marketplace_installed: Option<Vec<Installed>>,
     marketplace_refresh: Option<Receiver<MarketplaceResult>>,
     /// Present while the extras picker is open, for the same reason.
     extras: Option<ExtrasPicker>,
@@ -1298,6 +1282,7 @@ impl App {
                 context_warning: context_warning.clone(),
                 last_event: last_event.clone(),
                 browser: None,
+                marketplace_installed: Some(installed),
                 marketplace_refresh: None,
                 extras: None,
                 recommendations: None,
@@ -1329,6 +1314,7 @@ impl App {
                 context_warning,
                 last_event,
                 browser: None,
+                marketplace_installed: None,
                 marketplace_refresh: None,
                 extras: None,
                 recommendations: None,
@@ -2276,12 +2262,23 @@ impl App {
                 Some(cache) => (cache.entries, cache.note, cache.fresh),
                 None => (Vec::new(), String::new(), false),
             };
-            self.browser = Some(crate::browse::Browser::new(entries, note, listed));
+            self.browser = Some(crate::browse::Browser::new(
+                entries,
+                note,
+                listed,
+                self.marketplace_installed.as_deref(),
+            ));
             if fresh && !force_refresh {
                 return;
             }
         }
-        self.start_marketplace_refresh(move || crate::registry::load(force_refresh));
+        self.start_marketplace_refresh(move || {
+            crate::registry::load(force_refresh).map(|(entries, note)| MarketplaceUpdate {
+                entries,
+                note,
+                installed: installed_plugins().ok(),
+            })
+        });
     }
 
     fn start_marketplace_refresh(
@@ -2326,7 +2323,14 @@ impl App {
             return;
         };
         match result {
-            Ok((entries, note)) => browser.replace_entries(entries, note),
+            Ok(update) => {
+                self.marketplace_installed = update.installed;
+                browser.replace_entries(
+                    update.entries,
+                    update.note,
+                    self.marketplace_installed.as_deref(),
+                );
+            }
             Err(error) => {
                 browser.source_note = format!("refresh failed: {}", sanitize_log_output(&error));
             }
@@ -3560,14 +3564,11 @@ impl App {
 }
 
 fn add_help_line(lines: &mut Vec<(bool, String)>, bold: bool, text: &str, columns: usize) {
-    for line in wrap(text, columns) {
-        let chars: Vec<char> = line.chars().collect();
-        lines.extend(
-            chars
-                .chunks(columns)
-                .map(|chunk| (bold, chunk.iter().collect())),
-        );
-    }
+    lines.extend(
+        wrap_words(text, columns)
+            .into_iter()
+            .map(|line| (bold, line)),
+    );
 }
 
 fn help_lines(columns: usize, context: &str) -> Vec<(bool, String)> {
@@ -3721,7 +3722,7 @@ fn draw_help(
         write!(
             out,
             "\x1b[1m{}\x1b[0m",
-            truncate("Keyboard shortcuts", columns)
+            clip("Keyboard shortcuts", columns).0
         )?;
     }
     for (index, (bold, line)) in lines.iter().skip(start).take(visible).enumerate() {
@@ -3735,8 +3736,25 @@ fn draw_help(
     let footer = footer_start_row(height);
     if footer > first_row {
         let end = (start + visible).min(lines.len());
-        let hint = format!("Esc close · ↑↓ scroll · {end}/{}", lines.len());
-        write!(out, "\x1b[{footer};1H{}", truncate(&hint, columns))?;
+        let full = "Esc Back · ↑↓ PgUp/PgDn Scroll";
+        let compact = "Esc Back · ↑↓ Scroll";
+        let arrows = "Esc Back · ↑↓";
+        let controls = if terminal_text::display_width(full) <= columns {
+            full
+        } else if terminal_text::display_width(compact) <= columns {
+            compact
+        } else if terminal_text::display_width(arrows) <= columns {
+            arrows
+        } else {
+            "Esc Back"
+        };
+        let progress = format!(" · {end}/{}", lines.len());
+        write!(out, "\x1b[{footer};1H{}", clip(controls, columns).0)?;
+        if terminal_text::display_width(controls) + terminal_text::display_width(&progress)
+            <= columns
+        {
+            write!(out, "{progress}")?;
+        }
     }
     out.flush()
 }
@@ -3754,26 +3772,6 @@ fn help_scroll(offset: usize, key: KeyCode, width: u16, height: u16, context: &s
         KeyCode::End | KeyCode::Char('G') => last,
         _ => offset,
     }
-}
-
-/// Break text to a width, on spaces where possible.
-fn wrap(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut out = Vec::new();
-    let mut line = String::new();
-    for word in text.split_whitespace() {
-        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
-            out.push(std::mem::take(&mut line));
-        }
-        if !line.is_empty() {
-            line.push(' ');
-        }
-        line.push_str(word);
-    }
-    if !line.is_empty() {
-        out.push(line);
-    }
-    out
 }
 
 /// Cut a label to `max` *characters*.
@@ -4433,6 +4431,15 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                 KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.open_browser(true)
                 }
+                KeyCode::Char('f') if key.modifiers == KeyModifiers::CONTROL => {
+                    app.browser.as_mut().unwrap().cycle_install_filter();
+                }
+                KeyCode::Char('n') if key.modifiers == KeyModifiers::CONTROL => {
+                    app.browser.as_mut().unwrap().toggle_sort();
+                }
+                KeyCode::Char('l') if key.modifiers == KeyModifiers::CONTROL => {
+                    app.browser.as_mut().unwrap().reset();
+                }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     return Ok(())
                 }
@@ -4441,9 +4448,6 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                     app.browser.as_mut().unwrap().push(c);
                 }
                 _ => {}
-            }
-            if let Some(b) = app.browser.as_mut() {
-                b.clamp();
             }
             continue;
         }
@@ -4591,40 +4595,305 @@ mod tests {
         }
     }
 
+    fn draw_list_frame(app: &App, width: u16) -> String {
+        let mut output = Vec::new();
+        app.draw(&mut output, width, 14).unwrap();
+        String::from_utf8(output).unwrap()
+    }
+
+    fn list_frame_row(frame: &str, row: usize) -> &str {
+        let (_, row) = frame.split_once(&format!("\x1b[{row};1H")).unwrap();
+        let end = row
+            .match_indices("\x1b[")
+            .find_map(|(start, _)| {
+                let command = row[start + 2..].chars().find(|ch| ('@'..='~').contains(ch));
+                (command == Some('H')).then_some(start)
+            })
+            .unwrap_or(row.len());
+        &row[..end]
+    }
+
+    pub(super) fn list_row_text(row: &str) -> String {
+        let mut segments = row.split("\x1b[");
+        let mut text = segments.next().unwrap().to_string();
+        for segment in segments {
+            let end = segment.find(|ch| ('@'..='~').contains(&ch)).unwrap();
+            text.push_str(&segment[end + 1..]);
+        }
+        text
+    }
+
+    #[test]
+    fn manage_supporting_information_uses_the_row_foreground() {
+        for preset in crate::theme::PRESETS {
+            let mut app = App {
+                rows: rows(&[Spec::parse("owner/a"), Spec::parse("owner/b")], &[]),
+                theme: preset.palette,
+                ..App::default()
+            };
+            for row in &mut app.rows {
+                row.commit = Some("af06d0ad3fd99dc06027de187f1369328bf2d455".into());
+            }
+
+            let frame = draw_list_frame(&app, 120);
+            let selection = app.theme.selection();
+            for (offset, fg) in [selection.foreground(), crate::theme::Color::Ansi(39)]
+                .into_iter()
+                .enumerate()
+            {
+                let row = list_frame_row(&frame, LIST_TOP + 1 + offset);
+                let (name, tail) = row.split_once("\x1b[22m").unwrap();
+                assert!(name.contains(&format!("{fg} ")), "{row:?}");
+                assert!(tail.contains("af06d0ad3fd9") && tail.contains("in your list"));
+                assert!(!tail.contains("\x1b[2m"), "{row:?}");
+                assert_eq!(row.starts_with(&selection.to_string()), offset == 0);
+            }
+            let header = frame.split("\x1b[2;1H").next().unwrap();
+            assert!(!header.contains("\x1b[2m"), "{header:?}");
+            assert!(list_frame_row(&frame, 2).starts_with("\x1b[2m─"));
+        }
+    }
+
+    #[test]
+    fn selection_surface_keeps_custom_status_and_metadata_readable() {
+        use crate::browse::Browser;
+        use crate::theme::Color;
+
+        let colors = std::env::var("COLORFGBG").unwrap_or_default();
+        let light = matches!(colors.rsplit_once(';'), Some((_, "7" | "15")));
+        let (low_contrast, foreground, distinct) = if light {
+            (0xffffff, 0x000000, 0x206b37)
+        } else {
+            (0x000000, 0xffffff, 0xa6e3a1)
+        };
+        let theme = Theme::parse_custom(&format!(
+            "warning=#{low_contrast:06x},success=#{distinct:06x}"
+        ))
+        .unwrap();
+        let mut app = App {
+            rows: rows(&[Spec::parse("owner/a"), Spec::parse("owner/b")], &[]),
+            theme,
+            ..App::default()
+        };
+        app.rows[0].commit = Some("af06d0ad3fd9".into());
+        let frame = draw_list_frame(&app, 120);
+        let managed = list_frame_row(&frame, LIST_TOP + 1);
+        let foreground = Color::Rgb(foreground);
+        assert!(
+            managed.contains(&format!("{foreground}Missing")),
+            "{managed:?}"
+        );
+        assert!(managed.contains("af06d0ad3fd9") && !managed.contains("\x1b[2m"));
+        assert!(list_frame_row(&frame, LIST_TOP + 2)
+            .contains(&format!("{}Missing", Color::Rgb(low_contrast))));
+
+        app.browser = Some(Browser::new(
+            vec![marketplace_entry("owner/a")],
+            "cached".into(),
+            vec!["owner/a".into()],
+            Some(&[]),
+        ));
+        let frame = draw_list_frame(&app, 120);
+        let marketplace = list_frame_row(&frame, 4);
+        assert!(marketplace.contains(&format!("{}Listed", Color::Rgb(distinct))));
+        assert!(!marketplace.contains("\x1b[2m"));
+    }
+
+    #[test]
+    fn selection_surface_reserves_the_last_column_of_picked_manage_rows() {
+        let mut app = App {
+            rows: rows(&[Spec::parse("owner/a"), Spec::parse("owner/b")], &[]),
+            ..App::default()
+        };
+        app.rows[0].picked = true;
+        for width in 12..=15 {
+            let frame = draw_list_frame(&app, width);
+            for index in 0..=1 {
+                let row = list_frame_row(&frame, LIST_TOP + 1 + index);
+                for pass in row.split("\x1b[1G") {
+                    let text = list_row_text(pass);
+                    let cells = terminal_text::display_width(&text);
+                    assert!(cells < usize::from(width), "width {width}: {text:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selection_surface_reaches_the_last_usable_cell_with_joined_emoji() {
+        use unicode_width::UnicodeWidthStr;
+
+        let mut entry = marketplace_entry("owner/editor");
+        entry.description = "👩‍💻".into();
+        let app = App {
+            browser: Some(crate::browse::Browser::new(
+                vec![entry],
+                "cached".into(),
+                Vec::new(),
+                Some(&[]),
+            )),
+            ..App::default()
+        };
+        let frame = draw_list_frame(&app, 120);
+        let row = list_frame_row(&frame, 4);
+        assert!(row.contains("👩‍💻"));
+        let painted = row
+            .split("\x1b[1G")
+            .map(|pass| list_row_text(pass).width())
+            .max()
+            .unwrap();
+        assert_eq!(painted, 119, "{row:?}");
+    }
+
+    #[test]
+    fn focused_list_rows_keep_the_background_through_status_and_padding() {
+        use crate::browse::Browser;
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let terminal_background = match std::env::var("COLORFGBG")
+            .unwrap_or_default()
+            .rsplit_once(';')
+        {
+            Some((_, "7")) => "\x1b[107m",
+            Some((_, "15")) => "\x1b[47m",
+            _ => "\x1b[100m",
+        };
+        let (custom_colors, custom_background) = if terminal_background == "\x1b[100m" {
+            ("warning=#f9e2af,success=#a6e3a1", "\x1b[48;2;48;48;48m")
+        } else {
+            ("warning=#825400,success=#206b37", "\x1b[48;2;238;238;238m")
+        };
+        for (theme, background) in [
+            (Theme::default(), terminal_background),
+            (crate::theme::PRESETS[1].palette, "\x1b[48;2;49;50;68m"),
+            (
+                Theme::parse_custom(custom_colors).unwrap(),
+                custom_background,
+            ),
+        ] {
+            for browser_open in [false, true] {
+                let mut app = App {
+                    rows: rows(&[Spec::parse("owner/a"), Spec::parse("owner/二")], &[]),
+                    browser: browser_open.then(|| {
+                        Browser::new(
+                            vec![marketplace_entry("owner/a"), marketplace_entry("owner/b")],
+                            "cached".into(),
+                            vec!["owner/a".into(), "owner/b".into()],
+                            Some(&[]),
+                        )
+                    }),
+                    theme,
+                    ..App::default()
+                };
+                let top = if browser_open { 3 } else { LIST_TOP } as u16;
+                let (role, status) = if browser_open {
+                    (Role::Success, "Listed")
+                } else {
+                    (Role::Warning, "Missing")
+                };
+                for offset in 0..=1 {
+                    if offset == 1 {
+                        app.handle_mouse(
+                            MouseEvent {
+                                kind: MouseEventKind::Down(MouseButton::Left),
+                                column: 0,
+                                row: top + offset,
+                                modifiers: KeyModifiers::NONE,
+                            },
+                            14,
+                        )
+                        .unwrap();
+                    }
+                    for width in [2, 40, 80, 120] {
+                        let mut output = Vec::new();
+                        app.draw(&mut output, width, 14).unwrap();
+                        let frame = String::from_utf8(output).unwrap();
+                        assert_eq!(frame.matches(background).count(), 1);
+                        let (before, highlighted) = frame.split_once(background).unwrap();
+                        assert!(before.ends_with(&format!("\x1b[{};1H", top + offset + 1)));
+                        let (fill, highlighted) = highlighted.split_once("\x1b[1G").unwrap();
+                        assert_eq!(fill, " ".repeat(usize::from(width - 1)));
+                        let (row, after) = highlighted.split_once("\x1b[49m").unwrap();
+                        let pointer = if !browser_open && offset == 1 && width == 2 {
+                            '+'
+                        } else {
+                            '>'
+                        };
+                        let text = list_row_text(row);
+                        assert!(text.starts_with(pointer));
+                        if width >= 40 {
+                            assert!(row.contains(&format!("{}{status}", theme.color(role))));
+                        }
+                        assert!(!row.contains("\x1b[0m"));
+                        assert!(after.starts_with("\x1b[") && !after.contains("\x1b[49m"));
+                        let cells = terminal_text::display_width(&text);
+                        assert!(cells <= usize::from(width - 1));
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn marketplace_completion_keeps_query_and_selected_plugin() {
         let (send, receive) = mpsc::channel();
+        let installed = [
+            installed_at("OWNER", "worktree-one", 0),
+            installed_at("owner", "worktree-two", 0),
+        ];
         let mut app = App {
             browser: Some(crate::browse::Browser::new(
                 vec![
                     marketplace_entry("owner/worktree-one"),
                     marketplace_entry("owner/worktree-two"),
+                    marketplace_entry("owner/worktree-three"),
                 ],
                 "cached".to_string(),
-                Vec::new(),
+                vec!["owner/worktree-three".to_string()],
+                Some(&installed),
             )),
             marketplace_refresh: Some(receive),
             ..Default::default()
         };
         let browser = app.browser.as_mut().unwrap();
-        browser.query = "worktree".to_string();
+        browser.query = "WoRkTrEe".to_string();
         browser.category = Some("worktree");
+        browser.cycle_install_filter();
+        browser.toggle_sort();
+        assert_eq!(browser.results().len(), 2);
         browser.move_down();
 
         assert!(!app.poll_marketplace());
-        send.send(Ok((
-            vec![
-                marketplace_entry("owner/worktree-two"),
+        send.send(Ok(MarketplaceUpdate {
+            entries: vec![
+                marketplace_entry("OWNER/WORKTREE-TWO"),
+                marketplace_entry("owner/worktree-one"),
                 marketplace_entry("owner/note"),
+                marketplace_entry("owner/worktree-three"),
             ],
-            "just refreshed".to_string(),
-        )))
+            note: "just refreshed".to_string(),
+            installed: Some(vec![
+                installed_at("owner", "worktree-two", 0),
+                installed_at("owner", "worktree-three", 0),
+            ]),
+        }))
         .unwrap();
         assert!(app.poll_marketplace());
         let browser = app.browser.as_ref().unwrap();
-        assert_eq!(browser.query, "worktree");
+        assert_eq!(browser.query, "WoRkTrEe");
         assert_eq!(browser.category, Some("worktree"));
-        assert_eq!(browser.selected().unwrap().full_name, "owner/worktree-two");
+        assert_eq!(browser.install_filter_label(), "installed");
+        assert_eq!(browser.sort_label(), "name");
+        assert_eq!(
+            browser
+                .results()
+                .iter()
+                .map(|entry| entry.full_name.as_str())
+                .collect::<Vec<_>>(),
+            ["owner/worktree-three", "OWNER/WORKTREE-TWO"],
+        );
+        assert_eq!(browser.cursor, 1);
+        assert_eq!(browser.selected().unwrap().full_name, "OWNER/WORKTREE-TWO");
         assert_eq!(browser.source_note, "just refreshed");
         assert!(!app.poll_marketplace());
     }
@@ -4637,12 +4906,90 @@ mod tests {
             ..Default::default()
         };
         app.start_marketplace_refresh(|| unreachable!("another request is already running"));
-        send.send(Ok((Vec::new(), "just refreshed".to_string())))
-            .unwrap();
+        send.send(Ok(MarketplaceUpdate {
+            entries: Vec::new(),
+            note: "just refreshed".to_string(),
+            installed: Some(Vec::new()),
+        }))
+        .unwrap();
 
         assert!(!app.poll_marketplace());
         assert!(app.browser.is_none());
         assert!(app.marketplace_refresh.is_none());
+    }
+
+    #[test]
+    fn marketplace_inventory_failure_invalidates_filters_and_recovers_selection() {
+        let installed = vec![
+            installed_at("owner", "worktree-one", 0),
+            installed_at("owner", "worktree-two", 0),
+        ];
+        let entries = || {
+            vec![
+                marketplace_entry("owner/worktree-one"),
+                marketplace_entry("owner/worktree-two"),
+                marketplace_entry("owner/worktree-three"),
+            ]
+        };
+        let mut app = App {
+            browser: Some(crate::browse::Browser::new(
+                entries(),
+                "cached".to_string(),
+                Vec::new(),
+                Some(&installed),
+            )),
+            marketplace_installed: Some(installed.clone()),
+            ..Default::default()
+        };
+        let browser = app.browser.as_mut().unwrap();
+        browser.cycle_install_filter();
+        browser.move_down();
+        assert_eq!(browser.selected().unwrap().full_name, "owner/worktree-two");
+
+        for _ in 0..2 {
+            app.apply_marketplace_result(Ok(MarketplaceUpdate {
+                entries: entries(),
+                note: "just refreshed".to_string(),
+                installed: None,
+            }));
+            let mut failed = Vec::new();
+            app.draw_browser(&mut failed, 40, 12).unwrap();
+            let failed = String::from_utf8(failed).unwrap();
+            assert!(failed.contains("Install state unavailable"), "{failed:?}");
+            assert!(!failed.contains("2/3"), "{failed:?}");
+            assert!(app.browser.as_ref().unwrap().selected().is_none());
+            assert!(app.marketplace_installed.is_none());
+        }
+
+        app.apply_marketplace_result(Ok(MarketplaceUpdate {
+            entries: entries(),
+            note: "just refreshed".to_string(),
+            installed: Some(installed),
+        }));
+        let browser = app.browser.as_mut().unwrap();
+        assert_eq!(browser.install_filter_label(), "installed");
+        assert_eq!(browser.selected().unwrap().full_name, "owner/worktree-two");
+
+        app.apply_marketplace_result(Ok(MarketplaceUpdate {
+            entries: entries(),
+            note: "just refreshed".to_string(),
+            installed: None,
+        }));
+        let browser = app.browser.as_mut().unwrap();
+        browser.cycle_install_filter();
+        assert_eq!(browser.install_filter_label(), "not installed");
+        assert!(browser.results().is_empty());
+        browser.cycle_install_filter();
+        assert_eq!(browser.results().len(), 3);
+        assert!(browser
+            .results()
+            .iter()
+            .all(|entry| !browser.is_installed(entry)));
+        let mut unfiltered = Vec::new();
+        app.draw_browser(&mut unfiltered, 40, 12).unwrap();
+        assert!(String::from_utf8(unfiltered)
+            .unwrap()
+            .contains("Install state unavailable"));
     }
 
     #[test]
@@ -4653,6 +5000,7 @@ mod tests {
                 Vec::new(),
                 String::new(),
                 Vec::new(),
+                Some(&[]),
             )),
             marketplace_refresh: Some(receive),
             ..Default::default()
@@ -4689,34 +5037,52 @@ mod tests {
 
     #[test]
     fn help_layout_fits_short_panes_and_reaches_the_final_shortcut() {
-        let (width, height) = (40, 9);
-        let (columns, _, _) = help_viewport(width, height);
-        assert!(help_lines(columns, "")
-            .iter()
-            .all(|(_, line)| line.chars().count() <= columns));
+        for (width, height) in [(40, 9), (40, 11), (80, 24), (100, 30), (160, 48)] {
+            let (columns, visible, _) = help_viewport(width, height);
+            let lines = help_lines(columns, "");
+            let total = lines.len();
+            assert!(lines
+                .iter()
+                .all(|(_, line)| terminal_text::display_width(line) <= columns));
 
-        let frame = |offset| {
-            let mut output = Vec::new();
-            draw_help(&mut output, width, height, offset, "").unwrap();
-            let output = String::from_utf8(output).unwrap();
-            assert!(!output.contains('\n'));
-            for movement in output
-                .split("\x1b[")
-                .filter(|part| part.starts_with(|c: char| c.is_ascii_digit()))
-            {
-                if let Some((row, _)) = movement.split_once(";1H") {
-                    assert!(row.parse::<u16>().unwrap() <= footer_start_row(height));
+            let footer_row = footer_start_row(height);
+            let footer_position = format!("\x1b[{footer_row};1H");
+            let frame = |offset| {
+                let app = App {
+                    help: Some(offset),
+                    ..App::default()
+                };
+                let mut output = Vec::new();
+                app.draw(&mut output, width, height).unwrap();
+                let output = String::from_utf8(output).unwrap();
+                assert!(!output.contains('\n'));
+                for movement in output
+                    .split("\x1b[")
+                    .filter(|part| part.starts_with(|c: char| c.is_ascii_digit()))
+                {
+                    if let Some((row, _)) = movement.split_once(";1H") {
+                        assert!(row.parse::<u16>().unwrap() <= footer_row);
+                    }
                 }
+                output
+            };
+            let controls = "Esc Back · ↑↓ PgUp/PgDn Scroll";
+            let first = frame(0);
+            assert!(first.contains("Keyboard shortcuts"));
+            assert!(first.contains("Lowercase acts"));
+            let end = visible.min(total);
+            if end < total {
+                assert!(!first.contains("quit from the plugin list"));
             }
-            output
-        };
-        let first = frame(0);
-        assert!(first.contains("Keyboard shortcuts"));
-        assert!(first.contains("Lowercase acts"));
-        assert!(!first.contains("quit from the plugin list"));
-        let last = help_scroll(0, KeyCode::End, width, height, "");
-        assert!(frame(last).contains("quit from the plugin list"));
-        assert_eq!(frame(usize::MAX), frame(last));
+            assert!(first.ends_with(&format!("{footer_position}{controls} · {end}/{total}")));
+            let last = help_scroll(0, KeyCode::End, width, height, "");
+            let final_frame = frame(last);
+            assert!(final_frame.contains("quit from the plugin list"));
+            assert!(
+                final_frame.ends_with(&format!("{footer_position}{controls} · {total}/{total}"))
+            );
+            assert_eq!(frame(usize::MAX), final_frame);
+        }
     }
 
     #[test]
@@ -4727,6 +5093,18 @@ mod tests {
         assert_eq!(page, visible);
         assert_eq!(help_scroll(page, KeyCode::PageUp, width, height, ""), 0);
         assert_eq!(help_scroll(0, KeyCode::Up, width, height, ""), 0);
+
+        let app = App {
+            help: Some(0),
+            ..App::default()
+        };
+        for (width, controls) in [(24, "Esc Back · ↑↓ Scroll"), (20, "Esc Back · ↑↓")] {
+            let mut output = Vec::new();
+            app.draw(&mut output, width, height).unwrap();
+            assert!(String::from_utf8(output)
+                .unwrap()
+                .ends_with(&format!("\x1b[7;1H{controls}")));
+        }
 
         let narrow_end = help_scroll(0, KeyCode::End, width, height, "");
         let wide_end = help_scroll(0, KeyCode::End, 80, 24, "");
@@ -5036,6 +5414,47 @@ mod tests {
             view.display_lines(4),
             ["abcd", "ef", "next", "    ", "line"]
         );
+    }
+
+    #[test]
+    fn log_rendering_wraps_graphemes_and_preserves_log_sanitization() {
+        let app = App {
+            log_view: Some(LogView::from_result(
+                "example".into(),
+                Ok("x\x1b[31m👩‍💻\x1b[0me\u{301}界\n\n🇯🇵".into()),
+            )),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        app.draw_logs(&mut out, 5, 20).unwrap();
+        let frame = String::from_utf8(out).unwrap();
+        assert!(
+            frame.contains(" x👩‍💻\r\n e\u{301}界\r\n \r\n 🇯🇵\r\n"),
+            "{frame:?}"
+        );
+        assert!(!frame.contains("\x1b[31m"));
+    }
+
+    #[test]
+    fn log_rendering_fits_contextual_widths_on_one_cell_lines() {
+        let app = App {
+            log_view: Some(LogView::from_result("example".into(), Ok("xلاⵏ⵿ⴾy".into()))),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        app.draw_logs(&mut out, 3, 20).unwrap();
+        let frame = String::from_utf8(out).unwrap();
+        assert!(frame.contains(" x\r\n لا\r\n ⵏ⵿ⴾ\r\n y\r\n"), "{frame:?}");
+    }
+
+    #[test]
+    fn help_context_wraps_graphemes_within_its_columns() {
+        let mut out = Vec::new();
+        draw_help(&mut out, 9, 80, 0, " e\u{301}👩‍💻界 WXYZ \u{301}X").unwrap();
+        let frame = String::from_utf8(out).unwrap();
+        assert!(frame.contains("He\u{301}👩‍💻"), "{frame:?}");
+        assert!(frame.contains("H界"), "{frame:?}");
+        assert!(frame.contains("H \u{301}X"), "{frame:?}");
     }
 
     #[test]

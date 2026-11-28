@@ -1,6 +1,6 @@
 # herdr-lazy
 
-> See [GitHub Releases](https://github.com/natori-hrj/herdr-lazy/releases/latest) for the published version. [Changelog](CHANGELOG.md) · [v0.45.0 verification, recordings, and measurements](docs/release-v0.45.0.md).
+> [v0.46.0 release notes](docs/release-v0.46.0.md) · [Changelog](CHANGELOG.md) · [GitHub Releases](https://github.com/natori-hrj/herdr-lazy/releases/latest) · [v0.45.0 archive](docs/release-v0.45.0.md)
 
 With v0.45.0 or later, run `herdr-lazy --version` or `herdr-lazy -V` to identify your installed build.
 
@@ -14,9 +14,9 @@ pane to browse the Marketplace, inspect plugins, and decide what to install or u
 [![Latest release](https://img.shields.io/github/v/release/natori-hrj/herdr-lazy)](https://github.com/natori-hrj/herdr-lazy/releases/latest)
 ![Platforms: macOS, Linux, Windows](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-informational)
 
-![herdr-lazy v0.45.0 terminal demo showing Manage, command palette, Marketplace search and refresh, plugin details, and theme selection](docs/media/vhs/demo.gif)
+![herdr-lazy v0.46.0 terminal demo showing Manage, Marketplace discovery, plugin details, and theme selection](docs/media/v0460/demo.gif)
 
-[Watch the MP4](docs/media/vhs/demo.mp4) · [Regenerate the VHS recording and screenshots](docs/demo.md) · [Visual comparison](docs/vhs/visual-review.md)
+[Watch the MP4](docs/media/v0460/demo.mp4) · [Regenerate the recording and screenshots](docs/demo.md)
 
 ## Try it in 60 seconds
 
@@ -42,7 +42,7 @@ when you want to inspect, version, or reproduce the setup on another machine.
 
 | If you want to… | Use… |
 | --- | --- |
-| Find and add a plugin | `/`, then `Enter` |
+| Find and add a plugin | `/` to search, `Tab` to change category, `Enter` to add |
 | Find a Manage command | `Ctrl+P` |
 | Install what is selected | `i` |
 | Update installed plugins | `u` |
@@ -84,17 +84,8 @@ Install fetches a platform-matched prebuilt binary and verifies its SHA-256; if 
 your platform, or anything about the download is not exactly right, it falls back to building
 from source with [Rust](https://rustup.rs) (≥ 1.78). No toolchain is needed on the fast path.
 
-**Platform status for v0.45.0**
-
-| Verification | Coverage |
-| --- | --- |
-| Native Linux x86-64 host | Ran the published binary's version and list commands and exercised the TUI in a real PTY with fixture data. |
-| Isolated Herdr install on that host | Installed from GitHub with Herdr 0.9.5 and temporary configuration directories. The installed binary matched the published release asset byte for byte. |
-| GitHub Actions | CI passed on Linux x86-64, macOS arm64, and Windows x86-64. Release jobs also ran tests and checked the binary version on Linux arm64. The macOS Intel artifact was cross-built on arm64. |
-| Published artifacts | Downloaded, checked SHA-256, and extracted all five platform archives. |
-
-Manual v0.45.0 verification covered the Linux x86-64 install and the standalone
-TUI. macOS and Windows coverage comes from CI and published artifact checks. [CI](https://github.com/natori-hrj/herdr-lazy/actions/runs/45961519302) · [Release workflow](https://github.com/natori-hrj/herdr-lazy/actions/runs/45961519892) · [Release verification](docs/release-v0.45.0.md)
+The v0.46.0 notes document the Linux fixture recording and the scope of platform
+verification. [v0.46.0 verification](docs/release-v0.46.0.md#verification)
 
 **The first herdr start after installing sets up the route into the manager** (a `[[startup]]`
 hook): it writes the curated list and binds `prefix+shift+l` to the manage pane, but does not
@@ -453,16 +444,29 @@ whatever row you happened to be on before.
 
 Each result shows whether the plugin is installed or listed. When there is room, the
 pane also shows stars and the time since the repository's last push, such as `3d` or `2w`.
-Press `ctrl+o` to open the repository before installing it.
+Press `Ctrl+O` to open the repository before installing it.
 
 Search terms are ANDed and each may match the name, description or topics, so `worktree fzf`
-finds a worktree plugin whose description mentions fzf.
+finds a worktree plugin whose description mentions fzf. When no literal result passes the
+active filters, a single abbreviation of 3–12 ASCII letters or digits can match prefixes
+of repository name parts, such as `wti` for `worktree-tool-inspector`.
 
-`tab` narrows to a category — worktree, notifications, agents, and so on — for when you want
-to see what exists rather than search for something you can already name. It cycles back to
-`all`, and works alongside the query. Categories come from keywords matched against the name,
-description and topics, because GitHub topics alone miss more than half the plugins; anything
-that matches nothing lands in `other` rather than disappearing.
+Marketplace discovery combines the query with category and installation filters. The header
+normally shows the result count and catalog size, but can omit both when the inventory is
+unavailable or when a narrow pane shows refresh status or an error.
+
+| Key | Marketplace action |
+| --- | --- |
+| `Tab` / `Shift+Tab` | Cycle categories forward / backward, including `all` |
+| `Ctrl+F` | Cycle `any`, `installed`, and `not installed` using Herdr's plugin inventory |
+| `Ctrl+N` | Toggle between stars order and alphabetical order by repository slug |
+| `Ctrl+L` | Clear the query and filters, restore stars order, and select the first result |
+| `Ctrl+R` | Refresh the catalog in the background |
+
+Categories use keywords in names, descriptions, and topics. Unclassified entries appear in
+`other`. Herdr's installed inventory and your list are tracked separately. If the inventory is
+unavailable, the installed and not-installed filters report that state. Choose `any` to browse
+without the installation filter, or press `Ctrl+R` to retry the inventory lookup.
 
 Enter adds to your list rather than installing outright: one keystroke on a fuzzy match
 should not run a stranger's build script. The list is where intent is recorded.
@@ -475,7 +479,7 @@ shape and stays quiet on anything it cannot read confidently: sending you away f
 that works would be worse than saying nothing. It never blocks the add, and it says nothing on
 Windows, where herdr resolves cargo without trouble.
 
-The index is cached for six hours (`ctrl+r` refreshes) and works offline from that cache,
+The index is cached for six hours and works offline from that cache,
 saying how old it is. Two caveats worth stating plainly: the index endpoint is **not a
 documented API** — it is what the marketplace page itself fetches, and it may change without
 notice — and everything here fails soft, so if it becomes unreachable, browsing stops working
@@ -747,8 +751,12 @@ the rest still needs design.
 
 - **Rust, and nearly dependency-free.** The manager is orchestration — shelling out to
   the herdr CLI — which std covers, including a small hand-written JSON reader for
-  `plugin list --json`. The UI uses `crossterm` for terminal input and `unicode-width`
-  to keep CJK names and emoji within the visible Manage columns.
+  `plugin list --json`. The UI uses `crossterm` for terminal input. In views sized by
+  display cells, `unicode-segmentation` provides forward grapheme boundaries for
+  clipping and wrapping. `unicode-width` measures whole text runs, including
+  ligatures that span graphemes. Terminal emulators can use different shaping,
+  bidirectional text handling, and cell widths for ligatures, emoji, variation
+  selectors, and ambiguous-width characters.
 - **Never parse human output.** All state comes from `herdr plugin list --json`.
 - **Long operations leave the TUI** rather than being redrawn as in-pane progress, so
   a failing plugin build shows you its actual output.
