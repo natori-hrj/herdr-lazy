@@ -293,9 +293,16 @@ pub(crate) struct Report {
     resolved: Option<String>,
     source: Option<&'static str>,
     installed_ms: Option<u64>,
-    last_push: Option<String>,
+    last_push: Option<CachedPush>,
     lock_ref: Option<String>,
     consistency: Option<&'static str>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedPush {
+    summary: String,
+    maintenance: registry::MaintenanceStatus,
+    after_install: bool,
 }
 
 impl Report {
@@ -387,9 +394,10 @@ impl Report {
         installed: Option<&Installed>,
         market: &[registry::Entry],
     ) -> Self {
+        let installed_ms = installed.and_then(|plugin| plugin.installed_unix_ms);
         let last_push = repository
             .as_ref()
-            .and_then(|(slug, _)| cached_last_push(&crate::repo_root(slug), market));
+            .and_then(|(slug, _)| cached_last_push(&crate::repo_root(slug), market, installed_ms));
         let source = installed.and_then(|plugin| match plugin.source_kind.as_str() {
             "github" => Some("GitHub"),
             "local" => Some("Local link"),
@@ -404,10 +412,26 @@ impl Report {
                 .and_then(full_digest)
                 .map(str::to_owned),
             source,
-            installed_ms: installed.and_then(|plugin| plugin.installed_unix_ms),
+            installed_ms,
             last_push,
             ..Self::default()
         }
+    }
+
+    pub(crate) fn repository_root(&self) -> Option<String> {
+        self.repository
+            .as_ref()
+            .map(|(slug, _)| crate::repo_root(slug))
+    }
+
+    pub(crate) fn maintenance(&self) -> Option<registry::MaintenanceStatus> {
+        self.last_push.as_ref().map(|push| push.maintenance.clone())
+    }
+
+    pub(crate) fn pushed_since_install(&self) -> bool {
+        self.last_push
+            .as_ref()
+            .is_some_and(|push| push.after_install)
     }
 
     pub(crate) fn set_lock(&mut self, snapshot: Option<&str>) {
@@ -471,7 +495,7 @@ impl Report {
             fact("Installation recorded", installed_time.as_deref(), REGISTRY),
             fact(
                 "Last push",
-                self.last_push.as_deref(),
+                self.last_push.as_ref().map(|push| push.summary.as_str()),
                 "Marketplace cache, repository-wide",
             ),
             format!("License, security policy, archived state, external commands · {UNKNOWN}"),
@@ -482,7 +506,11 @@ impl Report {
     }
 }
 
-fn cached_last_push(root: &str, market: &[registry::Entry]) -> Option<String> {
+fn cached_last_push(
+    root: &str,
+    market: &[registry::Entry],
+    installed_ms: Option<u64>,
+) -> Option<CachedPush> {
     let mut matching = market
         .iter()
         .filter(|e| e.full_name.eq_ignore_ascii_case(root));
@@ -500,13 +528,22 @@ fn cached_last_push(root: &str, market: &[registry::Entry]) -> Option<String> {
     {
         return None;
     }
-    let status = registry::maintenance_status(date, registry::today_days());
-    let age = status.age()?;
-    Some(if age == "today" {
+    let maintenance = registry::maintenance_status(date, registry::today_days());
+    let age = maintenance.age()?;
+    let summary = if age == "today" {
         date.to_string()
     } else {
-        let quiet = if status.is_quiet() { " · quiet" } else { "" };
+        let quiet = if maintenance.is_quiet() {
+            " · quiet"
+        } else {
+            ""
+        };
         format!("{date} · {age} ago{quiet}")
+    };
+    Some(CachedPush {
+        summary,
+        maintenance,
+        after_install: installed_ms.is_some_and(|ms| registry::pushed_since(pushed_at, ms)),
     })
 }
 

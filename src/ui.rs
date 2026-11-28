@@ -230,6 +230,7 @@ impl Row {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChangesTarget {
     plugin_id: String,
+    /// Validated GitHub repository root, even for a plugin installed from a subdirectory.
     slug: String,
     commit: String,
 }
@@ -245,18 +246,19 @@ struct PluginDetail {
     changes: Option<ChangesTarget>,
 }
 
-fn detail_of(p: &Installed, repo: Option<&str>) -> PluginDetail {
+fn detail_of(p: &Installed, trust: &crate::plugin_trust::Report) -> PluginDetail {
     PluginDetail {
         description: p.description.clone(),
         actions: p.actions.clone(),
         panes: p.panes.clone(),
         events: p.events.clone(),
         plugin_id: p.plugin_id.clone(),
-        changes: repo
+        changes: trust
+            .repository_root()
             .zip(p.resolved_commit.as_deref())
             .map(|(slug, commit)| ChangesTarget {
                 plugin_id: p.plugin_id.clone(),
-                slug: slug.to_owned(),
+                slug,
                 commit: commit.to_owned(),
             }),
     }
@@ -658,29 +660,6 @@ fn rows_with_herdr_version(
         };
         (required > running).then_some(HerdrVersionWarning { required, running })
     };
-    let stale = |p: &Installed, spec: Option<&Spec>| -> bool {
-        // A pinned entry is meant to sit still; calling it out of date is noise.
-        if spec.map(|s| s.reference.is_some()).unwrap_or(false) {
-            return false;
-        }
-        let (Some(slug), Some(ms)) = (p.slug.as_ref(), p.installed_unix_ms) else {
-            return false;
-        };
-        market
-            .iter()
-            .find(|e| e.full_name.eq_ignore_ascii_case(slug))
-            .map(|e| crate::registry::pushed_since(&e.pushed_at, ms))
-            .unwrap_or(false)
-    };
-    let maintenance = |p: &Installed| -> Option<crate::registry::MaintenanceStatus> {
-        let slug = p.slug.as_ref()?;
-        market
-            .iter()
-            .find(|e| e.full_name.eq_ignore_ascii_case(slug))
-            .map(|e| {
-                crate::registry::maintenance_status(&e.pushed_at, crate::registry::today_days())
-            })
-    };
     let mut rows = Vec::new();
 
     for spec in desired {
@@ -719,10 +698,13 @@ fn rows_with_herdr_version(
             slug: Some(spec.repo.clone()),
             installed: hit.map(|(p, _)| (p.plugin_id.clone(), p.source_kind.clone())),
             enabled: hit.map(|(p, _)| p.enabled),
-            maintenance: hit.and_then(|(p, _)| maintenance(p)),
-            maybe_stale: authorized.is_some_and(|p| stale(p, Some(spec))),
+            maintenance: trust.maintenance(),
+            // A pinned entry is meant to sit still; calling it out of date is noise.
+            maybe_stale: spec.reference.is_none()
+                && authorized.is_some()
+                && trust.pushed_since_install(),
             picked: false,
-            detail: authorized.map(|p| detail_of(p, Some(&spec.repo))),
+            detail: authorized.map(|p| detail_of(p, &trust)),
             trust,
         });
     }
@@ -748,10 +730,10 @@ fn rows_with_herdr_version(
             slug: p.slug.clone(),
             installed: Some((p.plugin_id.clone(), p.source_kind.clone())),
             enabled: Some(p.enabled),
-            maintenance: maintenance(p),
-            maybe_stale: authorized.is_some_and(|p| stale(p, None)),
+            maintenance: trust.maintenance(),
+            maybe_stale: authorized.is_some() && trust.pushed_since_install(),
             picked: false,
-            detail: authorized.map(|p| detail_of(p, p.slug.as_deref())),
+            detail: authorized.map(|p| detail_of(p, &trust)),
             trust,
         });
     }
@@ -5977,6 +5959,65 @@ mod tests {
             "maintenance facts belong in the detail view, not the main action list"
         );
         assert_eq!(rows[0].status, Status::Ok);
+    }
+
+    #[test]
+    fn managed_maintenance_uses_the_desired_root_not_a_weak_hit() {
+        let installed = [installed_at("other", "plugin", 0)];
+        let desired = [Spec::parse("owner/plugin")];
+        assert_eq!(installed[0].matches(&desired[0]), Match::Weak);
+        let unrelated = market("other/plugin", "1970-01-01T00:00:00Z");
+        let rows = rows_with_updates(&desired, &installed, std::slice::from_ref(&unrelated));
+        assert!(rows[0].maintenance.is_none());
+        assert!(!rows[0].maybe_stale);
+
+        let market = [unrelated, market("OWNER/PLUGIN", "2024-10-05T00:00:00Z")];
+        let rows = rows_with_updates(&desired, &installed, &market);
+        assert_eq!(
+            rows[0].maintenance,
+            Some(crate::registry::maintenance_status(
+                &market[1].pushed_at,
+                crate::registry::today_days()
+            ))
+        );
+        // The cache supplies repository facts, not facts about the weakly matched install.
+        assert!(!rows[0].maybe_stale);
+        assert!(rows[0].changes_target().is_none());
+
+        let invalid = [Spec::parse("../plugin")];
+        let rows = rows_with_updates(&invalid, &installed, &market);
+        assert!(rows[0].maintenance.is_none());
+    }
+
+    #[test]
+    fn parsed_child_uses_root_for_cache_and_changes_but_keeps_scoped_report() {
+        for repo in ["REPO", "REPO/Tools"] {
+            let installed = crate::parse_plugin_list(&format!(
+                r#"{{"result":{{"plugins":[{{"plugin_id":"example.plugin","source":{{
+                    "kind":"github","owner":"Owner","repo":"{repo}","subdir":"Tools",
+                    "resolved_commit":"{SHA}","installed_unix_ms":1
+                }}}}]}}}}"#
+            ))
+            .unwrap();
+            let desired = [Spec::parse("owner/repo/Tools")];
+            let market = [market("OWNER/REPO", "2024-10-05T00:00:00Z")];
+            let target = ChangesTarget {
+                plugin_id: "example.plugin".into(),
+                slug: "owner/repo".into(),
+                commit: SHA.into(),
+            };
+            for desired in [desired.as_slice(), &[]] {
+                let rows = rows_with_updates(desired, &installed, &market);
+                assert!(rows[0].maintenance.is_some());
+                assert!(rows[0].maybe_stale);
+                assert_eq!(rows[0].changes_target(), Some(&target));
+                assert!(rows[0]
+                    .trust
+                    .lines()
+                    .iter()
+                    .any(|line| line.starts_with("Repository · owner/repo/Tools (")));
+            }
+        }
     }
 
     #[test]
