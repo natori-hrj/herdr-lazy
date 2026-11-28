@@ -612,6 +612,10 @@ impl Report {
             .map(|(slug, _)| crate::repo_root(slug))
     }
 
+    pub(crate) fn repository_scope(&self) -> Option<&str> {
+        self.repository.as_ref().map(|(scope, _)| scope.as_str())
+    }
+
     pub(crate) fn maintenance(&self) -> Option<registry::MaintenanceStatus> {
         self.last_push.as_ref().map(|push| push.maintenance.clone())
     }

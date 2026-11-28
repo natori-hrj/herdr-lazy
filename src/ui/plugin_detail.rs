@@ -976,11 +976,10 @@ mod tests {
         oversized.resize(crate::MAX_LOCAL_INPUT_BYTES as usize + 1, b'a');
         for rejected in [invalid, oversized] {
             std::fs::write(&path, rejected).unwrap();
-            let error = crate::read_local_text(&path, "plugin list").unwrap_err();
-            let desired = Err(error);
+            let error = crate::read_ui_bundle(&path).unwrap_err();
             let mut app = App {
-                rows: rows_from_bundle(&desired, &records, &[], None),
-                bundle_error: bundle_read_error(&desired),
+                rows: rows_from_bundle(None, &records, &[], None),
+                bundle_error: Some(bundle_read_error(&error)),
                 ..App::default()
             };
             assert_eq!(app.rows.len(), 2);
@@ -1011,7 +1010,7 @@ mod tests {
                 );
             }
         }
-        let empty = rows_from_bundle(&Ok(Vec::new()), &records, &[], None);
+        let empty = rows_from_bundle(Some(&[]), &records, &[], None);
         assert!(empty.iter().all(|row| row.plugin_detail().is_some()));
     }
 
