@@ -1,6 +1,6 @@
 # herdr-lazy
 
-> [v0.46.0 release notes](docs/release-v0.46.0.md) · [Changelog](CHANGELOG.md) · [GitHub Releases](https://github.com/natori-hrj/herdr-lazy/releases/latest) · [v0.45.0 archive](docs/release-v0.45.0.md)
+> [v0.47.0 release notes](docs/release-v0.47.0.md) · [Changelog](CHANGELOG.md) · [GitHub Releases](https://github.com/natori-hrj/herdr-lazy/releases/latest) · [v0.46.0 archive](docs/release-v0.46.0.md)
 
 With v0.45.0 or later, run `herdr-lazy --version` or `herdr-lazy -V` to identify your installed build.
 
@@ -16,7 +16,7 @@ pane to browse the Marketplace, inspect plugins, and decide what to install or u
 
 ![herdr-lazy v0.46.0 terminal demo showing Manage, Marketplace discovery, plugin details, and theme selection](docs/media/v0460/demo.gif)
 
-[Watch the MP4](docs/media/v0460/demo.mp4) · [Regenerate the recording and screenshots](docs/demo.md)
+Recorded with **herdr-lazy v0.46.0**. [Watch the MP4](docs/media/v0460/demo.mp4) · [Recording guide](docs/demo.md)
 
 ## Try it in 60 seconds
 
@@ -84,8 +84,8 @@ Install fetches a platform-matched prebuilt binary and verifies its SHA-256; if 
 your platform, or anything about the download is not exactly right, it falls back to building
 from source with [Rust](https://rustup.rs) (≥ 1.78). No toolchain is needed on the fast path.
 
-The v0.46.0 notes document the Linux fixture recording and the scope of platform
-verification. [v0.46.0 verification](docs/release-v0.46.0.md#verification)
+The [v0.47.0 notes](docs/release-v0.47.0.md) describe the response and local-file
+limits, lock permission handling, and measured performance tradeoff.
 
 **The first herdr start after installing sets up the route into the manager** (a `[[startup]]`
 hook): it writes the curated list and binds `prefix+shift+l` to the manage pane, but does not
