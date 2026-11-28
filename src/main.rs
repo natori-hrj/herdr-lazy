@@ -275,7 +275,33 @@ fn remove_file_if_present(path: &Path) -> io::Result<()> {
     }
 }
 
-fn optional_file_contents(path: &Path) -> io::Result<Option<Vec<u8>>> {
+fn history_slot_metadata(path: &Path) -> io::Result<Option<fs::Metadata>> {
+    // Generated slots must be independent directory entries, not symlinks (even dangling ones).
+    // Regular hard links are fine: replacement never writes into their shared inode.
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(Some(metadata)),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "plugin lock history {} is not a regular file",
+                path.display()
+            ),
+        )),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn optional_history_contents(path: &Path, active_path: &Path) -> io::Result<Option<Vec<u8>>> {
+    if history_slot_metadata(path)?.is_none() {
+        return Ok(None);
+    }
+    if fs::canonicalize(path)? == active_path {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("plugin lock history {} is the active lock", path.display()),
+        ));
+    }
     match open_local_regular_file(path, "plugin lock history") {
         Ok(file) => read_limited(file, MAX_LOCAL_INPUT_BYTES)?
             .ok_or_else(|| {
@@ -294,16 +320,17 @@ fn optional_file_contents(path: &Path) -> io::Result<Option<Vec<u8>>> {
     }
 }
 
-fn restore_file_contents(path: &Path, contents: &Option<Vec<u8>>) -> io::Result<()> {
+fn replace_history_slot(path: &Path, contents: Option<&[u8]>) -> io::Result<()> {
+    let permissions = history_slot_metadata(path)?.map(|metadata| metadata.permissions());
     match contents {
-        Some(bytes) => write_bytes_atomically(path, bytes),
+        Some(bytes) => write_atomic_replacement(path, bytes, permissions),
         None => remove_file_if_present(path),
     }
 }
 
 fn restore_lock_history(lock: &Path, previous: &[Option<Vec<u8>>]) -> io::Result<()> {
     for (index, contents) in previous.iter().enumerate() {
-        restore_file_contents(&lock_history_beside(lock, index + 1), contents)?;
+        replace_history_slot(&lock_history_beside(lock, index + 1), contents.as_deref())?;
     }
     Ok(())
 }
@@ -313,16 +340,19 @@ fn restore_lock_history(lock: &Path, previous: &[Option<Vec<u8>>]) -> io::Result
 /// Every source is captured before the first write. If validation or a history operation fails,
 /// the caller can leave the current lock untouched instead of losing the only known-good state.
 fn rotate_lock_history(lock: &Path, active: &[u8]) -> io::Result<Vec<Option<Vec<u8>>>> {
+    let active_path = fs::canonicalize(lock)?;
     let previous: Vec<Option<Vec<u8>>> = (1..=MAX_PREVIOUS_LOCKFILES)
-        .map(|generation| optional_file_contents(&lock_history_beside(lock, generation)))
+        .map(|generation| {
+            optional_history_contents(&lock_history_beside(lock, generation), &active_path)
+        })
         .collect::<io::Result<_>>()?;
 
     let result = (|| {
         for generation in (2..=MAX_PREVIOUS_LOCKFILES).rev() {
             let destination = lock_history_beside(lock, generation);
-            restore_file_contents(&destination, &previous[generation - 2])?;
+            replace_history_slot(&destination, previous[generation - 2].as_deref())?;
         }
-        write_bytes_atomically(&lock_history_beside(lock, 1), active)
+        replace_history_slot(&lock_history_beside(lock, 1), Some(active))
     })();
 
     match result {
@@ -445,34 +475,66 @@ fn replace_lock(path: &Path, temporary: &Path) -> io::Result<()> {
 
 pub(crate) fn write_bytes_atomically(path: &Path, body: &[u8]) -> io::Result<()> {
     let path = atomic_write_destination(path)?;
-    let temporary = loop {
-        let candidate = lock_temp_path(&path);
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(mut file) => {
-                if let Err(e) = file.write_all(body) {
-                    drop(file);
-                    let _ = remove_file_if_present(&candidate);
-                    return Err(e);
-                }
-                drop(file);
-                break candidate;
-            }
+    let permissions = fs::metadata(&path)
+        .ok()
+        .map(|metadata| metadata.permissions());
+    write_atomic_replacement(&path, body, permissions)
+}
+
+fn create_atomic_temp(
+    path: &Path,
+    options: &mut fs::OpenOptions,
+) -> io::Result<(PathBuf, fs::File)> {
+    options.write(true).create_new(true);
+    loop {
+        let candidate = lock_temp_path(path);
+        match options.open(&candidate) {
+            Ok(file) => return Ok((candidate, file)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         }
+    }
+}
+
+fn create_atomic_stage(path: &Path) -> io::Result<(PathBuf, fs::File)> {
+    let mut options = fs::OpenOptions::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    create_atomic_temp(path, &mut options)
+}
+
+/// Publish at this exact leaf. Only the caller decides whether to resolve symlinks.
+fn write_atomic_replacement(
+    path: &Path,
+    body: &[u8],
+    permissions: Option<fs::Permissions>,
+) -> io::Result<()> {
+    #[cfg(unix)]
+    let permissions = match permissions {
+        Some(permissions) => Some(permissions),
+        None => {
+            // Measure the normal creation mode in this directory without changing the process
+            // umask. The probe stays empty; no reader can acquire an early fd to the actual stage.
+            let (probe_path, probe) = create_atomic_temp(path, &mut fs::OpenOptions::new())?;
+            let permissions = probe.metadata().map(|metadata| metadata.permissions());
+            drop(probe);
+            remove_file_if_present(&probe_path)?;
+            Some(permissions?)
+        }
     };
 
-    if let Ok(metadata) = fs::metadata(&path) {
-        if let Err(e) = fs::set_permissions(&temporary, metadata.permissions()) {
-            let _ = remove_file_if_present(&temporary);
-            return Err(e);
+    let (temporary, mut file) = create_atomic_stage(path)?;
+    let written = file.write_all(body);
+    drop(file);
+    let result = written.and_then(|()| {
+        if let Some(permissions) = permissions {
+            fs::set_permissions(&temporary, permissions)?;
         }
-    }
-    let result = replace_lock(&path, &temporary);
+        replace_lock(path, &temporary)
+    });
     if result.is_err() {
         let _ = remove_file_if_present(&temporary);
     }
@@ -4785,6 +4847,51 @@ command = "something.else"
         clean_scratch_lock(&lock);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_history_slot_aborts_before_rotating_any_slot() {
+        use std::os::unix::fs::symlink;
+
+        let lock = scratch_lock("symlinked-history");
+        let first = lock_history_beside(&lock, 1);
+        let alias = lock_history_beside(&lock, 2);
+        let last = lock_history_beside(&lock, 3);
+        fs::write(&lock, "active\n").unwrap();
+        fs::write(&first, "history-1\n").unwrap();
+        symlink(lock.file_name().unwrap(), &alias).unwrap();
+        fs::write(&last, "history-3\n").unwrap();
+
+        let error = write_lock_contents(&lock, "replacement\n").unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read_link(&alias).unwrap(), Path::new("plugins.lock"));
+        assert_eq!(fs::read_to_string(&lock).unwrap(), "active\n");
+        assert_eq!(fs::read_to_string(&first).unwrap(), "history-1\n");
+        assert_eq!(fs::read_to_string(&last).unwrap(), "history-3\n");
+        clean_scratch_lock(&lock);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_lock_link_to_history_aborts_before_rotating_any_slot() {
+        use std::os::unix::fs::symlink;
+
+        let lock = scratch_lock("active-lock-links-to-history");
+        let first = lock_history_beside(&lock, 1);
+        let second = lock_history_beside(&lock, 2);
+        fs::write(&first, "active\n").unwrap();
+        fs::write(&second, "history-2\n").unwrap();
+        symlink(first.file_name().unwrap(), &lock).unwrap();
+
+        let error = write_lock_contents(&lock, "replacement\n").unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read_link(&lock).unwrap(), Path::new("plugins.lock.1"));
+        assert_eq!(fs::read_to_string(&first).unwrap(), "active\n");
+        assert_eq!(fs::read_to_string(&second).unwrap(), "history-2\n");
+        clean_scratch_lock(&lock);
+    }
+
     #[test]
     fn adopted_init_proposal_deduplicates_extras_before_its_only_write() {
         let extra = extras::Extra {
@@ -4849,6 +4956,32 @@ command = "something.else"
         assert_eq!(fs::read_link(&list).unwrap(), Path::new("dotfiles.list"));
         assert_eq!(fs::read_to_string(&target).unwrap(), "new\n");
         clean_scratch_lock(&list);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_stages_privately_and_preserves_final_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = scratch_lock("atomic-modes");
+        let ordinary = path.with_file_name("ordinary");
+        fs::write(&ordinary, "ordinary\n").unwrap();
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+        let (temporary, stage) = create_atomic_stage(&path).unwrap();
+        assert_eq!(stage.metadata().unwrap().len(), 0);
+        assert_eq!(mode(&temporary) & 0o077, 0);
+        drop(stage);
+        fs::remove_file(temporary).unwrap();
+
+        write_bytes_atomically(&path, b"first\n").unwrap();
+        assert_eq!(mode(&path), mode(&ordinary));
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        write_bytes_atomically(&path, b"private\n").unwrap();
+        assert_eq!(mode(&path), 0o400);
+        assert_eq!(fs::read(&path).unwrap(), b"private\n");
+        clean_scratch_lock(&path);
     }
 
     #[cfg(unix)]
