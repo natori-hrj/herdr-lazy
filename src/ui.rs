@@ -139,8 +139,7 @@ struct Row {
     /// Ticked for a bulk operation. Kept on the row rather than as a set of indices so it
     /// survives the list being rebuilt in a different order.
     picked: bool,
-    /// What this plugin can do, for the details view. Empty for anything not installed —
-    /// herdr only knows a manifest once it has fetched it.
+    /// Authorized UI payload, never populated by a merely operational match.
     detail: Option<PluginDetail>,
     /// Local evidence for Plugin Details, separate from operational matches and pins.
     trust: crate::plugin_trust::Report,
@@ -154,11 +153,11 @@ struct HerdrVersionWarning {
 
 impl Row {
     fn plugin_detail(&self) -> Option<&PluginDetail> {
-        if self.trust.hide_install_details {
-            None
-        } else {
-            self.detail.as_ref()
-        }
+        self.detail.as_ref()
+    }
+
+    fn changes_target(&self) -> Option<&ChangesTarget> {
+        self.plugin_detail()?.changes.as_ref()
     }
 
     fn marker(&self) -> &'static str {
@@ -206,8 +205,7 @@ impl Row {
         if !note.is_empty() {
             return note;
         }
-        self.detail
-            .as_ref()
+        self.plugin_detail()
             .map(|d| d.description.clone())
             .unwrap_or_default()
     }
@@ -227,6 +225,15 @@ impl Row {
     }
 }
 
+/// A row index can refer to a different plugin after refresh, and an installation can change
+/// revision even if it keeps its row and ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChangesTarget {
+    plugin_id: String,
+    slug: String,
+    commit: String,
+}
+
 /// The manifest facts worth showing a user who just installed seven plugins at once.
 #[derive(Debug, Clone, Default)]
 struct PluginDetail {
@@ -235,15 +242,23 @@ struct PluginDetail {
     panes: Vec<(String, String, String)>,
     events: Vec<String>,
     plugin_id: String,
+    changes: Option<ChangesTarget>,
 }
 
-fn detail_of(p: &Installed) -> PluginDetail {
+fn detail_of(p: &Installed, repo: Option<&str>) -> PluginDetail {
     PluginDetail {
         description: p.description.clone(),
         actions: p.actions.clone(),
         panes: p.panes.clone(),
         events: p.events.clone(),
         plugin_id: p.plugin_id.clone(),
+        changes: repo
+            .zip(p.resolved_commit.as_deref())
+            .map(|(slug, commit)| ChangesTarget {
+                plugin_id: p.plugin_id.clone(),
+                slug: slug.to_owned(),
+                commit: commit.to_owned(),
+            }),
     }
 }
 
@@ -689,7 +704,7 @@ fn rows_with_herdr_version(
             }
         };
         let display = spec.display();
-        let trust = crate::plugin_trust::Report::for_bundle(
+        let (trust, authorized) = crate::plugin_trust::Report::for_bundle(
             &display,
             installed,
             hit.map(|(p, _)| p),
@@ -699,15 +714,15 @@ fn rows_with_herdr_version(
             label: display.clone(),
             commit,
             status,
-            herdr_warning: hit.and_then(|(p, _)| version_warning(p)),
+            herdr_warning: authorized.and_then(version_warning),
             listed_as: Some(display),
             slug: Some(spec.repo.clone()),
             installed: hit.map(|(p, _)| (p.plugin_id.clone(), p.source_kind.clone())),
             enabled: hit.map(|(p, _)| p.enabled),
             maintenance: hit.and_then(|(p, _)| maintenance(p)),
-            maybe_stale: hit.map(|(p, _)| stale(p, Some(spec))).unwrap_or(false),
+            maybe_stale: authorized.is_some_and(|p| stale(p, Some(spec))),
             picked: false,
-            detail: hit.map(|(p, _)| detail_of(p)),
+            detail: authorized.map(|p| detail_of(p, Some(&spec.repo))),
             trust,
         });
     }
@@ -717,6 +732,7 @@ fn rows_with_herdr_version(
         if claimed {
             continue;
         }
+        let (trust, authorized) = crate::plugin_trust::Report::for_install(p, installed, market);
         rows.push(Row {
             label: p.slug.clone().unwrap_or_else(|| p.plugin_id.clone()),
             commit: p.resolved_commit.clone(),
@@ -727,16 +743,16 @@ fn rows_with_herdr_version(
             } else {
                 Status::Extra
             },
-            herdr_warning: version_warning(p),
+            herdr_warning: authorized.and_then(version_warning),
             listed_as: None,
             slug: p.slug.clone(),
             installed: Some((p.plugin_id.clone(), p.source_kind.clone())),
             enabled: Some(p.enabled),
             maintenance: maintenance(p),
-            maybe_stale: stale(p, None),
+            maybe_stale: authorized.is_some_and(|p| stale(p, None)),
             picked: false,
-            detail: Some(detail_of(p)),
-            trust: crate::plugin_trust::Report::for_install(p, market),
+            detail: authorized.map(|p| detail_of(p, p.slug.as_deref())),
+            trust,
         });
     }
 
@@ -1218,7 +1234,7 @@ struct App {
     /// Changes fetched for the currently open details, and which row they belong to. Keyed by
     /// row so reopening the same plugin does not re-hit the network, and a stale result for a
     /// different plugin never shows.
-    detail_changes: Option<(usize, crate::github::Changes)>,
+    detail_changes: Option<(ChangesTarget, crate::github::Changes)>,
     /// Recent command logs for the selected plugin. This is a modal overlay so the list/detail
     /// cursor remains where the user left it when they go back.
     log_view: Option<LogView>,
@@ -1731,29 +1747,19 @@ impl App {
         self.open_logs_for(self.cursor);
     }
 
-    fn open_detail_logs(&mut self, idx: usize) {
-        if self
-            .rows
-            .get(idx)
-            .is_some_and(|row| row.trust.hide_install_details)
-        {
-            self.flash = Some("Logs unavailable · plugin identity is uncertain".to_string());
-            return;
-        }
-        self.open_logs_for(idx);
-    }
-
     fn open_logs_for(&mut self, idx: usize) {
-        let Some(plugin_id) = self
-            .rows
-            .get(idx)
-            .and_then(|row| row.installed.as_ref())
-            .map(|(plugin_id, _)| plugin_id.clone())
-        else {
-            self.flash = Some("logs are only available for an installed plugin".to_string());
+        let row = self.rows.get(idx);
+        let Some(detail) = row.and_then(Row::plugin_detail) else {
+            let message = if row.is_some_and(|row| row.installed.is_some()) {
+                "Logs unavailable · plugin identity is uncertain"
+            } else {
+                "logs are only available for an installed plugin"
+            };
+            self.flash = Some(message.to_string());
             return;
         };
 
+        let plugin_id = detail.plugin_id.clone();
         self.flash = None;
         self.log_view = Some(LogView::from_result(
             plugin_id.clone(),
@@ -1815,25 +1821,26 @@ impl App {
         self.detail_scroll = 0;
         self.flash = None;
 
-        if row.trust.hide_install_details {
-            self.detail_changes = None;
-            return;
-        }
         // Fetch only for a plugin the offline marker already flagged. Opening the details of
         // an up-to-date plugin must stay instant — going to the network for every `l` would
         // make the common case (nothing changed) the slow one, which is backwards. The marker
         // can lag a very recent push by up to a day; that a just-pushed plugin waits one more
         // day for its diff is a fair price for `l` never blocking on a plugin that is current.
         //
-        // Reuse a result already fetched for this row so reopening does not re-hit the network.
-        if matches!(&self.detail_changes, Some((i, _)) if *i == self.cursor) {
+        // Reuse only a result for the same authorized identity and revision.
+        let target = row.changes_target();
+        if self
+            .detail_changes
+            .as_ref()
+            .is_some_and(|(cached, _)| target == Some(cached))
+        {
             return;
         }
         self.detail_changes = None;
         if row.maybe_stale {
-            if let (Some(slug), Some(commit)) = (row.slug.clone(), row.commit.clone()) {
-                let changes = crate::github::changes_since(&slug, &commit);
-                self.detail_changes = Some((self.cursor, changes));
+            if let Some(target) = target.cloned() {
+                let changes = crate::github::changes_since(&target.slug, &target.commit);
+                self.detail_changes = Some((target, changes));
             }
         }
     }
@@ -2746,15 +2753,17 @@ impl App {
 
     /// Show the exact change before making it.
     fn draw_bind_confirm(&self, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
-        let success = self.theme.color(Role::Success);
-        let rule = rule_line(width);
-        let (target, key) = self.pending_bind.clone().expect("checked by caller");
-        let plugin_id = self
+        let Some(detail) = self
             .detail_of
             .and_then(|i| self.rows.get(i))
             .and_then(Row::plugin_detail)
-            .map(|d| d.plugin_id.clone())
-            .unwrap_or_default();
+        else {
+            return plugin_detail::draw(self, out, width, height);
+        };
+        let success = self.theme.color(Role::Success);
+        let rule = rule_line(width);
+        let (target, key) = self.pending_bind.clone().expect("checked by caller");
+        let plugin_id = &detail.plugin_id;
         let path = crate::herdr_config_path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "(herdr's config.toml — location unknown)".to_string());
@@ -2764,7 +2773,7 @@ impl App {
         writeln!(out, "\x1b[2m{}\x1b[0m\r", rule)?;
         writeln!(out, " This appends to \x1b[1m{}\x1b[0m:\r", path)?;
         writeln!(out, "\r")?;
-        let (kind, command) = crate::bind_toml_fields(&target, &plugin_id);
+        let (kind, command) = crate::bind_toml_fields(&target, plugin_id);
         for line in [
             "# added by herdr-lazy".to_string(),
             "[[keys.command]]".to_string(),
@@ -4286,7 +4295,7 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
                         app.run_detail_action();
                     }
                 }
-                KeyCode::Char('L') => app.open_detail_logs(idx),
+                KeyCode::Char('L') => app.open_logs_for(idx),
                 _ => {}
             }
             continue;
@@ -5257,13 +5266,16 @@ mod tests {
             }
         }
 
-        let expected = format!("Resolved revision · {SHA} (installed registry)");
         for candidates in [
             [exact.clone(), root.clone(), sibling.clone()],
             [sibling, root, exact],
         ] {
             let r = rows(&desired, &candidates);
-            assert!(r[0].trust.lines().contains(&expected));
+            assert!(r[0]
+                .trust
+                .lines()
+                .contains(&"Resolved revision · Unknown".to_string()));
+            assert!(r[0].plugin_detail().is_none());
         }
     }
 

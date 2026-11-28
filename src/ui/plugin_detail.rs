@@ -73,10 +73,11 @@ fn body(app: &App, width: u16) -> Body {
     };
 
     let text_width = usize::from(width).saturating_sub(2).max(1);
-    if row.trust.hide_install_details {
+    let detail = row.plugin_detail();
+    if row.installed.is_some() && detail.is_none() {
         body.push_color("Installation · Unknown", app.theme.color(Role::Warning));
         body.push_wrapped(
-            "The installed record cannot be attributed to this entry. Manifest, actions, compatibility, and logs are unavailable here.",
+            "The installed record cannot be attributed to this entry. Manifest, actions, compatibility, logs, and Changes are unavailable here.",
             text_width,
         );
         push_trust(&mut body, &row.trust, text_width);
@@ -101,7 +102,7 @@ fn body(app: &App, width: u16) -> Body {
     }
     body.push("");
 
-    let Some(detail) = row.plugin_detail() else {
+    let Some(detail) = detail else {
         body.push_wrapped(
             "Esc returns to the list. Press i there to install.",
             text_width,
@@ -162,8 +163,8 @@ fn body(app: &App, width: u16) -> Body {
         body.push("");
     }
 
-    if let Some((row_idx, changes)) = &app.detail_changes {
-        if *row_idx == idx {
+    if let Some((cached, changes)) = &app.detail_changes {
+        if row.changes_target() == Some(cached) {
             let warning = app.theme.color(Role::Warning);
             match changes {
                 Changes::Commits(subjects) if !subjects.is_empty() => {
@@ -344,7 +345,7 @@ pub(super) fn draw(app: &App, out: &mut impl Write, width: u16, height: u16) -> 
                     " · ↑/↓ Select · Enter Run · b Bind"
                 });
             }
-            if row.installed.is_some() && !row.trust.hide_install_details {
+            if row.plugin_detail().is_some() {
                 hints.push_str(if compact { " · L" } else { " · L Logs" });
             }
             let (footer, _) = clip(&hints, columns);
@@ -362,24 +363,31 @@ pub(super) fn draw(app: &App, out: &mut impl Write, width: u16, height: u16) -> 
 
 #[cfg(test)]
 mod tests {
+    use super::super::{rows, rows_with_herdr_version, ChangesTarget};
     use super::*;
-    use crate::Installed;
+    use crate::{Installed, Spec};
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
     fn fixture() -> App {
         let plugin = Installed {
             plugin_id: "example.plugin".into(),
             name: "Plugin 界".into(),
             description: "Navigation and workspace setup. ".repeat(3),
+            slug: Some("example/plugin".into()),
+            resolved_commit: Some(SHA.into()),
             actions: (0..12)
                 .map(|i| (format!("example.plugin.action-{i}"), format!("Command {i}")))
                 .collect(),
             events: vec!["workspace.created".into()],
             ..Default::default()
         };
+        let rows = rows(&[], &[plugin]);
+        let target = rows[0].changes_target().unwrap().clone();
         App {
-            rows: super::super::rows(&[], &[plugin]),
+            rows,
             detail_of: Some(0),
-            detail_changes: Some((0, Changes::Commits(vec!["Fix workspaces".into()]))),
+            detail_changes: Some((target, Changes::Commits(vec!["Fix workspaces".into()]))),
             ..Default::default()
         }
     }
@@ -470,8 +478,9 @@ mod tests {
     #[test]
     fn detail_shows_source_labelled_evidence_and_unknowns_for_missing_rows() {
         let mut app = fixture();
-        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let sha = SHA;
         let plugin = Installed {
+            plugin_id: "fixture.plugin".into(),
             slug: Some("Example/Plugin".into()),
             source_kind: "github".into(),
             resolved_commit: Some(sha.into()),
@@ -513,55 +522,66 @@ mod tests {
         assert!(!missing.contains("Requires Herdr"));
     }
 
-    #[test]
-    fn detail_does_not_attribute_a_case_distinct_subdirectory_to_the_bundle_entry() {
-        let plugin = Installed {
-            plugin_id: "fixture-other-subdir".into(),
-            enabled: true,
-            source_kind: "github".into(),
-            slug: Some("example/plugin/tools".into()),
-            min_herdr_version: crate::HerdrVersion::parse("0.10.0"),
-            description: "Other manifest description".into(),
-            actions: vec![("other.action".into(), "Other action".into())],
-            events: vec!["other.event".into()],
-            ..Installed::default()
-        };
+    fn assert_unattributed(spec: &str, plugins: &[Installed]) {
         let mut app = App {
-            rows: super::super::rows_with_herdr_version(
-                &[crate::Spec::parse("example/plugin/Tools")],
-                &[plugin],
+            rows: rows_with_herdr_version(
+                &[Spec::parse(spec)],
+                plugins,
                 &[],
                 crate::HerdrVersion::parse("0.9.5"),
             ),
-            detail_of: Some(0),
-            detail_changes: Some((0, Changes::Commits(vec!["Other plugin changes".into()]))),
+            detail_changes: Some((
+                ChangesTarget {
+                    plugin_id: "other-plugin".into(),
+                    slug: spec.into(),
+                    commit: SHA.into(),
+                },
+                Changes::Commits(vec!["Other plugin changes".into()]),
+            )),
             ..App::default()
         };
         assert_eq!(app.rows[0].enabled, Some(true));
-        assert!(app.rows[0].herdr_warning.is_some());
-        assert!(app.rows[0].detail.is_some());
+        assert!(app.rows[0].herdr_warning.is_none());
         assert!(app.rows[0].plugin_detail().is_none());
+        assert!(app.rows[0].changes_target().is_none());
+        let list = render(&app, 160, 24);
+        assert!(!list.contains("Other manifest description"), "{list:?}");
+        assert!(!list.contains("needs herdr"), "{list:?}");
+        assert!(!list.contains("Requires newer Herdr"), "{list:?}");
+        app.open_logs();
+        assert!(app.log_view.is_none());
+        assert_eq!(
+            app.flash.take().as_deref(),
+            Some("Logs unavailable · plugin identity is uncertain")
+        );
 
+        app.detail_of = Some(0);
         let frame = render(&app, 120, 24);
         assert!(frame.contains("Installation · Unknown"));
-        assert!(frame.contains("Repository · example/plugin/Tools (bundle list)"));
+        assert!(frame.contains(&format!("Repository · {spec} (bundle list)")));
         for hidden in [
             "Installed ·",
             "Other manifest description",
             "Other action",
+            "Other pane",
             "other.event",
             "Requires Herdr",
             "Other plugin changes",
             "Binding preview",
+            "Enter Run",
             "L Logs",
         ] {
             assert!(!frame.contains(hidden), "unexpected {hidden}: {frame:?}");
         }
         assert!(!confirm_selection_visible(&mut app, 120, 24));
+        app.flash = None;
         app.run_detail_action();
+        app.detail_cursor = 1;
+        app.run_detail_action();
+        assert!(app.flash.is_none());
         app.bind_selected('t');
         assert!(app.pending_bind.is_none());
-        app.open_detail_logs(0);
+        app.open_logs_for(0);
         assert!(app.log_view.is_none());
         assert_eq!(
             app.flash.as_deref(),
@@ -569,17 +589,151 @@ mod tests {
         );
     }
 
+    fn registry_fixture(repo: &str, id: &str, url_field: &str) -> Installed {
+        crate::parse_plugin_list(&format!(
+            r#"{{"result":{{"plugins":[{{
+                "plugin_id":"{id}","name":"plugin","description":"Other manifest description",
+                "min_herdr_version":"0.10.0",
+                "source":{{"kind":"github","owner":"example","repo":"{repo}","resolved_commit":"{SHA}"{url_field}}},
+                "actions":[{{"id":"other.action","title":"Other action"}}],
+                "panes":[{{"id":"other.pane","title":"Other pane"}}],
+                "events":[{{"on":"other.event"}}]
+            }}]}}}}"#
+        ))
+        .unwrap()
+        .pop()
+        .unwrap()
+    }
+
     #[test]
-    fn ordinary_weak_local_detail_still_shows_actions() {
+    fn child_does_not_get_payload_from_weak_or_competing_registry_claims() {
+        let spec = "example/plugin/Tools";
+        let root = registry_fixture("plugin", "other-plugin", "");
+        let second_root = registry_fixture("plugin", "second-plugin", "");
+        let exact = registry_fixture("plugin/Tools", "exact-plugin", "");
+        let sibling = registry_fixture("plugin/tools", "other-plugin", "");
+        let mut url_only = registry_fixture(
+            "plugin",
+            "other-plugin",
+            r#","url":"https://github.com/example/plugin.git""#,
+        );
+        url_only.slug = None;
+        for candidates in [
+            vec![root.clone()],
+            vec![second_root, root.clone()],
+            vec![root, exact.clone()],
+            vec![sibling.clone()],
+            vec![exact.clone(), sibling],
+            vec![url_only.clone()],
+            vec![url_only, exact],
+        ] {
+            assert_unattributed(spec, &candidates);
+        }
+    }
+
+    #[test]
+    fn a_path_in_source_owner_is_not_a_scoped_claim() {
+        let records = crate::parse_plugin_list(
+            r#"{"result":{"plugins":[{"plugin_id":"other-plugin","source":{
+                "kind":"github","owner":"example/plugin","repo":"Tools"
+            }}]}}"#,
+        )
+        .unwrap();
+        assert_unattributed("example/plugin/Tools", &records);
+    }
+
+    #[test]
+    fn a_present_bad_url_never_falls_back_to_absent() {
+        for value in [
+            "null".to_string(),
+            "42".to_string(),
+            r#"{"raw":"https://github.com/example/plugin"}"#.into(),
+            r#""not a URL""#.into(),
+            format!(r#""https://github.com/example/plugin/{}""#, "x".repeat(320)),
+        ] {
+            let field = format!(r#","url":{value}"#);
+            for repo in ["plugin", "plugin/Tools"] {
+                let plugin = registry_fixture(repo, "other-plugin", &field);
+                assert_unattributed(&format!("example/{repo}"), &[plugin]);
+            }
+        }
+    }
+
+    #[test]
+    fn exact_scope_still_requires_a_usable_unique_id() {
+        let spec = "example/plugin";
+        for id in ["", " ", "--invalid"] {
+            assert_unattributed(spec, &[registry_fixture("plugin", id, "")]);
+        }
+        let exact = registry_fixture("plugin", "other-plugin", "");
+        let unrelated = registry_fixture("different", "other-plugin", "");
+        assert_unattributed(spec, &[exact, unrelated]);
+    }
+
+    #[test]
+    fn unique_root_and_case_exact_child_keep_their_payload() {
+        for (spec, repo, field) in [
+            ("example/plugin", "plugin", ""),
+            (
+                "example/plugin/Tools",
+                "PLUGIN/Tools",
+                r#","url":"git@github.com:EXAMPLE/plugin.git""#,
+            ),
+        ] {
+            let p = registry_fixture(repo, "other-plugin", field);
+            let mut app = App {
+                rows: rows_with_herdr_version(
+                    &[Spec::parse(spec)],
+                    &[p],
+                    &[],
+                    crate::HerdrVersion::parse("0.9.5"),
+                ),
+                detail_of: Some(0),
+                ..App::default()
+            };
+            let frame = render(&app, 120, 30);
+            for shown in [
+                "Other manifest description",
+                "Other action",
+                "Other pane",
+                "other.event",
+                "Requires Herdr",
+                "Binding preview",
+                "L Logs",
+            ] {
+                assert!(frame.contains(shown), "{shown}: {frame:?}");
+            }
+            assert!(confirm_selection_visible(&mut app, 120, 30));
+        }
+    }
+
+    #[test]
+    fn an_unlisted_github_row_can_use_its_direct_id() {
+        let p = registry_fixture("plugin", "other-plugin", "");
+        let app = App {
+            rows: rows(&[], &[p]),
+            detail_of: Some(0),
+            ..App::default()
+        };
+        let frame = render(&app, 120, 24);
+        assert!(frame.contains("Other action"));
+        assert!(frame.contains("Binding preview"));
+        assert!(frame.contains("L Logs"));
+    }
+
+    #[test]
+    fn weak_local_claim_does_not_authorize_a_bundle_row_but_direct_id_still_works() {
         let plugin = Installed {
+            plugin_id: "local-plugin".into(),
             name: "plugin".into(),
             enabled: true,
             source_kind: "local".into(),
             actions: vec![("local.action".into(), "Local action".into())],
             ..Installed::default()
         };
+        assert_unattributed("example/plugin", std::slice::from_ref(&plugin));
         let mut app = App {
-            rows: super::super::rows(&[crate::Spec::parse("example/plugin")], &[plugin]),
+            rows: rows(&[], &[plugin]),
             detail_of: Some(0),
             ..App::default()
         };
@@ -588,6 +742,20 @@ mod tests {
         assert!(frame.contains("Local action"));
         assert!(frame.contains("L Logs"));
         assert!(confirm_selection_visible(&mut app, 120, 24));
+    }
+
+    #[test]
+    fn cached_changes_do_not_follow_the_row_index_or_survive_a_revision_change() {
+        let mut app = fixture();
+        assert!(render(&app, 120, 35).contains("Fix workspaces"));
+        let mut record = registry_fixture("plugin", "example.plugin", "");
+        record.resolved_commit = Some("f".repeat(40));
+        app.rows = rows(&[], std::slice::from_ref(&record));
+        assert!(!render(&app, 120, 35).contains("Fix workspaces"));
+        record.resolved_commit = Some(SHA.into());
+        record.plugin_id = "other-plugin".into();
+        app.rows = rows(&[], &[record]);
+        assert!(!render(&app, 120, 35).contains("Fix workspaces"));
     }
 
     #[test]
